@@ -65,18 +65,157 @@ class QueryEngineTest extends TestCase
         $this->assertArrayNotHasKey('truncated', $byTable);
 
         $this->assertSame($byTable['results'], $engine->writesTo('App\Models\Note')['results']);
-        $this->assertSame($byTable['results'], $engine->writesTo('notes.title')['results']);
+
+        $byColumn = $engine->writesTo('notes.title');
+        $this->assertSame('column:notes.title', $byColumn['column']);
+        $this->assertSame('title', $byColumn['field']);
+        $this->assertSame('possible', $byColumn['results'][0]['match']);
+        $this->assertSame(['create', 'save'], $byColumn['results'][0]['possibleOps']);
     }
 
     public function test_reads_from_lists_reader_methods(): void
     {
-        $reads = $this->engine()->readsFrom('notes');
+        $engine = $this->engine();
+        $reads = $engine->readsFrom('notes');
 
         $this->assertSame(
             ['App\Http\Controllers\NoteController::index'],
             array_column($reads['results'], 'id')
         );
         $this->assertSame(['get'], $reads['results'][0]['ops']);
+
+        $columnReads = $engine->readsFrom('notes.title');
+        $this->assertSame('possible', $columnReads['results'][0]['match']);
+        $this->assertSame(0, $columnReads['counts']['proven']);
+        $this->assertSame(1, $columnReads['counts']['possible']);
+    }
+
+    public function test_column_access_separates_proven_possible_and_excluded_operations(): void
+    {
+        $graph = $this->queryFixtureGraph();
+
+        foreach ($graph['edges'] as &$edge) {
+            if ($edge['from'] === 'App\Services\NoteService::save' && $edge['type'] === 'writes') {
+                $edge['metadata']['operations'] = [
+                    '16:create:model_table' => [
+                        'line' => 16,
+                        'operation' => 'create',
+                        'fields' => ['meta.signed_at', 'title'],
+                        'fieldCoverage' => 'complete',
+                    ],
+                    '17:update:model_table' => [
+                        'line' => 17,
+                        'operation' => 'update',
+                        'fields' => ['body'],
+                        'fieldCoverage' => 'complete',
+                    ],
+                    '18:save:model_table' => [
+                        'line' => 18,
+                        'operation' => 'save',
+                        'fieldCoverage' => 'unknown',
+                    ],
+                ];
+            }
+        }
+        unset($edge);
+
+        $graph['nodes'][] = [
+            'id' => 'App\Services\BodyService::save',
+            'type' => 'method',
+            'label' => 'BodyService::save',
+            'file' => 'app/Services/BodyService.php',
+            'line' => 10,
+        ];
+        $graph['nodes'][] = ['id' => 'column:notes.meta', 'type' => 'column', 'label' => 'notes.meta'];
+        $graph['edges'][] = [
+            'from' => 'table:notes',
+            'to' => 'column:notes.meta',
+            'type' => 'has_column',
+            'confidence' => 1.0,
+        ];
+        $graph['edges'][] = [
+            'from' => 'App\Services\BodyService::save',
+            'to' => 'table:notes',
+            'type' => 'writes',
+            'confidence' => 0.9,
+            'metadata' => ['operations' => [
+                '11:update:model_table' => [
+                    'line' => 11,
+                    'operation' => 'update',
+                    'fields' => ['body'],
+                    'fieldCoverage' => 'complete',
+                ],
+            ]],
+        ];
+
+        $result = (new QueryEngine(GraphIndex::fromArray($graph)))->writesTo('notes.title');
+
+        $this->assertSame(['proven' => 1, 'possible' => 0, 'excluded' => 1], $result['counts']);
+        $this->assertSame('App\Services\NoteService::save', $result['matches']['proven'][0]['id']);
+        $this->assertSame(['create'], $result['matches']['proven'][0]['provenOps']);
+        $this->assertSame(['save'], $result['matches']['proven'][0]['possibleOps']);
+        $this->assertSame(['update'], $result['matches']['proven'][0]['excludedOps']);
+        $this->assertSame('App\Services\BodyService::save', $result['matches']['excluded'][0]['id']);
+        $this->assertSame([], $result['matches']['possible']);
+
+        $nested = (new QueryEngine(GraphIndex::fromArray($graph)))->writesTo('notes.meta');
+        $this->assertSame('proven', $nested['results'][0]['match']);
+        $this->assertSame(['create'], $nested['results'][0]['provenOps']);
+    }
+
+    public function test_column_access_treats_legacy_coverage_as_unknown_and_whole_rows_as_proven(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $graph['nodes'] = [
+            ...$graph['nodes'],
+            ['id' => 'App\\Services\\LegacyWriter::save', 'type' => 'method', 'label' => 'LegacyWriter::save'],
+            ['id' => 'App\\Services\\RowDeleter::delete', 'type' => 'method', 'label' => 'RowDeleter::delete'],
+            ['id' => 'App\\Services\\WildcardReader::read', 'type' => 'method', 'label' => 'WildcardReader::read'],
+        ];
+        $graph['edges'] = [
+            ...$graph['edges'],
+            [
+                'from' => 'App\\Services\\LegacyWriter::save',
+                'to' => 'table:notes',
+                'type' => 'writes',
+                'confidence' => 1.0,
+                'metadata' => ['operations' => [[
+                    'operation' => 'update',
+                    'fields' => ['body'],
+                ]]],
+            ],
+            [
+                'from' => 'App\\Services\\RowDeleter::delete',
+                'to' => 'table:notes',
+                'type' => 'writes',
+                'confidence' => 1.0,
+                'metadata' => ['operations' => [[
+                    'operation' => 'delete',
+                    'fields' => [],
+                    'fieldCoverage' => 'whole_row',
+                ]]],
+            ],
+            [
+                'from' => 'App\\Services\\WildcardReader::read',
+                'to' => 'table:notes',
+                'type' => 'reads',
+                'confidence' => 1.0,
+                'metadata' => ['operations' => [[
+                    'operation' => 'get',
+                    'fields' => ['*'],
+                    'fieldCoverage' => 'whole_row',
+                ]]],
+            ],
+        ];
+        $engine = new QueryEngine(GraphIndex::fromArray($graph));
+
+        $writes = $engine->writesTo('notes.title');
+        $this->assertSame('proven', collect($writes['results'])->firstWhere('id', 'App\\Services\\RowDeleter::delete')['match']);
+        $this->assertSame('possible', collect($writes['results'])->firstWhere('id', 'App\\Services\\LegacyWriter::save')['match']);
+        $this->assertNotContains('App\\Services\\LegacyWriter::save', array_column($writes['matches']['excluded'], 'id'));
+
+        $reads = $engine->readsFrom('notes.title');
+        $this->assertSame('proven', collect($reads['results'])->firstWhere('id', 'App\\Services\\WildcardReader::read')['match']);
     }
 
     public function test_callers_of_traverses_call_graph_upstream(): void

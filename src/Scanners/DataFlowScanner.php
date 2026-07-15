@@ -131,6 +131,7 @@ class DataFlowScanner
         'orderBy',
         'query',
         'select',
+        'addSelect',
         'take',
         'where',
         'whereBelongsTo',
@@ -512,9 +513,10 @@ class DataFlowScanner
             foreach ($this->dataTargetsForAccess($access, $flowType, $operation) as $target) {
                 $this->addDataFlowEdge($graph, $context, $target['table'], $flowType, round($target['confidence'] * $this->operationConfidence($operation, $flowType), 2), [
                     'line' => $call->getStartLine(),
+                    'callsite' => $this->nodeCallsite($call),
                     'operation' => $operation,
                     'syntax' => 'method_call',
-                    'fields' => $this->fieldsFromCall($call),
+                    ...$this->fieldEvidenceForCall($call, $operation, $flowType, $access),
                 ] + $target['metadata']);
             }
         }
@@ -541,9 +543,10 @@ class DataFlowScanner
             foreach ($this->flowTypesForOperation($operation) as $flowType) {
                 $this->addDataFlowEdge($graph, $context, $table['table'], $flowType, round($table['confidence'] * $this->operationConfidence($operation, $flowType), 2), [
                     'line' => $call->getStartLine(),
+                    'callsite' => $this->nodeCallsite($call),
                     'operation' => $operation,
                     'syntax' => 'static_call',
-                    'fields' => $this->fieldsFromCall($call),
+                    ...$this->fieldEvidenceForCall($call, $operation, $flowType),
                     'inference' => 'model_static_call',
                     'model' => $targetClass,
                     'targetRole' => 'model_table',
@@ -576,6 +579,7 @@ class DataFlowScanner
         foreach ($this->tablesFromSql($sql, $flowType) as $table) {
             $this->addDataFlowEdge($graph, $context, $table, $flowType, 0.4, [
                 'line' => $call->getStartLine(),
+                'callsite' => $this->nodeCallsite($call),
                 'operation' => $operation,
                 'syntax' => 'db_facade_raw_sql',
                 'inference' => 'raw_sql_table_name_regex',
@@ -613,6 +617,7 @@ class DataFlowScanner
 
         $operationKey = implode(':', array_filter([
             (string) ($metadata['line'] ?? 'unknown'),
+            (string) ($metadata['callsite'] ?? 'unknown'),
             (string) ($metadata['operation'] ?? 'unknown'),
             (string) ($metadata['targetRole'] ?? 'table'),
         ]));
@@ -629,6 +634,8 @@ class DataFlowScanner
             'relationshipMethod' => $metadata['relationshipMethod'] ?? null,
             'relationshipType' => $metadata['relationshipType'] ?? null,
             'fields' => $metadata['fields'] ?? null,
+            'fieldCoverage' => $metadata['fieldCoverage'] ?? null,
+            'fieldEvidence' => $metadata['fieldEvidence'] ?? null,
             'possibleModels' => $metadata['possibleModels'] ?? null,
         ], static fn ($value): bool => $value !== null);
 
@@ -819,11 +826,12 @@ class DataFlowScanner
             }
 
             if (in_array($operation, $this->queryPassthroughOperations, true)) {
+                $fieldEvidence = $this->queryFieldEvidenceFromCall($expression, $operation);
                 $access['kind'] = 'model_query';
                 $access['confidence'] *= 0.95;
                 $access['inference'] = 'model_query_chain';
 
-                return $access;
+                return $this->applyQueryFieldEvidence($access, $operation, $fieldEvidence);
             }
 
             if (in_array($operation, array_merge($this->readOperations, $this->writeOperations), true)) {
@@ -857,6 +865,7 @@ class DataFlowScanner
             }
 
             if (in_array($operation, $this->queryPassthroughOperations, true)) {
+                $fieldEvidence = $this->queryFieldEvidenceFromCall($expression, $operation);
                 $receiver['confidence'] = round(($receiver['confidence'] ?? 0.7) * 0.98, 2);
                 $receiver['inference'] = ($receiver['inference'] ?? 'query_chain').':query_passthrough';
 
@@ -864,7 +873,7 @@ class DataFlowScanner
                     $receiver['kind'] = 'model_query';
                 }
 
-                return $receiver;
+                return $this->applyQueryFieldEvidence($receiver, $operation, $fieldEvidence);
             }
 
             if (in_array($operation, array_merge($this->readOperations, $this->writeOperations), true)) {
@@ -873,6 +882,49 @@ class DataFlowScanner
         }
 
         return null;
+    }
+
+    /**
+     * Keep predicates separate from projections: `select()` replaces a prior
+     * projection while `addSelect()` appends. Mixing the two would claim that
+     * overwritten columns are still read by the final SQL query.
+     *
+     * @param array<string, mixed> $access
+     * @param array{fields: array<int, string>, complete: bool} $evidence
+     * @return array<string, mixed>
+     */
+    private function applyQueryFieldEvidence(array $access, string $operation, array $evidence): array
+    {
+        if ($operation === 'select') {
+            $access['queryProjectionSeen'] = true;
+            $access['queryProjectionFields'] = $evidence['fields'];
+            $access['queryProjectionComplete'] = $evidence['complete'];
+
+            return $access;
+        }
+
+        if ($operation === 'addSelect') {
+            $projectionSeen = $access['queryProjectionSeen'] ?? false;
+            $access['queryProjectionSeen'] = true;
+            $access['queryProjectionFields'] = $this->mergeFields(
+                $projectionSeen ? ($access['queryProjectionFields'] ?? []) : [],
+                $evidence['fields'],
+            );
+            $access['queryProjectionComplete'] = ($projectionSeen
+                ? ($access['queryProjectionComplete'] ?? false)
+                : true) && $evidence['complete'];
+
+            return $access;
+        }
+
+        $access['queryPredicateFields'] = $this->mergeFields(
+            $access['queryPredicateFields'] ?? [],
+            $evidence['fields'],
+        );
+        $access['queryPredicatesComplete'] = ($access['queryPredicatesComplete'] ?? true)
+            && $evidence['complete'];
+
+        return $access;
     }
 
     /**
@@ -1133,9 +1185,12 @@ class DataFlowScanner
         foreach ($this->dataTargetsForAccess($attribute['access'], 'writes', 'assign') as $target) {
             $this->addDataFlowEdge($graph, $context, $target['table'], 'writes', round($target['confidence'] * 0.85, 2), [
                 'line' => $assignment->getStartLine(),
+                'callsite' => $this->nodeCallsite($assignment),
                 'operation' => 'assign',
                 'syntax' => 'attribute_assignment',
                 'fields' => [$attribute['field']],
+                'fieldCoverage' => 'complete',
+                'fieldEvidence' => 'attribute_assignment',
             ] + $target['metadata']);
         }
     }
@@ -1186,52 +1241,467 @@ class DataFlowScanner
         };
     }
 
+    private function nodeCallsite(Node $node): string
+    {
+        $start = $node->getStartFilePos();
+        $end = $node->getEndFilePos();
+
+        if ($start >= 0 && $end >= $start) {
+            return $start.'-'.$end;
+        }
+
+        return $node->getStartTokenPos().'-'.$node->getEndTokenPos();
+    }
+
     /**
-     * @return array<int, string>
+     * @param array<string, mixed>|null $access
+     * @return array{fields: array<int, string>, fieldCoverage: string, fieldEvidence?: string}
      */
-    private function fieldsFromCall(Expr\MethodCall|Expr\StaticCall $call): array
+    private function fieldEvidenceForCall(Expr\MethodCall|Expr\StaticCall $call, string $operation, string $flowType, ?array $access = null): array
+    {
+        if ($flowType === 'reads') {
+            $predicateFields = $access['queryPredicateFields'] ?? [];
+            $predicatesComplete = $access['queryPredicatesComplete'] ?? true;
+            $projectionSeen = $access['queryProjectionSeen'] ?? false;
+            $projectionFields = $access['queryProjectionFields'] ?? [];
+            $projectionComplete = $access['queryProjectionComplete'] ?? false;
+
+            if ($operation === 'find' && ($access['kind'] ?? null) === 'table_query') {
+                // Query Builder::find() always adds `where id = ?` before its
+                // terminal first() projection.
+                $predicateFields = $this->mergeFields($predicateFields, ['id']);
+            }
+
+            if (in_array($operation, [
+                'all', 'cursor', 'cursorPaginate', 'find', 'findMany', 'findOrFail',
+                'first', 'firstOr', 'firstOrFail', 'get', 'paginate', 'simplePaginate',
+            ], true)) {
+                if (! $projectionSeen) {
+                    $projection = $this->rowProjectionEvidence($call, $operation);
+                    $projectionFields = $projection['fields'];
+                    $projectionComplete = $projection['complete'];
+                }
+
+                $fields = $this->mergeFields($predicateFields, $projectionFields);
+                $chainComplete = $predicatesComplete && $projectionComplete;
+            } elseif (in_array($operation, ['pluck', 'value'], true)) {
+                $terminal = $this->queryFieldEvidenceFromCall($call, $operation);
+
+                if (! $projectionSeen) {
+                    $projectionFields = $terminal['fields'];
+                    $projectionComplete = $terminal['complete'];
+                }
+
+                $fields = $this->mergeFields($predicateFields, $projectionFields);
+                $chainComplete = $predicatesComplete && $projectionComplete;
+            } elseif (in_array($operation, ['avg', 'count', 'max', 'min', 'sum'], true)) {
+                $terminal = $this->aggregateProjectionEvidence($call, $operation);
+                $fields = $this->mergeFields($predicateFields, $terminal['fields']);
+                $chainComplete = $predicatesComplete && $terminal['complete'];
+            } elseif ($operation === 'exists') {
+                $fields = $predicateFields;
+                $chainComplete = $predicatesComplete;
+            } else {
+                $terminal = $this->queryFieldEvidenceFromCall($call, $operation);
+                $fields = $this->mergeFields($predicateFields, $projectionFields, $terminal['fields']);
+                $chainComplete = false;
+            }
+
+            // Eloquent relationships/models can add global scopes and implicit
+            // key columns. Only a literal DB::table() query can completely
+            // exclude other columns; known Eloquent fields still prove their
+            // own access while all other columns remain possible.
+            $coverageIsComplete = ($access['kind'] ?? null) === 'table_query'
+                && $chainComplete;
+
+            return [
+                'fields' => $fields,
+                'fieldCoverage' => $coverageIsComplete
+                    ? ($this->fieldsContainWildcard($fields) ? 'whole_row' : 'complete')
+                    : 'unknown',
+                ...($fields === [] ? [] : ['fieldEvidence' => 'literal_query_field']),
+            ];
+        }
+
+        if (in_array($operation, ['save', 'saveQuietly'], true)) {
+            // The first argument contains save options (for example `touch`),
+            // not attributes. Dirty attributes and model events are not known
+            // from the call site.
+            return ['fields' => [], 'fieldCoverage' => 'unknown'];
+        }
+
+        $positions = match ($operation) {
+            'firstOrCreate', 'updateOrCreate' => [0, 1],
+            default => [0],
+        };
+        $fields = [];
+        $allLiteral = true;
+
+        foreach ($positions as $position) {
+            $argument = $call->args[$position] ?? null;
+
+            if ($argument === null && $position > 0) {
+                continue;
+            }
+
+            if (! $argument instanceof Arg || ! $argument->value instanceof Expr\Array_) {
+                $allLiteral = false;
+                continue;
+            }
+
+            $extraction = $this->fieldExtractionFromCall($call, $position);
+            $fields = $this->mergeFields($fields, $extraction['fields']);
+            $allLiteral = $allLiteral && $extraction['complete'];
+        }
+
+        if (in_array($operation, ['increment', 'decrement'], true)) {
+            $field = $this->literalFieldArgument($call->args[0] ?? null);
+            $extraArgument = $call->args[2] ?? null;
+            $extra = ['fields' => [], 'complete' => true];
+
+            if ($extraArgument !== null) {
+                $extra = $this->fieldExtractionFromCall($call, 2);
+            }
+
+            $fields = $this->mergeFields($field === null ? [] : [$field], $extra['fields']);
+            $complete = $field !== null
+                && $extra['complete']
+                && ($access['kind'] ?? null) === 'table_query';
+
+            return [
+                'fields' => $fields,
+                'fieldCoverage' => $complete ? 'complete' : 'unknown',
+                ...($fields === [] ? [] : ['fieldEvidence' => 'literal_field_argument']),
+            ];
+        }
+
+        if (in_array($operation, ['forceDelete', 'truncate'], true)
+            || ($operation === 'delete' && ($access['kind'] ?? null) === 'table_query')) {
+            return ['fields' => [], 'fieldCoverage' => 'whole_row'];
+        }
+
+        if (in_array($operation, ['delete', 'deleteQuietly', 'destroy', 'restore', 'restoreQuietly'], true)) {
+            // Eloquent deletes may be soft deletes, and restores update a
+            // model-defined deleted-at column. Without model trait metadata the
+            // affected fields are intentionally left open.
+            return ['fields' => [], 'fieldCoverage' => 'unknown'];
+        }
+
+        $complete = $fields !== []
+            && $allLiteral
+            && ($access['kind'] ?? null) === 'table_query';
+
+        return [
+            'fields' => $fields,
+            'fieldCoverage' => $complete ? 'complete' : 'unknown',
+            ...($fields === [] ? [] : ['fieldEvidence' => 'literal_payload']),
+        ];
+    }
+
+    /**
+     * @return array{fields: array<int, string>, complete: bool}
+     */
+    private function queryFieldEvidenceFromCall(Expr\MethodCall|Expr\StaticCall $call, string $operation): array
+    {
+        if (in_array($operation, ['addSelect', 'select'], true)) {
+            $fields = [];
+            $complete = true;
+
+            foreach ($call->args as $argument) {
+                if (! $argument instanceof Arg) {
+                    $complete = false;
+                    continue;
+                }
+
+                if ($argument->unpack) {
+                    $complete = false;
+                }
+
+                if ($argument->value instanceof Scalar\String_) {
+                    $field = $this->normalizeLiteralField($argument->value->value);
+
+                    if ($field !== null) {
+                        $fields[] = $field;
+                    } else {
+                        $complete = false;
+                    }
+                } elseif ($argument->value instanceof Expr\Array_) {
+                    foreach ($argument->value->items as $item) {
+                        if ($item?->unpack) {
+                            $complete = false;
+                        }
+
+                        if ($item?->value instanceof Scalar\String_) {
+                            $field = $this->normalizeLiteralField($item->value->value);
+
+                            if ($field !== null) {
+                                $fields[] = $field;
+                            } else {
+                                $complete = false;
+                            }
+                        } else {
+                            $complete = false;
+                        }
+                    }
+                } else {
+                    $complete = false;
+                }
+            }
+
+            $fields = $this->mergeFields([], $fields);
+            return [
+                'fields' => $fields,
+                'complete' => $complete,
+            ];
+        }
+
+        if (! in_array($operation, [
+            'avg', 'count', 'max', 'min', 'sum', 'value', 'pluck',
+            'where', 'orWhere', 'whereDate', 'whereIn', 'whereNotNull', 'whereNull', 'orderBy',
+        ], true)) {
+            $fieldFree = in_array($operation, [
+                'distinct', 'limit', 'newModelQuery', 'newQuery', 'on', 'query', 'take',
+            ], true);
+
+            return [
+                'fields' => [],
+                'complete' => $fieldFree,
+            ];
+        }
+
+        $positions = $operation === 'pluck' ? [0, 1] : [0];
+        $fields = [];
+        $complete = true;
+
+        foreach ($positions as $position) {
+            $argument = $call->args[$position] ?? null;
+
+            if ($argument === null && $position > 0) {
+                continue;
+            }
+
+            $field = $this->literalFieldArgument($argument);
+
+            if ($field === null) {
+                $complete = false;
+            } else {
+                $fields[] = $field;
+            }
+        }
+
+        $fields = $this->mergeFields([], $fields);
+        return [
+            'fields' => $fields,
+            'complete' => $complete,
+        ];
+    }
+
+    /**
+     * @return array{fields: array<int, string>, complete: bool}
+     */
+    private function rowProjectionEvidence(Expr\MethodCall|Expr\StaticCall $call, string $operation): array
+    {
+        $position = match ($operation) {
+            'cursorPaginate', 'find', 'findMany', 'findOrFail', 'paginate', 'simplePaginate' => 1,
+            default => 0,
+        };
+        $argument = $call->args[$position] ?? null;
+
+        if ($argument === null) {
+            return ['fields' => ['*'], 'complete' => true];
+        }
+
+        return $this->fieldListFromArgument($argument);
+    }
+
+    /**
+     * @return array{fields: array<int, string>, complete: bool}
+     */
+    private function aggregateProjectionEvidence(Expr\MethodCall|Expr\StaticCall $call, string $operation): array
     {
         $argument = $call->args[0] ?? null;
 
-        if (! $argument instanceof Arg || ! $argument->value instanceof Expr\Array_) {
-            return [];
+        if ($argument === null) {
+            return [
+                'fields' => [],
+                'complete' => $operation === 'count',
+            ];
         }
 
-        $fields = $this->fieldsFromArray($argument->value);
+        $evidence = $this->fieldListFromArgument($argument);
+
+        // COUNT(*) does not read every individual column. It is a complete,
+        // column-free aggregate rather than a whole-row projection.
+        if ($operation === 'count' && $evidence['complete'] && $evidence['fields'] === ['*']) {
+            return ['fields' => [], 'complete' => true];
+        }
+
+        return $evidence;
+    }
+
+    /**
+     * @return array{fields: array<int, string>, complete: bool}
+     */
+    private function fieldListFromArgument(Arg|Node\VariadicPlaceholder $argument): array
+    {
+        if (! $argument instanceof Arg || $argument->unpack) {
+            return ['fields' => [], 'complete' => false];
+        }
+
+        if ($argument->value instanceof Scalar\String_) {
+            $field = $this->normalizeLiteralField($argument->value->value);
+
+            return [
+                'fields' => $field === null ? [] : [$field],
+                'complete' => $field !== null,
+            ];
+        }
+
+        if (! $argument->value instanceof Expr\Array_) {
+            return ['fields' => [], 'complete' => false];
+        }
+
+        $fields = [];
+        $complete = true;
+
+        foreach ($argument->value->items as $item) {
+            if ($item === null || $item->unpack || ! $item->value instanceof Scalar\String_) {
+                $complete = false;
+                continue;
+            }
+
+            $field = $this->normalizeLiteralField($item->value->value);
+
+            if ($field === null) {
+                $complete = false;
+            } else {
+                $fields[] = $field;
+            }
+        }
+
+        return [
+            'fields' => $this->mergeFields([], $fields),
+            'complete' => $complete,
+        ];
+    }
+
+    private function literalFieldArgument(Arg|Node\VariadicPlaceholder|null $argument): ?string
+    {
+        return $argument instanceof Arg && $argument->value instanceof Scalar\String_
+            ? $this->normalizeLiteralField($argument->value->value)
+            : null;
+    }
+
+    private function normalizeLiteralField(string $field): ?string
+    {
+        $field = trim($field);
+
+        if (! preg_match('/^([A-Za-z_*][A-Za-z0-9_.*]*(?:->[A-Za-z0-9_*]+)*)(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?$/i', $field, $matches)) {
+            return null;
+        }
+
+        return $matches[1];
+    }
+
+    /** @param array<int, string> $fields */
+    private function fieldsContainWildcard(array $fields): bool
+    {
+        foreach ($fields as $field) {
+            if ($field === '*' || str_ends_with($field, '.*')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param array<int, string> ...$fieldSets
+     * @return array<int, string>
+     */
+    private function mergeFields(array ...$fieldSets): array
+    {
+        $fields = [];
+
+        foreach ($fieldSets as $fieldSet) {
+            foreach ($fieldSet as $field) {
+                if (is_string($field) && $field !== '') {
+                    $fields[$field] = $field;
+                }
+            }
+        }
+
         sort($fields);
 
-        return array_values(array_unique($fields));
+        return array_values($fields);
     }
 
     /**
      * @return array<int, string>
      */
-    private function fieldsFromArray(Expr\Array_ $array, string $prefix = ''): array
+    /** @return array{fields: array<int, string>, complete: bool} */
+    private function fieldExtractionFromCall(Expr\MethodCall|Expr\StaticCall $call, int $position): array
+    {
+        $argument = $call->args[$position] ?? null;
+
+        if (! $argument instanceof Arg || ! $argument->value instanceof Expr\Array_) {
+            return ['fields' => [], 'complete' => false];
+        }
+
+        $extraction = $this->fieldExtractionFromArray($argument->value);
+        $extraction['fields'] = $this->mergeFields([], $extraction['fields']);
+
+        return $extraction;
+    }
+
+    /** @return array{fields: array<int, string>, complete: bool} */
+    private function fieldExtractionFromArray(Expr\Array_ $array, string $prefix = ''): array
     {
         $fields = [];
+        $complete = true;
 
         foreach ($array->items as $item) {
             if ($item === null) {
+                $complete = false;
+                continue;
+            }
+
+            if ($item->unpack) {
+                $complete = false;
+            }
+
+            if (($item->key === null || $item->key instanceof Scalar\Int_)
+                && $prefix === ''
+                && $item->value instanceof Expr\Array_) {
+                $nested = $this->fieldExtractionFromArray($item->value);
+                $fields = [...$fields, ...$nested['fields']];
+                $complete = $complete && $nested['complete'];
                 continue;
             }
 
             $key = $this->arrayDimension($item->key);
 
             if ($key === null) {
+                if ($prefix !== '') {
+                    $fields[] = $prefix.'.{dynamic}';
+                }
+
+                $complete = false;
                 continue;
             }
 
             $path = $prefix === '' ? $key : $prefix.'.'.$key;
 
             if ($item->value instanceof Expr\Array_ && $item->value->items !== []) {
-                $nested = $this->fieldsFromArray($item->value, $path);
-                $fields = [...$fields, ...($nested === [] ? [$path] : $nested)];
+                $nested = $this->fieldExtractionFromArray($item->value, $path);
+                $fields = [...$fields, ...($nested['fields'] === [] ? [$path] : $nested['fields'])];
+                $complete = $complete && $nested['complete'];
             } else {
                 $fields[] = $path;
             }
         }
 
-        return $fields;
+        return ['fields' => $fields, 'complete' => $complete];
     }
 
     private function explicitTableFromClass(Stmt\Class_|Stmt\Trait_ $class): ?string

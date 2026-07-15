@@ -74,6 +74,14 @@ class McpToolsTest extends TestCase
                 ->where('results.0.id', 'App\Services\NoteService::save')
                 ->etc());
 
+        AppGraphServer::tool(QueryTool::class, ['query' => 'writes-to', 'target' => 'notes.title'])
+            ->assertOk()
+            ->assertStructuredContent(fn (AssertableJson $json) => $json
+                ->where('column', 'column:notes.title')
+                ->where('results.0.match', 'possible')
+                ->where('counts.possible', 1)
+                ->etc());
+
         AppGraphServer::tool(QueryTool::class, ['query' => 'impact-of', 'target' => 'notes.title'])
             ->assertOk()
             ->assertStructuredContent(fn (AssertableJson $json) => $json

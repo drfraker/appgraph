@@ -83,6 +83,153 @@ class GraphIndexTest extends TestCase
         $this->assertSame('App\Http\Controllers\NoteController::update', $limited[0]['id']);
     }
 
+    public function test_traverse_replaces_a_weak_shallow_visit_with_a_stronger_ranked_path(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => array_map(
+                static fn (string $id): array => ['id' => $id, 'type' => 'method', 'label' => $id],
+                ['A', 'B', 'T'],
+            ),
+            'edges' => [
+                ['from' => 'A', 'to' => 'T', 'type' => 'calls', 'confidence' => 0.2],
+                ['from' => 'A', 'to' => 'B', 'type' => 'calls', 'confidence' => 0.95],
+                ['from' => 'B', 'to' => 'T', 'type' => 'calls', 'confidence' => 0.95],
+                ['from' => 'T', 'to' => 'A', 'type' => 'calls', 'confidence' => 1.0],
+            ],
+        ];
+
+        $results = GraphIndex::fromArray($graph)->traverse('A', ['calls']);
+        $target = collect($results)->firstWhere('id', 'T');
+
+        $this->assertSame(['B', 'T'], array_column($results, 'id'));
+        $this->assertSame(2, $target['depth']);
+        $this->assertSame(0.9025, $target['confidence']);
+        $this->assertSame('B', $target['via']);
+        $this->assertSame(['A', 'B', 'T'], $target['path']);
+    }
+
+    public function test_top_paths_returns_distinct_complete_paths_in_rank_order_and_ignores_cycles(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => array_map(
+                static fn (string $id): array => ['id' => $id, 'type' => 'method', 'label' => $id],
+                ['A', 'B', 'C', 'T'],
+            ),
+            // Deliberately place the weakest path first to prove input order is irrelevant.
+            'edges' => [
+                ['from' => 'A', 'to' => 'T', 'type' => 'calls', 'confidence' => 0.3],
+                ['from' => 'C', 'to' => 'T', 'type' => 'calls', 'confidence' => 0.8],
+                ['from' => 'A', 'to' => 'C', 'type' => 'calls', 'confidence' => 0.9],
+                ['from' => 'B', 'to' => 'T', 'type' => 'calls', 'confidence' => 0.95],
+                ['from' => 'A', 'to' => 'B', 'type' => 'calls', 'confidence' => 0.95],
+                ['from' => 'T', 'to' => 'A', 'type' => 'calls', 'confidence' => 1.0],
+            ],
+        ];
+
+        $truncated = false;
+        $paths = GraphIndex::fromArray($graph)->topPaths(
+            'A',
+            'T',
+            ['calls'],
+            maxDepth: 4,
+            limit: 3,
+            truncated: $truncated,
+        );
+
+        $this->assertSame([
+            ['A', 'B', 'T'],
+            ['A', 'C', 'T'],
+            ['A', 'T'],
+        ], array_column($paths, 'nodes'));
+        $this->assertSame([0.9025, 0.72, 0.3], array_column($paths, 'confidence'));
+        $this->assertSame([2, 2, 1], array_column($paths, 'depth'));
+        $this->assertCount(2, $paths[0]['edges']);
+        $this->assertFalse($truncated);
+
+        $reordered = $graph;
+        $reordered['edges'] = array_reverse($reordered['edges']);
+        $this->assertSame(
+            array_column($paths, 'nodes'),
+            array_column(GraphIndex::fromArray($reordered)->topPaths('A', 'T', ['calls']), 'nodes')
+        );
+
+        $reverse = GraphIndex::fromArray($graph)->topPaths('T', 'A', ['calls'], direction: 'in');
+        $this->assertSame(['T', 'B', 'A'], $reverse[0]['nodes']);
+
+        $limited = GraphIndex::fromArray($graph)->topPaths('A', 'T', ['calls'], limit: 2, truncated: $truncated);
+        $this->assertCount(2, $limited);
+        $this->assertTrue($truncated);
+    }
+
+    public function test_top_paths_hard_bounds_generated_states_on_dense_graphs(): void
+    {
+        $nodes = ['A', 'T'];
+        $edges = [];
+
+        for ($index = 0; $index < 6; $index++) {
+            $branch = 'B'.$index;
+            $nodes[] = $branch;
+            $edges[] = ['from' => 'A', 'to' => $branch, 'type' => 'calls', 'confidence' => 1.0];
+            $edges[] = ['from' => $branch, 'to' => 'T', 'type' => 'calls', 'confidence' => 1.0];
+        }
+
+        $graph = [
+            'meta' => [],
+            'nodes' => array_map(
+                static fn (string $id): array => ['id' => $id, 'type' => 'method', 'label' => $id],
+                $nodes,
+            ),
+            'edges' => array_reverse($edges),
+        ];
+        $truncated = false;
+        $paths = GraphIndex::fromArray($graph)->topPaths(
+            'A',
+            'T',
+            ['calls'],
+            maxDepth: 3,
+            limit: 10,
+            maxStates: 10,
+            truncated: $truncated,
+        );
+
+        $this->assertTrue($truncated);
+        $this->assertCount(3, $paths);
+        $this->assertSame([
+            ['A', 'B0', 'T'],
+            ['A', 'B1', 'T'],
+            ['A', 'B2', 'T'],
+        ], array_column($paths, 'nodes'));
+    }
+
+    public function test_top_paths_spends_a_tight_state_budget_on_the_strongest_edges(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => array_map(
+                static fn (string $id): array => ['id' => $id, 'type' => 'method', 'label' => $id],
+                ['A', 'B', 'C', 'T'],
+            ),
+            'edges' => [
+                ['from' => 'A', 'to' => 'B', 'type' => 'calls', 'confidence' => 0.1],
+                ['from' => 'A', 'to' => 'C', 'type' => 'calls', 'confidence' => 0.2],
+                ['from' => 'A', 'to' => 'T', 'type' => 'calls', 'confidence' => 1.0],
+            ],
+        ];
+        $truncated = false;
+        $paths = GraphIndex::fromArray($graph)->topPaths(
+            'A',
+            'T',
+            ['calls'],
+            maxStates: 3,
+            truncated: $truncated,
+        );
+
+        $this->assertTrue($truncated);
+        $this->assertSame([['A', 'T']], array_column($paths, 'nodes'));
+    }
+
     public function test_search_matches_id_and_label_case_insensitively(): void
     {
         $index = GraphIndex::fromArray($this->queryFixtureGraph());

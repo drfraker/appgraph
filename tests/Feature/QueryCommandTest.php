@@ -46,6 +46,19 @@ class QueryCommandTest extends TestCase
         );
     }
 
+    public function test_column_writer_query_preserves_field_certainty(): void
+    {
+        $payload = $this->runQuery([
+            'query' => 'writes-to',
+            'target' => 'notes.title',
+        ]);
+
+        $this->assertSame('column:notes.title', $payload['column']);
+        $this->assertSame('possible', $payload['results'][0]['match']);
+        $this->assertSame(0, $payload['counts']['proven']);
+        $this->assertSame(1, $payload['counts']['possible']);
+    }
+
     public function test_flow_from_route_name_returns_a_feature_slice(): void
     {
         $payload = $this->runQuery([

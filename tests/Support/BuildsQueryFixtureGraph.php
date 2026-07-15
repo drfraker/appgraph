@@ -44,7 +44,7 @@ trait BuildsQueryFixtureGraph
                 ['from' => 'App\Services\NoteService::save', 'to' => 'table:notes', 'type' => 'writes', 'confidence' => 0.85, 'metadata' => [
                     'operations' => [
                         '16:create:model_table' => ['line' => 16, 'operation' => 'create'],
-                        '18:save:model_table' => ['line' => 18, 'operation' => 'save'],
+                        '18:save:model_table' => ['line' => 18, 'operation' => 'save', 'fieldCoverage' => 'unknown'],
                     ],
                 ]],
                 ['from' => 'App\Http\Controllers\NoteController::index', 'to' => 'table:notes', 'type' => 'reads', 'confidence' => 0.9, 'metadata' => [

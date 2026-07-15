@@ -143,6 +143,16 @@ php artisan appgraph:query impact-of progress_notes.title --pretty
 ```
 
 Confidence values multiply along multi-hop paths — treat them as a ranking heuristic for how certain the static analysis is, not a probability. Filter noise with `--min-confidence`.
+Traversal keeps the strongest supported path to each node, even when it is longer
+than a weak direct edge. Complete path queries can retain several distinct ranked
+paths using confidence, evidence diversity, depth, and deterministic path ordering.
+
+Column targets preserve field precision. For example, `writes-to users.email`
+separates methods with literal `email` writes and whole-row operations (`proven`)
+from dynamic or incomplete operations (`possible`) and complete literal writes to
+other fields (`excluded`). Missing coverage metadata from older graph generations
+is treated as unknown rather than as proof that a column is untouched.
+Table and model targets retain the original compact reader/writer result shape.
 
 `flow-from` includes `analysisWarnings` when application calls on the selected path could
 not be resolved statically, or when no test could be mapped to the selected route. Calls
@@ -216,6 +226,9 @@ Uncertain inferred relationships include a confidence score below `1.0` and expl
 Edges with source provenance also retain a deduplicated `metadata.evidence` map, so
 multiple call sites supporting the same `(from, to, type)` relationship are not lost
 when deterministic edge merging combines them.
+Data-flow operation records include `fieldCoverage` (`complete`, `unknown`, or
+`whole_row`) and `fieldEvidence` when available. Column queries use that distinction
+to distinguish proven whole-row access from incomplete table-level evidence.
 Call inference follows declared application return types and common Eloquent query/model
 results. It also carries model element types through common collection operations and
 untyped collection callbacks. Writes through abstract model parameters fan out to indexed concrete descendant tables at

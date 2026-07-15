@@ -111,6 +111,7 @@ class ProgressNoteController
         $note->billingCodes()->pluck('id');
         $note->meta['signed_at'] = now();
         $note->update(['body' => 'Changed', 'meta' => ['signed_by' => 1]]);
+        $note->save(['touch' => false]);
     }
 
     public function bulkUpdate(): void
@@ -118,6 +119,39 @@ class ProgressNoteController
         ProgressNote::query()->where('id', 1)->update(['body' => 'Changed']);
         DB::table('progress_notes')->count();
         $queryFactory = ProgressNote::query(...);
+    }
+
+    public function findByBody(): void
+    {
+        ProgressNote::query()->where('body', 'Changed')->select('id', 'body as note_body')->get();
+        ProgressNote::pluck('body', 'id');
+        ProgressNote::select('*')->get();
+        $dynamic = ['updated_at'];
+        ProgressNote::select('id', ...$dynamic)->get();
+    }
+
+    public function queryBuilderReads(): void
+    {
+        DB::table('progress_notes')->where('body', 'Changed')->select('email')->select('id')->get();
+        DB::table('progress_notes')->select('id')->get();
+        DB::table('progress_notes')->select('*')->get();
+        $dynamic = ['updated_at'];
+        DB::table('progress_notes')->select('id', ...$dynamic)->get();
+        DB::table('progress_notes')->find(1, ['body']);
+    }
+
+    public function queryBuilderWrites(): void
+    {
+        $payload = ['title' => 'Changed'];
+        DB::table('progress_notes')->update(['body' => 'Changed', ...$payload]);
+        DB::table('progress_notes')->increment('visits', 1, ['updated_at' => now()]);
+        DB::table('progress_notes')->increment('visits', 1, $payload);
+        DB::table('progress_notes')->delete();
+    }
+
+    public function sameLineWrites(): void
+    {
+        DB::table('progress_notes')->update(['alpha' => 1]); DB::table('progress_notes')->update(['omega' => 1]);
     }
 
     public function mutateAbstractModel(AbstractNote $note): void
@@ -147,6 +181,10 @@ PHP);
         $this->assertGraphHasEdge($array, $controller.'::update', 'table:billing_codes', 'reads');
         $this->assertGraphHasEdge($array, $controller.'::bulkUpdate', 'table:progress_notes', 'writes');
         $this->assertGraphHasEdge($array, $controller.'::bulkUpdate', 'table:progress_notes', 'reads');
+        $this->assertGraphHasEdge($array, $controller.'::findByBody', 'table:progress_notes', 'reads');
+        $this->assertGraphHasEdge($array, $controller.'::queryBuilderReads', 'table:progress_notes', 'reads');
+        $this->assertGraphHasEdge($array, $controller.'::queryBuilderWrites', 'table:progress_notes', 'writes');
+        $this->assertGraphHasEdge($array, $controller.'::sameLineWrites', 'table:progress_notes', 'writes');
         $this->assertGraphHasEdge($array, $controller.'::mutateAbstractModel', 'table:progress_notes', 'writes');
 
         $pivotEdge = $this->graphEdge($array, $controller.'::update', 'table:billables', 'writes');
@@ -161,6 +199,48 @@ PHP);
         $this->assertContains('meta.signed_at', $fields);
         $this->assertContains('meta.signed_by', $fields);
         $this->assertContains('body', $fields);
+        $fieldCoverage = array_column(array_values($updateEdge['metadata']['operations']), 'fieldCoverage');
+        $this->assertContains('complete', $fieldCoverage);
+        $this->assertContains('unknown', $fieldCoverage);
+        $saveOperation = collect(array_values($updateEdge['metadata']['operations']))
+            ->firstWhere('operation', 'save');
+        $this->assertSame([], $saveOperation['fields']);
+        $this->assertSame('unknown', $saveOperation['fieldCoverage']);
+
+        $readEdge = $this->graphEdge($array, $controller.'::findByBody', 'table:progress_notes', 'reads');
+        $readOperations = array_values($readEdge['metadata']['operations']);
+        $this->assertSame(['get', 'pluck'], array_values(array_unique(array_column($readOperations, 'operation'))));
+        $this->assertSame(['body', 'id'], $readOperations[0]['fields']);
+        $this->assertSame(['body', 'id'], $readOperations[1]['fields']);
+        $this->assertSame('*', $readOperations[2]['fields'][0]);
+        $this->assertSame(['id'], $readOperations[3]['fields']);
+        $this->assertSame(['unknown', 'unknown', 'unknown', 'unknown'], array_column($readOperations, 'fieldCoverage'));
+
+        $queryReadEdge = $this->graphEdge($array, $controller.'::queryBuilderReads', 'table:progress_notes', 'reads');
+        $queryReadOperations = array_values($queryReadEdge['metadata']['operations']);
+        $this->assertSame(['body', 'id'], $queryReadOperations[0]['fields']);
+        $this->assertNotContains('email', $queryReadOperations[0]['fields']);
+        $this->assertSame(['id'], $queryReadOperations[1]['fields']);
+        $this->assertSame(['*'], $queryReadOperations[2]['fields']);
+        $this->assertSame(['id'], $queryReadOperations[3]['fields']);
+        $this->assertSame(['body', 'id'], $queryReadOperations[4]['fields']);
+        $this->assertSame(['complete', 'complete', 'whole_row', 'unknown', 'complete'], array_column($queryReadOperations, 'fieldCoverage'));
+
+        $queryWriteEdge = $this->graphEdge($array, $controller.'::queryBuilderWrites', 'table:progress_notes', 'writes');
+        $queryWriteOperations = array_values($queryWriteEdge['metadata']['operations']);
+        $this->assertSame(['body'], $queryWriteOperations[0]['fields']);
+        $this->assertSame('unknown', $queryWriteOperations[0]['fieldCoverage']);
+        $this->assertSame(['updated_at', 'visits'], $queryWriteOperations[1]['fields']);
+        $this->assertSame('complete', $queryWriteOperations[1]['fieldCoverage']);
+        $this->assertSame(['visits'], $queryWriteOperations[2]['fields']);
+        $this->assertSame('unknown', $queryWriteOperations[2]['fieldCoverage']);
+        $this->assertSame([], $queryWriteOperations[3]['fields']);
+        $this->assertSame('whole_row', $queryWriteOperations[3]['fieldCoverage']);
+
+        $sameLineEdge = $this->graphEdge($array, $controller.'::sameLineWrites', 'table:progress_notes', 'writes');
+        $sameLineOperations = array_values($sameLineEdge['metadata']['operations']);
+        $this->assertCount(2, $sameLineOperations);
+        $this->assertSame(['alpha', 'omega'], array_merge(...array_column($sameLineOperations, 'fields')));
 
         $abstractEdge = $this->graphEdge($array, $controller.'::mutateAbstractModel', 'table:progress_notes', 'writes');
         $this->assertSame('possible_model_table', $abstractEdge['metadata']['targetRole']);

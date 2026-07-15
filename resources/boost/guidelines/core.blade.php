@@ -5,6 +5,7 @@ AppGraph is a local Laravel application map for AI-assisted feature work and ref
 - Start with `appgraph_overview`; refresh once with `appgraph_refresh` when the graph is stale and current results matter.
 - Use `appgraph_search` to resolve exact ids.
 - Use `appgraph_query` with `flow-from`, `impact-of`, `routes-touching`, `writes-to`, `reads-from`, `callers-of`, or `calls-from`. `flow-from` also surfaces middleware, authorization, field writes, side effects, frontend consumers, mapped tests, and unresolved-call warnings.
+- Column reader/writer queries separate `proven`, `possible`, and `excluded` matches. Inspect possible matches before changing a field because their operations are dynamic or incomplete; whole-row operations are proven matches.
 - Read and verify the returned source files before editing, especially for low-confidence results.
 - Refresh after a meaningful batch of edits before using AppGraph for final verification.
 

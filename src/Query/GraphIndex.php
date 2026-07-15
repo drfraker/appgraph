@@ -207,12 +207,14 @@ class GraphIndex
     }
 
     /**
-     * Breadth-first traversal from a node, multiplying edge confidence along the
-     * path. The first visit to a node wins (BFS guarantees it is the shallowest);
-     * results are sorted by [depth, id] so output stays deterministic.
+     * Rank bounded paths by confidence rather than keeping the first shallow
+     * visit. Dynamic programming retains the strongest path to each node at each
+     * depth, then selects the strongest result across depths with deterministic
+     * depth/path tie-breakers. Evidence diversity is reported, but it is not a
+     * safe pruning criterion because later edges can change the evidence set.
      *
      * @param array<int, string> $edgeTypes
-     * @return array<int, array{id: string, depth: int, confidence: float, via: string, edgeType: string}>
+     * @return array<int, array{id: string, depth: int, confidence: float, via: string, edgeType: string, path: array<int, string>, evidenceCount: int}>
      */
     public function traverse(
         string $startId,
@@ -223,47 +225,80 @@ class GraphIndex
         int $limit = 50,
         bool &$truncated = false,
     ): array {
-        $results = [];
-        $visited = [$startId => true];
-        $queue = [[$startId, 0, 1.0]];
+        $resultsById = [];
+        $states = [[
+            $startId => [
+                'id' => $startId,
+                'depth' => 0,
+                'confidence' => 1.0,
+                'via' => $startId,
+                'edgeType' => '',
+                'path' => [$startId],
+                'evidenceCount' => 0,
+            ],
+        ]];
 
-        while ($queue !== []) {
-            [$currentId, $depth, $confidence] = array_shift($queue);
+        for ($depth = 0; $depth < $maxDepth; $depth++) {
+            $nextStates = [];
+            $currentStates = $states[$depth] ?? [];
+            ksort($currentStates);
 
-            if ($depth >= $maxDepth) {
-                continue;
+            foreach ($currentStates as $state) {
+                $edges = $direction === 'out'
+                    ? $this->edgesFrom($state['id'], $edgeTypes)
+                    : $this->edgesTo($state['id'], $edgeTypes);
+                usort($edges, static fn (array $a, array $b): int => [
+                    $direction === 'out' ? $a['to'] : $a['from'],
+                    $a['type'],
+                ] <=> [
+                    $direction === 'out' ? $b['to'] : $b['from'],
+                    $b['type'],
+                ]);
+
+                foreach ($edges as $edge) {
+                    $neighborId = $direction === 'out' ? $edge['to'] : $edge['from'];
+
+                    $pathConfidence = round($state['confidence'] * (float) ($edge['confidence'] ?? 1.0), 4);
+
+                    if ($pathConfidence < $minConfidence) {
+                        continue;
+                    }
+
+                    $candidate = [
+                        'id' => $neighborId,
+                        'depth' => $depth + 1,
+                        'confidence' => $pathConfidence,
+                        'via' => $state['id'],
+                        'edgeType' => $edge['type'],
+                        'path' => [...$state['path'], $neighborId],
+                        'evidenceKinds' => $this->mergeEvidenceKinds(
+                            $state['evidenceKinds'] ?? [],
+                            $this->edgeEvidenceKinds($edge),
+                        ),
+                    ];
+                    $candidate['evidenceCount'] = count($candidate['evidenceKinds']);
+
+                    if (! isset($nextStates[$neighborId]) || $this->pathRanksBefore($candidate, $nextStates[$neighborId])) {
+                        $nextStates[$neighborId] = $candidate;
+                    }
+
+                    if ($neighborId !== $startId
+                        && (! isset($resultsById[$neighborId]) || $this->pathRanksBefore($candidate, $resultsById[$neighborId]))) {
+                        $resultsById[$neighborId] = $candidate;
+                    }
+                }
             }
 
-            $edges = $direction === 'out'
-                ? $this->edgesFrom($currentId, $edgeTypes)
-                : $this->edgesTo($currentId, $edgeTypes);
-
-            foreach ($edges as $edge) {
-                $neighborId = $direction === 'out' ? $edge['to'] : $edge['from'];
-
-                if (isset($visited[$neighborId])) {
-                    continue;
-                }
-
-                $pathConfidence = round($confidence * (float) ($edge['confidence'] ?? 1.0), 4);
-
-                if ($pathConfidence < $minConfidence) {
-                    continue;
-                }
-
-                $visited[$neighborId] = true;
-                $results[] = [
-                    'id' => $neighborId,
-                    'depth' => $depth + 1,
-                    'confidence' => $pathConfidence,
-                    'via' => $currentId,
-                    'edgeType' => $edge['type'],
-                ];
-                $queue[] = [$neighborId, $depth + 1, $pathConfidence];
-            }
+            $states[$depth + 1] = $nextStates;
         }
 
-        usort($results, static fn (array $a, array $b): int => [$a['depth'], $a['id']] <=> [$b['depth'], $b['id']]);
+        $results = array_values($resultsById);
+        usort($results, fn (array $a, array $b): int => $this->compareTraversalPaths($a, $b));
+
+        foreach ($results as &$result) {
+            unset($result['evidenceKinds']);
+        }
+        unset($result);
 
         if (count($results) > $limit) {
             $truncated = true;
@@ -271,6 +306,306 @@ class GraphIndex
         }
 
         return $results;
+    }
+
+    /**
+     * Return several complete, distinct, simple paths ordered by deterministic
+     * confidence/evidence/depth ranking. Generated states are hard-bounded and
+     * retain parent pointers so dense graphs cannot grow an unbounded frontier.
+     *
+     * @param array<int, string> $edgeTypes
+     * @return array<int, array{nodes: array<int, string>, edges: array<int, array<string, mixed>>, depth: int, confidence: float, evidenceCount: int}>
+     */
+    public function topPaths(
+        string $startId,
+        string $destinationId,
+        array $edgeTypes,
+        string $direction = 'out',
+        int $maxDepth = 4,
+        float $minConfidence = 0.0,
+        int $limit = 3,
+        int $maxStates = 10000,
+        bool &$truncated = false,
+    ): array {
+        if ($startId === $destinationId || $limit < 1 || $maxDepth < 1) {
+            return [];
+        }
+
+        $frontier = new class extends \SplPriorityQueue
+        {
+            public function compare(mixed $priority1, mixed $priority2): int
+            {
+                foreach ([0, 1, 2, 3] as $position) {
+                    $comparison = $priority1[$position] <=> $priority2[$position];
+
+                    if ($comparison !== 0) {
+                        return $comparison;
+                    }
+                }
+
+                return 0;
+            }
+        };
+        $frontier->setExtractFlags(\SplPriorityQueue::EXTR_DATA);
+        $states = [[
+            'id' => $startId,
+            'depth' => 0,
+            'confidence' => 1.0,
+            'parent' => null,
+            'edge' => null,
+            'evidenceKinds' => [],
+            'evidenceCount' => 0,
+        ]];
+        $frontier->insert(0, [1.0, 0, 0, 0]);
+        $candidateStateIds = [];
+        $candidateKeys = [];
+        $generatedStates = 1;
+        $sequence = 0;
+        $budgetExhausted = $maxStates < 1;
+
+        if ($budgetExhausted) {
+            $truncated = true;
+        }
+
+        while (! $frontier->isEmpty()) {
+            $stateId = $frontier->extract();
+            $state = $states[$stateId];
+
+            if ($state['id'] === $destinationId) {
+                $path = $this->reconstructStatePath($states, $stateId);
+                $key = implode("\0", $path['nodes']);
+
+                if (! isset($candidateKeys[$key])) {
+                    $candidateKeys[$key] = true;
+                    $candidateStateIds[] = $stateId;
+                }
+
+                continue;
+            }
+
+            if ($state['depth'] >= $maxDepth || $budgetExhausted) {
+                continue;
+            }
+
+            $edges = $direction === 'out'
+                ? $this->edgesFrom($state['id'], $edgeTypes)
+                : $this->edgesTo($state['id'], $edgeTypes);
+            usort($edges, function (array $a, array $b) use ($direction, $state): int {
+                $aEvidence = $this->mergeEvidenceKinds($state['evidenceKinds'], $this->edgeEvidenceKinds($a));
+                $bEvidence = $this->mergeEvidenceKinds($state['evidenceKinds'], $this->edgeEvidenceKinds($b));
+
+                return [
+                    -round($state['confidence'] * (float) ($a['confidence'] ?? 1.0), 4),
+                    -count($aEvidence),
+                    $direction === 'out' ? $a['to'] : $a['from'],
+                    $a['type'],
+                ] <=> [
+                    -round($state['confidence'] * (float) ($b['confidence'] ?? 1.0), 4),
+                    -count($bEvidence),
+                    $direction === 'out' ? $b['to'] : $b['from'],
+                    $b['type'],
+                ];
+            });
+
+            foreach ($edges as $edge) {
+                $neighborId = $direction === 'out' ? $edge['to'] : $edge['from'];
+
+                if ($this->stateContainsNode($states, $stateId, $neighborId)) {
+                    continue;
+                }
+
+                $confidence = round($state['confidence'] * (float) ($edge['confidence'] ?? 1.0), 4);
+
+                if ($confidence < $minConfidence) {
+                    continue;
+                }
+
+                if ($generatedStates >= $maxStates) {
+                    $truncated = true;
+                    $budgetExhausted = true;
+
+                    break;
+                }
+
+                $evidenceKinds = $this->mergeEvidenceKinds(
+                    $state['evidenceKinds'],
+                    $this->edgeEvidenceKinds($edge),
+                );
+                $candidateStateId = count($states);
+                $states[] = [
+                    'id' => $neighborId,
+                    'depth' => $state['depth'] + 1,
+                    'confidence' => $confidence,
+                    'parent' => $stateId,
+                    'edge' => $edge,
+                    'evidenceKinds' => $evidenceKinds,
+                    'evidenceCount' => count($evidenceKinds),
+                ];
+                $sequence++;
+                $frontier->insert($candidateStateId, [
+                    $confidence,
+                    count($evidenceKinds),
+                    -($state['depth'] + 1),
+                    -$sequence,
+                ]);
+                $generatedStates++;
+            }
+        }
+
+        $candidatePaths = array_map(
+            fn (int $stateId): array => $this->reconstructStatePath($states, $stateId),
+            $candidateStateIds,
+        );
+        usort($candidatePaths, fn (array $a, array $b): int => $this->compareRankedPaths($a, $b));
+
+        if (count($candidatePaths) > $limit) {
+            $truncated = true;
+            $candidatePaths = array_slice($candidatePaths, 0, $limit);
+        }
+
+        return $candidatePaths;
+    }
+
+    /** @param array<string, mixed> $candidate @param array<string, mixed> $current */
+    private function pathRanksBefore(array $candidate, array $current): bool
+    {
+        return $this->compareTraversalPaths($candidate, $current) < 0;
+    }
+
+    /** @param array<string, mixed> $a @param array<string, mixed> $b */
+    private function compareTraversalPaths(array $a, array $b): int
+    {
+        return [
+            -(float) $a['confidence'],
+            (int) $a['depth'],
+            implode("\0", $a['path'] ?? []),
+            (string) $a['id'],
+        ] <=> [
+            -(float) $b['confidence'],
+            (int) $b['depth'],
+            implode("\0", $b['path'] ?? []),
+            (string) $b['id'],
+        ];
+    }
+
+    /** @param array<string, mixed> $a @param array<string, mixed> $b */
+    private function compareRankedPaths(array $a, array $b): int
+    {
+        $aPath = $a['path'] ?? $a['nodes'] ?? [];
+        $bPath = $b['path'] ?? $b['nodes'] ?? [];
+
+        return [
+            -(float) $a['confidence'],
+            -(int) ($a['evidenceCount'] ?? 0),
+            (int) $a['depth'],
+            implode("\0", $aPath),
+            (string) ($a['id'] ?? end($aPath)),
+        ] <=> [
+            -(float) $b['confidence'],
+            -(int) ($b['evidenceCount'] ?? 0),
+            (int) $b['depth'],
+            implode("\0", $bPath),
+            (string) ($b['id'] ?? end($bPath)),
+        ];
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $states
+     */
+    private function stateContainsNode(array $states, int $stateId, string $nodeId): bool
+    {
+        $cursor = $stateId;
+
+        while (isset($states[$cursor])) {
+            if ($states[$cursor]['id'] === $nodeId) {
+                return true;
+            }
+
+            $parent = $states[$cursor]['parent'];
+
+            if (! is_int($parent)) {
+                break;
+            }
+
+            $cursor = $parent;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $states
+     * @return array{nodes: array<int, string>, edges: array<int, array<string, mixed>>, depth: int, confidence: float, evidenceCount: int}
+     */
+    private function reconstructStatePath(array $states, int $stateId): array
+    {
+        $nodes = [];
+        $edges = [];
+        $cursor = $stateId;
+
+        while (isset($states[$cursor])) {
+            $state = $states[$cursor];
+            $nodes[] = $state['id'];
+
+            if (is_array($state['edge'])) {
+                $edges[] = $state['edge'];
+            }
+
+            $parent = $state['parent'];
+
+            if (! is_int($parent)) {
+                break;
+            }
+
+            $cursor = $parent;
+        }
+
+        return [
+            'nodes' => array_reverse($nodes),
+            'edges' => array_reverse($edges),
+            'depth' => $states[$stateId]['depth'],
+            'confidence' => $states[$stateId]['confidence'],
+            'evidenceCount' => $states[$stateId]['evidenceCount'],
+        ];
+    }
+
+    /** @param array<string, mixed> $edge @return array<int, string> */
+    private function edgeEvidenceKinds(array $edge): array
+    {
+        $kinds = [];
+
+        foreach ($edge['metadata']['evidence'] ?? [] as $evidence) {
+            if (! is_array($evidence)) {
+                continue;
+            }
+
+            $kind = $evidence['rule']
+                ?? $evidence['source']
+                ?? $evidence['inference']
+                ?? $evidence['syntax']
+                ?? 'source_location';
+            $kinds[(string) $kind] = (string) $kind;
+        }
+
+        sort($kinds);
+
+        return array_values($kinds);
+    }
+
+    /** @param array<int, string> ...$sets @return array<int, string> */
+    private function mergeEvidenceKinds(array ...$sets): array
+    {
+        $merged = [];
+
+        foreach ($sets as $set) {
+            foreach ($set as $kind) {
+                $merged[$kind] = $kind;
+            }
+        }
+
+        sort($merged);
+
+        return array_values($merged);
     }
 
     /**

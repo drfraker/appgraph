@@ -479,7 +479,12 @@ class QueryEngine
      */
     private function tableAccess(string $query, string $edgeType, string $target, int $limit): array
     {
-        $tableId = $this->resolveTableId($target);
+        [$tableId, $columnId, $field] = $this->resolveAccessTarget($target);
+
+        if ($columnId !== null && $field !== null) {
+            return $this->columnAccess($query, $edgeType, $target, $tableId, $columnId, $field, $limit);
+        }
+
         $truncated = false;
         $results = [];
 
@@ -514,6 +519,179 @@ class QueryEngine
         }
 
         return $this->envelope($query, $target, ['table' => $tableId, 'results' => $results], $truncated);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function columnAccess(
+        string $query,
+        string $edgeType,
+        string $target,
+        string $tableId,
+        string $columnId,
+        string $field,
+        int $limit,
+    ): array {
+        $matches = ['proven' => [], 'possible' => [], 'excluded' => []];
+
+        $tableName = str_starts_with($tableId, 'table:') ? substr($tableId, 6) : $tableId;
+
+        foreach ($this->index->edgesTo($tableId, [$edgeType]) as $edge) {
+            $classified = $this->classifyFieldOperations($edge, $field, $tableName);
+            $fromNode = $this->index->node($edge['from']);
+            $row = array_filter([
+                'id' => $edge['from'],
+                'file' => $fromNode['file'] ?? null,
+                'line' => $fromNode['line'] ?? null,
+                'confidence' => $edge['confidence'] ?? null,
+                'match' => $classified['match'],
+                'ops' => $classified['ops'] ?: null,
+                'fields' => $classified['fields'] ?: null,
+                'provenOps' => $classified['provenOps'] ?: null,
+                'possibleOps' => $classified['possibleOps'] ?: null,
+                'excludedOps' => $classified['excludedOps'] ?: null,
+            ], static fn (mixed $value): bool => $value !== null);
+            $matches[$classified['match']][] = $row;
+        }
+
+        foreach ($matches as &$group) {
+            usort($group, static fn (array $a, array $b): int => $a['id'] <=> $b['id']);
+        }
+        unset($group);
+
+        $counts = array_map('count', $matches);
+        $truncated = false;
+
+        foreach ($matches as &$group) {
+            if (count($group) > $limit) {
+                $truncated = true;
+                $group = array_slice($group, 0, $limit);
+            }
+        }
+        unset($group);
+
+        $results = [...$matches['proven'], ...$matches['possible']];
+
+        if (count($results) > $limit) {
+            $truncated = true;
+            $results = array_slice($results, 0, $limit);
+        }
+
+        return $this->envelope($query, $target, [
+            'table' => $tableId,
+            'column' => $columnId,
+            'field' => $field,
+            'results' => $results,
+            'matches' => $matches,
+            'counts' => $counts,
+        ], $truncated);
+    }
+
+    /**
+     * @param array<string, mixed> $edge
+     * @return array{match: string, ops: array<int, string>, fields: array<int, string>, provenOps: array<int, string>, possibleOps: array<int, string>, excludedOps: array<int, string>}
+     */
+    private function classifyFieldOperations(array $edge, string $field, string $table): array
+    {
+        $operations = $edge['metadata']['operations'] ?? [];
+
+        if ($operations === []) {
+            return [
+                'match' => 'possible',
+                'ops' => [],
+                'fields' => [],
+                'provenOps' => [],
+                'possibleOps' => [],
+                'excludedOps' => [],
+            ];
+        }
+
+        $classified = ['proven' => [], 'possible' => [], 'excluded' => []];
+        $allFields = [];
+
+        foreach ($operations as $operation) {
+            if (! is_array($operation)) {
+                continue;
+            }
+
+            $name = isset($operation['operation']) ? (string) $operation['operation'] : 'unknown';
+            $fields = array_values(array_filter(
+                $operation['fields'] ?? [],
+                static fn (mixed $value): bool => is_string($value) && $value !== '',
+            ));
+
+            foreach ($fields as $operationField) {
+                $allFields[$operationField] = $operationField;
+            }
+
+            $coverage = $operation['fieldCoverage'] ?? 'unknown';
+
+            if ($coverage === 'whole_row' || $this->fieldsProveColumn($fields, $field, $table)) {
+                $classified['proven'][$name] = $name;
+                continue;
+            }
+
+            if ($coverage !== 'complete' || $this->fieldsAreDynamic($fields)) {
+                $classified['possible'][$name] = $name;
+            } else {
+                $classified['excluded'][$name] = $name;
+            }
+        }
+
+        foreach ($classified as &$ops) {
+            sort($ops);
+            $ops = array_values($ops);
+        }
+        unset($ops);
+        sort($allFields);
+
+        $match = $classified['proven'] !== []
+            ? 'proven'
+            : ($classified['possible'] !== [] ? 'possible' : 'excluded');
+        $relevant = $match === 'proven'
+            ? [...$classified['proven'], ...$classified['possible']]
+            : $classified[$match];
+        $relevant = array_values(array_unique($relevant));
+        sort($relevant);
+
+        return [
+            'match' => $match,
+            'ops' => $relevant,
+            'fields' => array_values($allFields),
+            'provenOps' => $classified['proven'],
+            'possibleOps' => $classified['possible'],
+            'excludedOps' => $classified['excluded'],
+        ];
+    }
+
+    /** @param array<int, string> $fields */
+    private function fieldsProveColumn(array $fields, string $column, string $table): bool
+    {
+        foreach ($fields as $field) {
+            $root = preg_split('/\.|->/', $field, 2)[0] ?? $field;
+
+            if ($field === $column
+                || $root === $column
+                || $field === $table.'.'.$column
+                || str_starts_with($field, $table.'.'.$column.'->')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** @param array<int, string> $fields */
+    private function fieldsAreDynamic(array $fields): bool
+    {
+        foreach ($fields as $field) {
+            if (str_contains($field, '{dynamic}')) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -663,7 +841,8 @@ class QueryEngine
         return $result['id'];
     }
 
-    private function resolveTableId(string $target): string
+    /** @return array{0: string, 1: ?string, 2: ?string} */
+    private function resolveAccessTarget(string $target): array
     {
         $id = $this->resolve($target);
         $node = $this->index->node($id);
@@ -673,7 +852,7 @@ class QueryEngine
             $tableEdge = $this->index->edgesFrom($id, ['uses_table'])[0] ?? null;
 
             if ($tableEdge !== null) {
-                return $tableEdge['to'];
+                return [$tableEdge['to'], null, null];
             }
         }
 
@@ -681,7 +860,15 @@ class QueryEngine
             $tableEdge = $this->index->edgesTo($id, ['has_column'])[0] ?? null;
 
             if ($tableEdge !== null) {
-                return $tableEdge['from'];
+                $table = $tableEdge['from'];
+                $tableName = str_starts_with($table, 'table:') ? substr($table, 6) : $table;
+                $prefix = $tableName.'.';
+                $label = (string) ($node['label'] ?? '');
+                $field = str_starts_with($label, $prefix)
+                    ? substr($label, strlen($prefix))
+                    : preg_replace('/^column:[^.]+\./', '', $id);
+
+                return [$table, $id, is_string($field) && $field !== '' ? $field : null];
             }
         }
 
@@ -689,7 +876,7 @@ class QueryEngine
             throw new UnresolvedTargetException($target);
         }
 
-        return $id;
+        return [$id, null, null];
     }
 
     /**

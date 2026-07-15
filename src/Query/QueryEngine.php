@@ -15,6 +15,26 @@ class QueryEngine
         'handled_by',
     ];
 
+    /** @var array<string, array<int, string>> */
+    private const FLOW_RELATED_GROUP_EDGE_TYPES = [
+        'formRequests' => ['validates_with'],
+        'models' => ['uses_model'],
+        'dataAccess' => ['reads', 'writes'],
+        'dispatches' => ['dispatches'],
+        'sideEffects' => [
+            'reads_cache',
+            'writes_cache',
+            'reads_filesystem',
+            'writes_filesystem',
+            'calls_external',
+        ],
+        'authorization' => ['authorizes_via'],
+        'frontendConsumers' => ['consumes_route'],
+        'tests' => ['tests_route'],
+    ];
+
+    private const DEFAULT_MAX_RELATED_FACTS = 10000;
+
     public function __construct(
         private GraphIndex $index,
         private ?StalenessChecker $staleness = null,
@@ -153,18 +173,45 @@ class QueryEngine
      * dispatched events/jobs. This is intentionally a map for source discovery,
      * not a claim that every dynamic runtime path is represented.
      *
+     * @param array<int, string>|null $relatedGroups Internal projection
+     *        selectivity; null retains every public flow group.
      * @return array<string, mixed>
      */
-    public function flowFrom(string $target, int $depth = 4, int $limit = 50, float $minConfidence = 0.0): array
+    public function flowFrom(
+        string $target,
+        int $depth = 4,
+        int $limit = 50,
+        float $minConfidence = 0.0,
+        ?int $relatedLimit = null,
+        int $maxTransitions = 10000,
+        int $maxRelatedFacts = self::DEFAULT_MAX_RELATED_FACTS,
+        ?array $relatedGroups = null,
+        bool $includeDispatchDetails = true,
+        bool $includeDataAccessDetails = true,
+        bool $includeAnalysisWarnings = true,
+    ): array
     {
+        $depth = max(0, $depth);
+        $limit = max(1, $limit);
+        $relatedLimit = max(1, $relatedLimit ?? $limit);
+        $maxTransitions = max(0, $maxTransitions);
+        $maxRelatedFacts = max(0, $maxRelatedFacts);
+        $selectedRelatedGroups = $this->selectedFlowRelatedGroups($relatedGroups);
+        $selectedRelatedEdgeTypes = $this->selectedFlowRelatedEdgeTypes($selectedRelatedGroups);
         $resolvedId = $this->resolve($target);
         $resolvedNode = $this->index->node($resolvedId);
         $route = null;
+        $routeActionSelectionTruncated = false;
         $entrypointId = $resolvedId;
         $entrypointConfidence = 1.0;
 
         if (($resolvedNode['type'] ?? null) === 'route') {
-            $routeEdge = $this->index->edgesFrom($resolvedId, ['routes_to'])[0] ?? null;
+            $routeEdge = $this->index->rankedEdgesFrom(
+                $resolvedId,
+                ['routes_to'],
+                1,
+                $routeActionSelectionTruncated,
+            )[0] ?? null;
 
             if ($routeEdge === null) {
                 throw new \RuntimeException("Route [{$target}] has no resolvable action in AppGraph.");
@@ -192,7 +239,10 @@ class QueryEngine
             throw new \RuntimeException("AppGraph resolved [{$target}] to an action that is not a method.");
         }
 
-        $truncated = false;
+        $truncated = $routeActionSelectionTruncated;
+        $executionTraversalTruncated = false;
+        $actionReservationTruncated = false;
+        $remainingTransitions = $maxTransitions;
         $methodSeeds = [[
             'id' => $entrypointId,
             'confidence' => $entrypointConfidence,
@@ -200,7 +250,17 @@ class QueryEngine
         ]];
 
         if ($route !== null) {
-            foreach ($this->index->edgesFrom($resolvedId, ['passes_through']) as $middlewareEdge) {
+            $middlewareSeedTruncated = false;
+            $middlewareEdges = $this->index->rankedEdgesFrom(
+                $resolvedId,
+                ['passes_through'],
+                $remainingTransitions,
+                $middlewareSeedTruncated,
+            );
+            $remainingTransitions -= count($middlewareEdges);
+            $executionTraversalTruncated = $middlewareSeedTruncated;
+
+            foreach ($middlewareEdges as $middlewareEdge) {
                 $middleware = $this->index->node($middlewareEdge['to']);
                 $middlewareConfidence = round((float) ($middlewareEdge['confidence'] ?? 1.0), 4);
 
@@ -235,11 +295,15 @@ class QueryEngine
                 $neighborId,
                 $direction,
             ),
-            truncated: $truncated,
+            maxTransitions: $remainingTransitions,
+            truncated: $executionTraversalTruncated,
         );
+
+        $truncated = $truncated || $executionTraversalTruncated;
 
         if (! in_array($entrypointId, array_column($methodHits, 'id'), true)) {
             $truncated = true;
+            $actionReservationTruncated = true;
             array_unshift($methodHits, [
                 'id' => $entrypointId,
                 'depth' => 0,
@@ -262,10 +326,23 @@ class QueryEngine
         $dispatches = [];
         $sideEffects = [];
         $authorization = [];
+        $remainingRelatedFacts = $maxRelatedFacts;
+        $relatedFactsConsumed = 0;
+        $relatedFactsTruncated = false;
+        $relatedFactTruncationStages = [];
+        $methodHitsById = [];
+        $relatedSources = [];
 
         foreach ($methodHits as $hit) {
             $method = $this->index->node($hit['id']);
             $pathConfidence = (float) $hit['confidence'];
+            $methodHitsById[$hit['id']] = $hit;
+            $relatedSources[] = [
+                'id' => $hit['id'],
+                'confidence' => $pathConfidence,
+                'depth' => $hit['depth'],
+                'path' => $hit['path'] ?? [$hit['id']],
+            ];
 
             $methods[$hit['id']] = array_filter([
                 'id' => $hit['id'],
@@ -275,125 +352,171 @@ class QueryEngine
                 'file' => $method['file'] ?? null,
                 'line' => $method['line'] ?? null,
             ], static fn ($value): bool => $value !== null);
+        }
 
-            foreach ($this->index->edgesFrom($hit['id'], [
-                'validates_with',
-                'uses_model',
-                'reads',
-                'writes',
-                'dispatches',
-                'reads_cache',
-                'writes_cache',
-                'reads_filesystem',
-                'writes_filesystem',
-                'calls_external',
-                'authorizes_via',
-            ]) as $edge) {
-                $edgeConfidence = round($pathConfidence * (float) ($edge['confidence'] ?? 1.0), 4);
+        // Merge every method's pre-ranked adjacency before spending the shared
+        // budget. This keeps a strong downstream fact from losing merely
+        // because its method appeared later in the traversal result.
+        $methodEdgesTruncated = false;
+        $methodRelatedRows = $selectedRelatedEdgeTypes === []
+            ? []
+            : $this->index->rankedEdgesFromSources(
+                $relatedSources,
+                $selectedRelatedEdgeTypes,
+                $remainingRelatedFacts,
+                $methodEdgesTruncated,
+            );
+        $methodRelatedEdgeCount = count($methodRelatedRows);
+        $remainingRelatedFacts -= $methodRelatedEdgeCount;
+        $relatedFactsConsumed += $methodRelatedEdgeCount;
 
-                if ($edgeConfidence < $minConfidence) {
-                    continue;
+        if ($methodEdgesTruncated) {
+            $relatedFactsTruncated = true;
+            $relatedFactTruncationStages['methodEdges'] = true;
+        }
+
+        foreach ($methodRelatedRows as $methodRelatedRow) {
+            $hit = $methodHitsById[$methodRelatedRow['source']];
+            $edge = $methodRelatedRow['edge'];
+            $pathConfidence = (float) $hit['confidence'];
+            $edgeConfidence = round($pathConfidence * (float) ($edge['confidence'] ?? 1.0), 4);
+
+            if ($edgeConfidence < $minConfidence) {
+                continue;
+            }
+
+            $related = $this->index->node($edge['to']);
+
+            if ($edge['type'] === 'validates_with') {
+                $row = $this->relatedNodeRow($edge['to'], $related, $hit, $edgeConfidence);
+
+                if (! isset($formRequests[$edge['to']])
+                    || $this->compareFlowRows($row, $formRequests[$edge['to']]) < 0) {
+                    $formRequests[$edge['to']] = $row;
                 }
 
-                $related = $this->index->node($edge['to']);
+                continue;
+            }
 
-                if ($edge['type'] === 'validates_with') {
-                    $formRequests[$edge['to']] = $this->relatedNodeRow($edge['to'], $related, $hit, $edgeConfidence);
-                    continue;
+            if ($edge['type'] === 'uses_model') {
+                $row = $this->relatedNodeRow($edge['to'], $related, $hit, $edgeConfidence);
+
+                if (! isset($models[$edge['to']])
+                    || $this->compareFlowRows($row, $models[$edge['to']]) < 0) {
+                    $models[$edge['to']] = $row;
                 }
 
-                if ($edge['type'] === 'uses_model') {
-                    $models[$edge['to']] = $this->relatedNodeRow($edge['to'], $related, $hit, $edgeConfidence);
-                    continue;
-                }
+                continue;
+            }
 
-                if (in_array($edge['type'], ['reads', 'writes'], true)) {
-                    $key = $hit['id'].'|'.$edge['type'].'|'.$edge['to'];
-                    $dataAccess[$key] = array_filter([
-                        'table' => str_starts_with($edge['to'], 'table:') ? substr($edge['to'], 6) : $edge['to'],
-                        'access' => $edge['type'] === 'reads' ? 'read' : 'write',
-                        'method' => $hit['id'],
-                        'depth' => $hit['depth'],
-                        'confidence' => $edgeConfidence,
-                        'ops' => $this->edgeOperations($edge) ?: null,
-                        'fields' => $this->edgeFields($edge) ?: null,
-                    ], static fn ($value): bool => $value !== null);
-                    continue;
-                }
+            if (in_array($edge['type'], ['reads', 'writes'], true)) {
+                $key = $hit['id'].'|'.$edge['type'].'|'.$edge['to'];
+                $dataAccess[$key] = array_filter([
+                    'table' => str_starts_with($edge['to'], 'table:') ? substr($edge['to'], 6) : $edge['to'],
+                    'access' => $edge['type'] === 'reads' ? 'read' : 'write',
+                    'method' => $hit['id'],
+                    'depth' => $hit['depth'],
+                    'confidence' => $edgeConfidence,
+                    'ops' => $includeDataAccessDetails ? ($this->edgeOperations($edge) ?: null) : null,
+                    'fields' => $includeDataAccessDetails ? ($this->edgeFields($edge) ?: null) : null,
+                ], static fn ($value): bool => $value !== null);
+                continue;
+            }
 
-                if (in_array($edge['type'], ['reads_cache', 'writes_cache', 'reads_filesystem', 'writes_filesystem', 'calls_external'], true)) {
-                    $sideEffects[$hit['id'].'|'.$edge['type'].'|'.$edge['to']] = array_filter([
-                        'id' => $edge['to'],
-                        'type' => $related['type'] ?? null,
-                        'effect' => $edge['type'],
-                        'operation' => $edge['metadata']['operation'] ?? null,
-                        'from' => $hit['id'],
-                        'depth' => $hit['depth'],
-                        'confidence' => $edgeConfidence,
-                        'file' => $related['file'] ?? null,
-                        'line' => $edge['metadata']['line'] ?? null,
-                    ], static fn ($value): bool => $value !== null);
-                    continue;
-                }
-
-                if ($edge['type'] === 'authorizes_via') {
-                    $authorization[$hit['id'].'|'.$edge['to']] = array_filter([
-                        'id' => $edge['to'],
-                        'policy' => $edge['to'],
-                        'ability' => $edge['metadata']['ability'] ?? null,
-                        'from' => $hit['id'],
-                        'depth' => $hit['depth'],
-                        'confidence' => $edgeConfidence,
-                        'file' => $related['file'] ?? null,
-                        'line' => $related['line'] ?? null,
-                    ], static fn ($value): bool => $value !== null);
-                    continue;
-                }
-
-                $listeners = [];
-                $dispatchKinds = $this->dispatchKinds($edge, $related);
-
-                if (in_array('event', $dispatchKinds, true)) {
-                    // A listens_to edge records registration, not execution. A
-                    // queued listener whose shouldQueue() returned false still
-                    // has that edge, while EventFlow deliberately omits its
-                    // handled_by edge. Build this compact execution summary from
-                    // the same active bridge used by flow traversal.
-                    foreach ($this->index->edgesFrom($edge['to'], ['handled_by']) as $listenerEdge) {
-                        if (($listenerEdge['metadata']['kind'] ?? null) !== 'listener') {
-                            continue;
-                        }
-
-                        if (($listenerEdge['metadata']['causalExecutionProven'] ?? null) === false) {
-                            continue;
-                        }
-
-                        $listener = $this->index->node($listenerEdge['to']);
-                        $listeners[] = array_filter([
-                            'id' => $listenerEdge['to'],
-                            'confidence' => $listenerEdge['confidence'] ?? 1.0,
-                            'queued' => $listenerEdge['metadata']['queued'] ?? null,
-                            'afterCommit' => $listenerEdge['metadata']['afterCommit'] ?? null,
-                            'file' => $listener['file'] ?? null,
-                            'line' => $listener['line'] ?? null,
-                        ], static fn ($value): bool => $value !== null);
-                    }
-                }
-
-                usort($listeners, static fn (array $a, array $b): int => $a['id'] <=> $b['id']);
-                $dispatchMetadata = $edge['metadata'] ?? [];
-                $occurrences = is_array($dispatchMetadata['dispatchOccurrences'] ?? null)
-                    ? $dispatchMetadata['dispatchOccurrences']
-                    : [];
-                $hasOccurrenceEvidence = $occurrences !== [];
-
-                $dispatches[$hit['id'].'|'.$edge['to']] = array_filter([
+            if (in_array($edge['type'], ['reads_cache', 'writes_cache', 'reads_filesystem', 'writes_filesystem', 'calls_external'], true)) {
+                $sideEffects[$hit['id'].'|'.$edge['type'].'|'.$edge['to']] = array_filter([
                     'id' => $edge['to'],
-                    'type' => count($dispatchKinds) === 1 ? $dispatchKinds[0] : ($related['type'] ?? null),
-                    'kinds' => count($dispatchKinds) > 1 ? $dispatchKinds : null,
+                    'type' => $related['type'] ?? null,
+                    'effect' => $edge['type'],
+                    'operation' => $edge['metadata']['operation'] ?? null,
                     'from' => $hit['id'],
                     'depth' => $hit['depth'],
                     'confidence' => $edgeConfidence,
+                    'file' => $related['file'] ?? null,
+                    'line' => $edge['metadata']['line'] ?? null,
+                ], static fn ($value): bool => $value !== null);
+                continue;
+            }
+
+            if ($edge['type'] === 'authorizes_via') {
+                $authorization[$hit['id'].'|'.$edge['to']] = array_filter([
+                    'id' => $edge['to'],
+                    'policy' => $edge['to'],
+                    'ability' => $edge['metadata']['ability'] ?? null,
+                    'from' => $hit['id'],
+                    'depth' => $hit['depth'],
+                    'confidence' => $edgeConfidence,
+                    'file' => $related['file'] ?? null,
+                    'line' => $related['line'] ?? null,
+                ], static fn ($value): bool => $value !== null);
+                continue;
+            }
+
+            $listeners = [];
+            $dispatchKinds = $this->dispatchKinds($edge, $related);
+
+            if ($includeDispatchDetails && in_array('event', $dispatchKinds, true)) {
+                // A listens_to edge records registration, not execution. A
+                // queued listener whose shouldQueue() returned false still
+                // has that edge, while EventFlow deliberately omits its
+                // handled_by edge. Build this compact execution summary from
+                // the same active bridge used by flow traversal.
+                $listenersTruncated = false;
+                $listenerEdges = $this->index->rankedEdgesFrom(
+                    $edge['to'],
+                    ['handled_by'],
+                    $remainingRelatedFacts,
+                    $listenersTruncated,
+                );
+                $listenerEdgeCount = count($listenerEdges);
+                $remainingRelatedFacts -= $listenerEdgeCount;
+                $relatedFactsConsumed += $listenerEdgeCount;
+
+                if ($listenersTruncated) {
+                    $relatedFactsTruncated = true;
+                    $relatedFactTruncationStages['dispatchListeners'] = true;
+                }
+
+                foreach ($listenerEdges as $listenerEdge) {
+                    if (($listenerEdge['metadata']['kind'] ?? null) !== 'listener') {
+                        continue;
+                    }
+
+                    if (($listenerEdge['metadata']['causalExecutionProven'] ?? null) === false) {
+                        continue;
+                    }
+
+                    $listener = $this->index->node($listenerEdge['to']);
+                    $listeners[] = array_filter([
+                        'id' => $listenerEdge['to'],
+                        'confidence' => $listenerEdge['confidence'] ?? 1.0,
+                        'queued' => $listenerEdge['metadata']['queued'] ?? null,
+                        'afterCommit' => $listenerEdge['metadata']['afterCommit'] ?? null,
+                        'file' => $listener['file'] ?? null,
+                        'line' => $listener['line'] ?? null,
+                    ], static fn ($value): bool => $value !== null);
+                }
+            }
+
+            usort($listeners, static fn (array $a, array $b): int => $a['id'] <=> $b['id']);
+            $dispatchMetadata = $edge['metadata'] ?? [];
+            $occurrences = is_array($dispatchMetadata['dispatchOccurrences'] ?? null)
+                ? $dispatchMetadata['dispatchOccurrences']
+                : [];
+            $hasOccurrenceEvidence = $occurrences !== [];
+            $dispatch = [
+                'id' => $edge['to'],
+                'type' => count($dispatchKinds) === 1 ? $dispatchKinds[0] : ($related['type'] ?? null),
+                'kinds' => count($dispatchKinds) > 1 ? $dispatchKinds : null,
+                'from' => $hit['id'],
+                'depth' => $hit['depth'],
+                'confidence' => $edgeConfidence,
+                'causalExecutionProven' => $dispatchKinds !== []
+                    && $this->dispatchCausalExecutionProven($edge),
+            ];
+
+            if ($includeDispatchDetails) {
+                $dispatch += [
                     'mode' => $dispatchMetadata['dispatchMode'] ?? null,
                     'modes' => $dispatchMetadata['dispatchModes'] ?? null,
                     'method' => $dispatchMetadata['dispatchMethod'] ?? null,
@@ -410,16 +533,51 @@ class QueryEngine
                     'listeners' => $listeners ?: null,
                     'file' => $related['file'] ?? null,
                     'line' => $related['line'] ?? null,
-                ], static fn ($value): bool => $value !== null);
+                ];
             }
+
+            $dispatches[$hit['id'].'|'.$edge['to']] = array_filter(
+                $dispatch,
+                static fn ($value): bool => $value !== null,
+            );
         }
 
         $frontendConsumers = [];
         $tests = [];
-        $analysisWarnings = $this->flowAnalysisWarnings(array_keys($methods));
+        $analysisWarnings = $includeAnalysisWarnings
+            ? $this->flowAnalysisWarnings(array_keys($methods))
+            : [];
 
         if ($route !== null) {
-            foreach ($this->index->edgesTo($route['id'], ['consumes_route', 'tests_route']) as $edge) {
+            $incomingEdgeTypes = [];
+
+            if (isset($selectedRelatedGroups['frontendConsumers'])) {
+                $incomingEdgeTypes[] = 'consumes_route';
+            }
+
+            if (isset($selectedRelatedGroups['tests'])) {
+                $incomingEdgeTypes[] = 'tests_route';
+            }
+
+            $incomingEdgesTruncated = false;
+            $incomingEdges = $incomingEdgeTypes === []
+                ? []
+                : $this->index->rankedEdgesTo(
+                    $route['id'],
+                    $incomingEdgeTypes,
+                    $remainingRelatedFacts,
+                    $incomingEdgesTruncated,
+                );
+            $incomingEdgeCount = count($incomingEdges);
+            $remainingRelatedFacts -= $incomingEdgeCount;
+            $relatedFactsConsumed += $incomingEdgeCount;
+
+            if ($incomingEdgesTruncated) {
+                $relatedFactsTruncated = true;
+                $relatedFactTruncationStages['routeIncoming'] = true;
+            }
+
+            foreach ($incomingEdges as $edge) {
                 $node = $this->index->node($edge['from']);
                 $row = array_filter([
                     'id' => $edge['from'],
@@ -435,7 +593,7 @@ class QueryEngine
                 }
             }
 
-            if ($tests === []) {
+            if (isset($selectedRelatedGroups['tests']) && $tests === [] && ! $incomingEdgesTruncated) {
                 $analysisWarnings[] = [
                     'reason' => 'route_has_no_mapped_tests',
                     'route' => $route['id'],
@@ -444,8 +602,7 @@ class QueryEngine
             }
         }
 
-        $groups = [
-            'methods' => array_values($methods),
+        $availableRelatedGroups = [
             'formRequests' => array_values($formRequests),
             'models' => array_values($models),
             'dataAccess' => array_values($dataAccess),
@@ -455,29 +612,50 @@ class QueryEngine
             'frontendConsumers' => array_values($frontendConsumers),
             'tests' => array_values($tests),
         ];
+        $groups = ['methods' => array_values($methods)];
+
+        foreach (array_keys($selectedRelatedGroups) as $group) {
+            $groups[$group] = $availableRelatedGroups[$group];
+        }
+
+        $truncatedGroups = [];
 
         foreach ($groups as $key => $group) {
-            usort($group, static fn (array $a, array $b): int => [
-                $a['depth'] ?? 0,
-                $a['id'] ?? $a['method'].'|'.$a['access'].'|'.$a['table'],
-            ] <=> [
-                $b['depth'] ?? 0,
-                $b['id'] ?? $b['method'].'|'.$b['access'].'|'.$b['table'],
-            ]);
+            usort($group, fn (array $a, array $b): int => $this->compareFlowRows($a, $b));
 
-            if (count($group) > $limit) {
+            $groupLimit = $key === 'methods' ? $limit : $relatedLimit;
+
+            if (count($group) > $groupLimit) {
                 $truncated = true;
-                $group = array_slice($group, 0, $limit);
+                $truncatedGroups[] = $key;
+                $group = array_slice($group, 0, $groupLimit);
             }
 
             $groups[$key] = $group;
         }
+
+        if ($relatedFactsTruncated) {
+            $truncated = true;
+        }
+
+        $truncation = array_filter([
+            'routeActionSelection' => $routeActionSelectionTruncated ?: null,
+            'executionTraversal' => $executionTraversalTruncated ?: null,
+            'actionReservation' => $actionReservationTruncated ?: null,
+            'relatedFacts' => $relatedFactsTruncated ? [
+                'maxRelatedFacts' => $maxRelatedFacts,
+                'consumed' => $relatedFactsConsumed,
+                'stages' => array_keys($relatedFactTruncationStages),
+            ] : null,
+            'groups' => $truncatedGroups ?: null,
+        ], static fn (mixed $value): bool => $value !== null);
 
         return $this->envelope('flow-from', $target, array_filter([
             'route' => $route,
             'entrypoint' => $methods[$entrypointId],
             ...$groups,
             'analysisWarnings' => $analysisWarnings ?: null,
+            'truncation' => $truncation ?: null,
         ], static fn ($value): bool => $value !== null && $value !== []), $truncated);
     }
 
@@ -971,6 +1149,60 @@ class QueryEngine
     }
 
     /**
+     * @param array<int, string>|null $requestedGroups
+     * @return array<string, true>
+     */
+    private function selectedFlowRelatedGroups(?array $requestedGroups): array
+    {
+        if ($requestedGroups === null) {
+            return array_fill_keys(array_keys(self::FLOW_RELATED_GROUP_EDGE_TYPES), true);
+        }
+
+        $requested = [];
+
+        foreach ($requestedGroups as $group) {
+            if (! is_string($group) || ! array_key_exists($group, self::FLOW_RELATED_GROUP_EDGE_TYPES)) {
+                $printable = is_scalar($group) ? (string) $group : get_debug_type($group);
+
+                throw new \InvalidArgumentException("Unknown flow related group [{$printable}].");
+            }
+
+            $requested[$group] = true;
+        }
+
+        $selected = [];
+
+        foreach (array_keys(self::FLOW_RELATED_GROUP_EDGE_TYPES) as $group) {
+            if (isset($requested[$group])) {
+                $selected[$group] = true;
+            }
+        }
+
+        return $selected;
+    }
+
+    /**
+     * @param array<string, true> $selectedGroups
+     * @return array<int, string>
+     */
+    private function selectedFlowRelatedEdgeTypes(array $selectedGroups): array
+    {
+        $types = [];
+
+        foreach ($selectedGroups as $group => $_selected) {
+            if (in_array($group, ['frontendConsumers', 'tests'], true)) {
+                continue;
+            }
+
+            foreach (self::FLOW_RELATED_GROUP_EDGE_TYPES[$group] as $type) {
+                $types[$type] = $type;
+            }
+        }
+
+        return array_values($types);
+    }
+
+    /**
      * Keep a dual-role event/job class on the execution bridge selected by the
      * dispatch occurrence that reached it. The state partition prevents a
      * stronger event path from lending its confidence to a separate job path.
@@ -986,17 +1218,16 @@ class QueryEngine
         }
 
         if (($edge['type'] ?? null) === 'dispatches') {
-            if (($edge['metadata']['causalExecutionProven'] ?? null) === false) {
+            if (! $this->dispatchCausalExecutionProven($edge)) {
                 return false;
             }
 
             $kinds = $this->dispatchKinds($edge, $this->index->node($neighborId));
 
-            // Once occurrence evidence exists it is authoritative. If every
-            // occurrence is explicitly non-causal, there is no execution
-            // bridge to cross even if merged edge or target metadata still
-            // describes event/job roles.
-            if ($this->hasDispatchOccurrences($edge) && $kinds === []) {
+            // A dispatch bridge must resolve an actual event/job role. This
+            // also rejects malformed occurrence evidence and raw dispatches
+            // aimed at an ordinary method node.
+            if ($kinds === []) {
                 return false;
             }
 
@@ -1038,6 +1269,35 @@ class QueryEngine
             'dispatchKinds' => [],
             'statePartition' => '',
         ];
+    }
+
+    /** @param array<string, mixed> $edge */
+    private function dispatchCausalExecutionProven(array $edge): bool
+    {
+        $metadata = $edge['metadata'] ?? [];
+
+        if (($metadata['causalExecutionProven'] ?? null) === false) {
+            return false;
+        }
+
+        $occurrences = $metadata['dispatchOccurrences'] ?? null;
+
+        if (! is_array($occurrences) || $occurrences === []) {
+            return true;
+        }
+
+        foreach ($occurrences as $occurrence) {
+            if (! is_array($occurrence)) {
+                continue;
+            }
+
+            if (in_array($occurrence['kind'] ?? null, ['event', 'job'], true)
+                && ($occurrence['causalExecutionProven'] ?? null) !== false) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -1102,14 +1362,6 @@ class QueryEngine
         return array_values($kinds);
     }
 
-    /** @param array<string, mixed> $edge */
-    private function hasDispatchOccurrences(array $edge): bool
-    {
-        $occurrences = $edge['metadata']['dispatchOccurrences'] ?? null;
-
-        return is_array($occurrences) && $occurrences !== [];
-    }
-
     /**
      * @param array<string, mixed>|null $node
      * @param array<string, mixed> $hit
@@ -1125,6 +1377,42 @@ class QueryEngine
             'file' => $node['file'] ?? null,
             'line' => $node['line'] ?? null,
         ], static fn ($value): bool => $value !== null);
+    }
+
+    /**
+     * Rank compact flow rows before any group is sliced. Confidence is the
+     * primary signal; depth and a complete stable identity break ties without
+     * relying on insertion order or PHP's sort stability.
+     *
+     * @param array<string, mixed> $a
+     * @param array<string, mixed> $b
+     */
+    private function compareFlowRows(array $a, array $b): int
+    {
+        $confidence = (float) ($b['confidence'] ?? 0.0) <=> (float) ($a['confidence'] ?? 0.0);
+
+        if ($confidence !== 0) {
+            return $confidence;
+        }
+
+        $depth = (int) ($a['depth'] ?? 0) <=> (int) ($b['depth'] ?? 0);
+
+        if ($depth !== 0) {
+            return $depth;
+        }
+
+        return $this->flowRowStableId($a) <=> $this->flowRowStableId($b);
+    }
+
+    /** @param array<string, mixed> $row */
+    private function flowRowStableId(array $row): string
+    {
+        return implode('|', array_map(
+            static fn (string $field): string => is_scalar($row[$field] ?? null)
+                ? (string) $row[$field]
+                : '',
+            ['id', 'from', 'method', 'access', 'table', 'effect', 'policy'],
+        ));
     }
 
     /**

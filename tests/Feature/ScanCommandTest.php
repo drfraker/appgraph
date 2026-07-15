@@ -7,6 +7,7 @@ use AppGraph\Tests\Fixtures\ProgressNoteController;
 use AppGraph\Tests\TestCase;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Filesystem\Filesystem;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Schema;
 
@@ -16,10 +17,27 @@ class ScanCommandTest extends TestCase
     {
         $this->useFileBackedSqliteDatabase();
         $this->createCommandModelFixture();
-        $this->createFormRequestAndEventFixtures();
+        $overviewController = $this->createFormRequestAndEventFixtures();
+        $this->assertSame([
+            'depth' => 6,
+            'method_limit' => 32,
+            'item_limit' => 12,
+            'transition_limit' => 5000,
+        ], config('appgraph.overview.route_summary'));
+        $this->assertNull(config('appgraph.mcp.route_summary'));
+        config()->set('appgraph.overview.route_summary.depth', 5);
+        config()->set('appgraph.overview.route_summary.method_limit', 9);
+        config()->set('appgraph.overview.route_summary.item_limit', 4);
+        config()->set('appgraph.overview.route_summary.transition_limit', 77);
+        Event::listen(
+            'App\Events\CommandNoteSaved',
+            ['App\Listeners\CommandNoteListener', 'handle'],
+        );
 
         Route::put('/progress-notes/{note}', [ProgressNoteController::class, 'update'])
             ->name('progress-notes.update');
+        Route::post('/command-notes', [$overviewController, 'store'])
+            ->name('command-notes.store');
 
         Schema::create('users', function (Blueprint $table): void {
             $table->id();
@@ -30,6 +48,11 @@ class ScanCommandTest extends TestCase
             $table->id();
             $table->foreignId('user_id')->constrained('users');
             $table->string('title');
+        });
+
+        Schema::create('audit_logs', function (Blueprint $table): void {
+            $table->id();
+            $table->string('message');
         });
 
         $outputPath = storage_path('appgraph-test/appgraph.json');
@@ -103,6 +126,13 @@ class ScanCommandTest extends TestCase
         $overview = json_decode((string) file_get_contents($overviewPath), true, flags: JSON_THROW_ON_ERROR);
 
         $this->assertSame('0.4.0', $overview['meta']['appgraphVersion']);
+        $this->assertSame([
+            'maxDepth' => 5,
+            'maxMethods' => 9,
+            'maxRelatedFacts' => 1024,
+            'maxItemsPerGroup' => 4,
+            'maxTransitions' => 77,
+        ], $overview['meta']['routeTraversal']);
         $this->assertSame('progress_notes', $overview['models']['App\Models\CommandProgressNote']);
         $this->assertArrayHasKey('byNodeType', $overview['counts']);
         $this->assertSame(1, $overview['events']['App\Events\CommandNoteSaved']['listeners']);
@@ -111,15 +141,41 @@ class ScanCommandTest extends TestCase
         $route = collect($overview['routes'])->firstWhere('route', 'PUT /progress-notes/{note}');
         $this->assertNotNull($route, 'Overview must list the scanned route.');
         $this->assertSame(ProgressNoteController::class.'::update', $route['action']);
+
+        $transitive = collect($overview['routes'])->firstWhere('route', 'POST /command-notes');
+        $this->assertNotNull($transitive, 'Overview must list the transitive fixture route.');
+        $this->assertContains('audit_logs', $transitive['tables']);
+        $this->assertContains('App\Events\CommandNoteSaved', $transitive['dispatches']);
     }
 
-    private function createFormRequestAndEventFixtures(): void
+    /** @return class-string */
+    private function createFormRequestAndEventFixtures(): string
     {
         $files = new Filesystem();
 
-        foreach (['app/Http/Requests', 'app/Events', 'app/Listeners', 'app/Services'] as $directory) {
+        foreach (['app/Http/Controllers', 'app/Http/Requests', 'app/Events', 'app/Listeners', 'app/Services'] as $directory) {
             $files->ensureDirectoryExists(base_path($directory));
         }
+
+        $controller = base_path('app/Http/Controllers/CommandOverviewController.php');
+        file_put_contents($controller, <<<'PHP'
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Services\CommandNotePublisher;
+
+class CommandOverviewController
+{
+    public function store(CommandNotePublisher $publisher): array
+    {
+        $publisher->publish();
+
+        return ['ok' => true];
+    }
+}
+PHP);
+        require_once $controller;
 
         file_put_contents(base_path('app/Http/Requests/CommandNoteRequest.php'), <<<'PHP'
 <?php
@@ -153,11 +209,13 @@ PHP);
 namespace App\Listeners;
 
 use App\Events\CommandNoteSaved;
+use Illuminate\Support\Facades\DB;
 
 class CommandNoteListener
 {
     public function handle(CommandNoteSaved $event): void
     {
+        DB::table('audit_logs')->insert(['message' => 'saved']);
     }
 }
 PHP);
@@ -177,6 +235,8 @@ class CommandNotePublisher
     }
 }
 PHP);
+
+        return 'App\Http\Controllers\CommandOverviewController';
     }
 
     private function createCommandModelFixture(): void

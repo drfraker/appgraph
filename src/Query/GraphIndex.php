@@ -23,6 +23,8 @@ class GraphIndex
      * @param array<string, array<int, string>> $nodeIdsByType
      * @param array<string, array<int, array<string, mixed>>> $outEdges
      * @param array<string, array<int, array<string, mixed>>> $inEdges
+     * @param array<string, array<string, array<int, array<string, mixed>>>> $rankedOutEdges
+     * @param array<string, array<string, array<int, array<string, mixed>>>> $rankedInEdges
      */
     private function __construct(
         private array $meta,
@@ -30,6 +32,8 @@ class GraphIndex
         private array $nodeIdsByType,
         private array $outEdges,
         private array $inEdges,
+        private array $rankedOutEdges,
+        private array $rankedInEdges,
         private int $edgeCount,
         private ?string $sourcePath,
     ) {
@@ -94,6 +98,8 @@ class GraphIndex
 
         $outEdges = [];
         $inEdges = [];
+        $rankedOutEdges = [];
+        $rankedInEdges = [];
         $edgeCount = 0;
 
         foreach ($graph['edges'] ?? [] as $edge) {
@@ -103,8 +109,26 @@ class GraphIndex
 
             $outEdges[$edge['from']][] = $edge;
             $inEdges[$edge['to']][] = $edge;
+            $rankedOutEdges[$edge['from']][$edge['type']][] = $edge;
+            $rankedInEdges[$edge['to']][$edge['type']][] = $edge;
             $edgeCount++;
         }
+
+        foreach ($rankedOutEdges as &$edgesByType) {
+            foreach ($edgesByType as &$edges) {
+                usort($edges, static fn (array $a, array $b): int => self::compareRankedEdges($a, $b, 'out'));
+            }
+            unset($edges);
+        }
+        unset($edgesByType);
+
+        foreach ($rankedInEdges as &$edgesByType) {
+            foreach ($edgesByType as &$edges) {
+                usort($edges, static fn (array $a, array $b): int => self::compareRankedEdges($a, $b, 'in'));
+            }
+            unset($edges);
+        }
+        unset($edgesByType);
 
         return new self(
             meta: $graph['meta'] ?? [],
@@ -112,6 +136,8 @@ class GraphIndex
             nodeIdsByType: $nodeIdsByType,
             outEdges: $outEdges,
             inEdges: $inEdges,
+            rankedOutEdges: $rankedOutEdges,
+            rankedInEdges: $rankedInEdges,
             edgeCount: $edgeCount,
             sourcePath: $sourcePath,
         );
@@ -207,13 +233,127 @@ class GraphIndex
     }
 
     /**
+     * Return the strongest outgoing edges without copying or sorting the full
+     * adjacency list. The per-type lists are pre-ranked, so selecting N edges
+     * retains only O(types + N) query-local values.
+     *
+     * @param array<int, string> $types
+     * @return array<int, array<string, mixed>>
+     */
+    public function rankedEdgesFrom(string $id, array $types, int $limit, bool &$truncated = false): array
+    {
+        return $this->rankedEdges($this->rankedOutEdges[$id] ?? [], $types, $limit, 'out', $truncated);
+    }
+
+    /**
+     * Return the strongest incoming edges without copying or sorting the full
+     * adjacency list.
+     *
+     * @param array<int, string> $types
+     * @return array<int, array<string, mixed>>
+     */
+    public function rankedEdgesTo(string $id, array $types, int $limit, bool &$truncated = false): array
+    {
+        return $this->rankedEdges($this->rankedInEdges[$id] ?? [], $types, $limit, 'in', $truncated);
+    }
+
+    /**
+     * Return the globally strongest outgoing facts from several weighted source
+     * paths. Each source/type adjacency contributes one lazy cursor, so a tight
+     * budget does not materialize or repeatedly scan the union of their edges.
+     *
+     * @param array<int, array{id: string, confidence: float, depth: int, path: array<int, string>}> $sources
+     * @param array<int, string> $types
+     * @return array<int, array{source: string, edge: array<string, mixed>}>
+     */
+    public function rankedEdgesFromSources(
+        array $sources,
+        array $types,
+        int $limit,
+        bool &$truncated = false,
+    ): array {
+        $types = $this->normalizedEdgeTypes($types);
+        $limit = max(0, $limit);
+        $sourcesById = [];
+
+        foreach ($sources as $source) {
+            if (! isset($source['id']) || ! is_string($source['id'])) {
+                continue;
+            }
+
+            $path = $source['path'] ?? [$source['id']];
+
+            if (! is_array($path)) {
+                $path = [$source['id']];
+            }
+
+            $normalized = [
+                'id' => $source['id'],
+                'confidence' => round((float) ($source['confidence'] ?? 1.0), 4),
+                'depth' => max(0, (int) ($source['depth'] ?? 0)),
+                'path' => array_values(array_filter(
+                    $path,
+                    static fn (mixed $id): bool => is_string($id),
+                )),
+            ];
+
+            if (! isset($sourcesById[$normalized['id']])
+                || $this->compareRelatedSources($normalized, $sourcesById[$normalized['id']]) < 0) {
+                $sourcesById[$normalized['id']] = $normalized;
+            }
+        }
+
+        ksort($sourcesById);
+        $matchingCount = 0;
+
+        foreach ($sourcesById as $source) {
+            foreach ($types as $type) {
+                $matchingCount += count($this->rankedOutEdges[$source['id']][$type] ?? []);
+            }
+        }
+
+        if ($matchingCount > $limit) {
+            $truncated = true;
+        }
+
+        if ($limit === 0 || $matchingCount === 0) {
+            return [];
+        }
+
+        $frontier = $this->newRankedMinQueue();
+
+        foreach ($sourcesById as $source) {
+            foreach ($types as $type) {
+                $this->enqueueRelatedEdgeCursor($frontier, $source, $type, 0);
+            }
+        }
+
+        $selected = [];
+
+        while (count($selected) < $limit && ! $frontier->isEmpty()) {
+            $cursor = $frontier->extract();
+            $selected[] = ['source' => $cursor['source']['id'], 'edge' => $cursor['edge']];
+            $this->enqueueRelatedEdgeCursor(
+                $frontier,
+                $cursor['source'],
+                $cursor['type'],
+                $cursor['position'] + 1,
+            );
+        }
+
+        return $selected;
+    }
+
+    /**
      * Rank bounded paths by confidence rather than keeping the first shallow
-     * visit. Dynamic programming retains the strongest path to each node at each
-     * depth, then selects the strongest result across depths with deterministic
-     * depth/path tie-breakers. Evidence diversity is reported, but it is not a
-     * safe pruning criterion because later edges can change the evidence set.
+     * visit. A lazy best-first frontier lets newly discovered strong descendants
+     * compete immediately, while retaining the strongest path to each state at
+     * each depth. Results use deterministic depth/path tie-breakers. Evidence
+     * diversity is reported but is not a safe pruning criterion because later
+     * edges can change the evidence set.
      *
      * @param array<int, string> $edgeTypes
+     * @param int|null $maxTransitions Hard bound on matching edges examined; null is unbounded.
      * @return array<int, array{id: string, depth: int, confidence: float, via: string, edgeType: string, path: array<int, string>, evidenceCount: int}>
      */
     public function traverse(
@@ -224,6 +364,7 @@ class GraphIndex
         float $minConfidence = 0.0,
         int $limit = 50,
         bool &$truncated = false,
+        ?int $maxTransitions = null,
     ): array {
         return $this->traverseSeedStates(
             [[
@@ -243,6 +384,7 @@ class GraphIndex
             null,
             [$startId => true],
             null,
+            $maxTransitions,
             $truncated,
         );
     }
@@ -257,10 +399,11 @@ class GraphIndex
      * synthetic node or allowing intermediate event/request nodes to consume a
      * method-result limit.
      *
-     * @param array<int, array{id: string, confidence?: float, via?: string, edgeType?: string, path?: array<int, string>}> $seeds
+     * @param array<int, array{id: string, confidence?: float, via?: string, edgeType?: string, path?: array<int, string>, statePartition?: scalar}> $seeds
      * @param array<int, string> $edgeTypes
      * @param array<int, string>|null $resultNodeTypes
      * @param callable(array<string, mixed>, array<string, mixed>, string, string):(array<string, mixed>|false)|null $transition
+     * @param int|null $maxTransitions Hard bound on matching edges examined; null is unbounded.
      * @return array<int, array{id: string, depth: int, confidence: float, via: string, edgeType: string, path: array<int, string>, evidenceCount: int}>
      */
     public function traverseFromSeeds(
@@ -273,6 +416,7 @@ class GraphIndex
         ?array $resultNodeTypes = null,
         ?callable $transition = null,
         bool &$truncated = false,
+        ?int $maxTransitions = null,
     ): array {
         $seedStates = [];
 
@@ -292,12 +436,18 @@ class GraphIndex
                 'evidenceCount' => 0,
             ];
 
+            if (array_key_exists('statePartition', $seed) && is_scalar($seed['statePartition'])) {
+                $state['statePartition'] = $seed['statePartition'];
+            }
+
             if ($state['confidence'] < $minConfidence) {
                 continue;
             }
 
-            if (! isset($seedStates[$state['id']]) || $this->pathRanksBefore($state, $seedStates[$state['id']])) {
-                $seedStates[$state['id']] = $state;
+            $stateKey = $this->traversalStateKey($state);
+
+            if (! isset($seedStates[$stateKey]) || $this->pathRanksBefore($state, $seedStates[$stateKey])) {
+                $seedStates[$stateKey] = $state;
             }
         }
 
@@ -311,6 +461,7 @@ class GraphIndex
             $resultNodeTypes,
             [],
             $transition,
+            $maxTransitions,
             $truncated,
         );
     }
@@ -321,6 +472,7 @@ class GraphIndex
      * @param array<int, string>|null $resultNodeTypes
      * @param array<string, bool> $excludedResultIds
      * @param callable(array<string, mixed>, array<string, mixed>, string, string):(array<string, mixed>|false)|null $transition
+     * @param int|null $maxTransitions Hard bound on matching edges examined; null is unbounded.
      * @return array<int, array{id: string, depth: int, confidence: float, via: string, edgeType: string, path: array<int, string>, evidenceCount: int}>
      */
     private function traverseSeedStates(
@@ -333,13 +485,26 @@ class GraphIndex
         ?array $resultNodeTypes,
         array $excludedResultIds,
         ?callable $transition,
+        ?int $maxTransitions,
         bool &$truncated,
     ): array {
         $resultsById = [];
         $states = [[]];
+        $edgeTypes = $this->normalizedEdgeTypes($edgeTypes);
+        $depthLimit = max(0, $maxDepth);
+        $transitionLimit = $maxTransitions === null ? null : max(0, $maxTransitions);
+        $transitionsExamined = 0;
+        $transitionBudgetExhausted = false;
+        $stateVersion = 0;
 
         foreach ($seedStates as $state) {
-            $states[0][$this->traversalStateKey($state)] = $state;
+            $stateKey = $this->traversalStateKey($state);
+            $state['stateKeyPath'] = $this->initialStateKeyPath($state, $stateKey);
+
+            if (! isset($states[0][$stateKey]) || $this->pathRanksBefore($state, $states[0][$stateKey])) {
+                $state['_traversalVersion'] = ++$stateVersion;
+                $states[0][$stateKey] = $state;
+            }
 
             if (! isset($excludedResultIds[$state['id']])
                 && $this->nodeMatchesTypes($state['id'], $resultNodeTypes)
@@ -348,81 +513,116 @@ class GraphIndex
             }
         }
 
-        for ($depth = 0; $depth < $maxDepth; $depth++) {
-            $nextStates = [];
-            $currentStates = $states[$depth] ?? [];
-            ksort($currentStates);
+        $frontier = $this->newRankedMinQueue();
 
-            foreach ($currentStates as $state) {
-                $edges = $direction === 'out'
-                    ? $this->edgesFrom($state['id'], $edgeTypes)
-                    : $this->edgesTo($state['id'], $edgeTypes);
-                usort($edges, static fn (array $a, array $b): int => [
-                    $direction === 'out' ? $a['to'] : $a['from'],
-                    $a['type'],
-                ] <=> [
-                    $direction === 'out' ? $b['to'] : $b['from'],
-                    $b['type'],
-                ]);
+        if ($depthLimit > 0) {
+            foreach ($states[0] as $state) {
+                $this->enqueueTraversalState($frontier, $state, $edgeTypes, $direction);
+            }
+        }
 
-                foreach ($edges as $edge) {
-                    $neighborId = $direction === 'out' ? $edge['to'] : $edge['from'];
+        while (($rankedTransition = $this->nextRankedTraversalTransition($frontier, $states)) !== null) {
+            if ($transitionLimit !== null && $transitionsExamined >= $transitionLimit) {
+                $truncated = true;
+                $transitionBudgetExhausted = true;
 
-                    $transitionState = [];
+                break;
+            }
 
-                    if ($transition !== null) {
-                        $transitionResult = $transition($state, $edge, $neighborId, $direction);
+            $transitionsExamined++;
+            $state = $rankedTransition['state'];
+            $edge = $rankedTransition['edge'];
+            $this->enqueueTraversalCursor(
+                $frontier,
+                $state,
+                $rankedTransition['type'],
+                $rankedTransition['position'] + 1,
+                $direction,
+            );
+            $neighborId = $direction === 'out' ? $edge['to'] : $edge['from'];
+            $candidate = $this->traversalCandidate(
+                $state,
+                $edge,
+                $neighborId,
+                $direction,
+                $minConfidence,
+                $transition,
+            );
 
-                        if ($transitionResult === false) {
-                            continue;
-                        }
+            if ($candidate === false) {
+                continue;
+            }
 
-                        if (is_array($transitionResult)) {
-                            $transitionState = $transitionResult;
-                        }
-                    }
+            $candidateDepth = (int) $candidate['depth'];
+            $stateKey = $this->traversalStateKey($candidate);
 
-                    $pathConfidence = round($state['confidence'] * (float) ($edge['confidence'] ?? 1.0), 4);
+            if (! isset($states[$candidateDepth][$stateKey])
+                || $this->pathRanksBefore($candidate, $states[$candidateDepth][$stateKey])) {
+                $storedCandidate = $candidate;
+                $storedCandidate['_traversalVersion'] = ++$stateVersion;
+                $states[$candidateDepth][$stateKey] = $storedCandidate;
 
-                    if ($pathConfidence < $minConfidence) {
-                        continue;
-                    }
-
-                    $candidate = [
-                        'id' => $neighborId,
-                        'depth' => $depth + 1,
-                        'confidence' => $pathConfidence,
-                        'via' => $state['id'],
-                        'edgeType' => $edge['type'],
-                        'path' => [...$state['path'], $neighborId],
-                        'evidenceKinds' => $this->mergeEvidenceKinds(
-                            $state['evidenceKinds'] ?? [],
-                            $this->edgeEvidenceKinds($edge),
-                        ),
-                    ] + $transitionState;
-                    $candidate['evidenceCount'] = count($candidate['evidenceKinds']);
-                    $stateKey = $this->traversalStateKey($candidate);
-
-                    if (! isset($nextStates[$stateKey]) || $this->pathRanksBefore($candidate, $nextStates[$stateKey])) {
-                        $nextStates[$stateKey] = $candidate;
-                    }
-
-                    if (! isset($excludedResultIds[$neighborId])
-                        && $this->nodeMatchesTypes($neighborId, $resultNodeTypes)
-                        && (! isset($resultsById[$neighborId]) || $this->pathRanksBefore($candidate, $resultsById[$neighborId]))) {
-                        $resultsById[$neighborId] = $candidate;
-                    }
+                if ($candidateDepth < $depthLimit) {
+                    $this->enqueueTraversalState($frontier, $storedCandidate, $edgeTypes, $direction);
                 }
             }
 
-            $states[$depth + 1] = $nextStates;
+            if (! isset($excludedResultIds[$neighborId])
+                && $this->nodeMatchesTypes($neighborId, $resultNodeTypes)
+                && (! isset($resultsById[$neighborId]) || $this->pathRanksBefore($candidate, $resultsById[$neighborId]))) {
+                $resultsById[$neighborId] = $candidate;
+            }
+        }
+
+        if (! $transitionBudgetExhausted) {
+            $terminalFrontier = $this->newRankedMinQueue();
+
+            foreach ($states[$depthLimit] ?? [] as $state) {
+                $this->enqueueTraversalState($terminalFrontier, $state, $edgeTypes, $direction);
+            }
+
+            while (($rankedTransition = $this->nextRankedTraversalTransition(
+                $terminalFrontier,
+                $states,
+            )) !== null) {
+                if ($transitionLimit !== null && $transitionsExamined >= $transitionLimit) {
+                    $truncated = true;
+
+                    break;
+                }
+
+                $transitionsExamined++;
+                $state = $rankedTransition['state'];
+                $edge = $rankedTransition['edge'];
+                $this->enqueueTraversalCursor(
+                    $terminalFrontier,
+                    $state,
+                    $rankedTransition['type'],
+                    $rankedTransition['position'] + 1,
+                    $direction,
+                );
+                $neighborId = $direction === 'out' ? $edge['to'] : $edge['from'];
+
+                if ($this->traversalCandidate(
+                    $state,
+                    $edge,
+                    $neighborId,
+                    $direction,
+                    $minConfidence,
+                    $transition,
+                ) !== false) {
+                    $truncated = true;
+
+                    break;
+                }
+            }
         }
 
         $results = array_values($resultsById);
         usort($results, fn (array $a, array $b): int => $this->compareTraversalPaths($a, $b));
 
         foreach ($results as &$result) {
-            unset($result['evidenceKinds']);
+            unset($result['evidenceKinds'], $result['stateKeyPath'], $result['_traversalVersion']);
         }
         unset($result);
 
@@ -440,6 +640,268 @@ class GraphIndex
         $partition = $state['statePartition'] ?? '';
 
         return (string) $state['id']."\0".(is_scalar($partition) ? (string) $partition : '');
+    }
+
+    /**
+     * Create a min-priority queue for deterministic rank tuples. Lazy graph
+     * merges keep one cursor per active pre-ranked adjacency stream.
+     */
+    private function newRankedMinQueue(): \SplPriorityQueue
+    {
+        $queue = new class extends \SplPriorityQueue
+        {
+            public function compare(mixed $priority1, mixed $priority2): int
+            {
+                return $priority2 <=> $priority1;
+            }
+        };
+        $queue->setExtractFlags(\SplPriorityQueue::EXTR_DATA);
+
+        return $queue;
+    }
+
+    /**
+     * @param array{id: string, confidence: float, depth: int, path: array<int, string>} $source
+     */
+    private function enqueueRelatedEdgeCursor(
+        \SplPriorityQueue $queue,
+        array $source,
+        string $type,
+        int $position,
+    ): void {
+        $edge = $this->rankedOutEdges[$source['id']][$type][$position] ?? null;
+
+        if ($edge === null) {
+            return;
+        }
+
+        $queue->insert(
+            [
+                'source' => $source,
+                'type' => $type,
+                'position' => $position,
+                'edge' => $edge,
+            ],
+            $this->relatedEdgePriority($source, $edge, $position),
+        );
+    }
+
+    /**
+     * @param array{id: string, confidence: float, depth: int, path: array<int, string>} $source
+     * @param array<string, mixed> $edge
+     * @return array{float, int, string, string, string, string, string, string, int}
+     */
+    private function relatedEdgePriority(array $source, array $edge, int $position): array
+    {
+        return [
+            -round($source['confidence'] * (float) ($edge['confidence'] ?? 1.0), 4),
+            $source['depth'],
+            implode("\0", $source['path']),
+            $source['id'],
+            (string) $edge['to'],
+            (string) $edge['type'],
+            (string) $edge['from'],
+            (string) $edge['to'],
+            $position,
+        ];
+    }
+
+    /**
+     * @param array{id: string, confidence: float, depth: int, path: array<int, string>} $a
+     * @param array{id: string, confidence: float, depth: int, path: array<int, string>} $b
+     */
+    private function compareRelatedSources(array $a, array $b): int
+    {
+        return [
+            -$a['confidence'],
+            $a['depth'],
+            implode("\0", $a['path']),
+            $a['id'],
+        ] <=> [
+            -$b['confidence'],
+            $b['depth'],
+            implode("\0", $b['path']),
+            $b['id'],
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $state
+     * @param array<int, string> $edgeTypes
+     */
+    private function enqueueTraversalState(
+        \SplPriorityQueue $queue,
+        array $state,
+        array $edgeTypes,
+        string $direction,
+    ): void {
+        foreach ($edgeTypes as $type) {
+            $this->enqueueTraversalCursor($queue, $state, $type, 0, $direction);
+        }
+    }
+
+    /** @param array<string, mixed> $state */
+    private function enqueueTraversalCursor(
+        \SplPriorityQueue $queue,
+        array $state,
+        string $type,
+        int $position,
+        string $direction,
+    ): void {
+        $edgesByType = $direction === 'out'
+            ? $this->rankedOutEdges[$state['id']] ?? []
+            : $this->rankedInEdges[$state['id']] ?? [];
+        $edge = $edgesByType[$type][$position] ?? null;
+
+        if ($edge === null) {
+            return;
+        }
+
+        $queue->insert(
+            [
+                'depth' => (int) $state['depth'],
+                'stateKey' => $this->traversalStateKey($state),
+                'stateVersion' => (int) $state['_traversalVersion'],
+                'type' => $type,
+                'position' => $position,
+                'edge' => $edge,
+            ],
+            $this->rankedTraversalTransitionPriority($state, $edge, $direction, $position),
+        );
+    }
+
+    /**
+     * Discard cursors belonging to a state superseded by a stronger path and
+     * return the next live transition without copying an adjacency list.
+     *
+     * @param array<int, array<string, array<string, mixed>>> $states
+     * @return array{state: array<string, mixed>, edge: array<string, mixed>, type: string, position: int}|null
+     */
+    private function nextRankedTraversalTransition(
+        \SplPriorityQueue $queue,
+        array $states,
+    ): ?array {
+        while (! $queue->isEmpty()) {
+            $cursor = $queue->extract();
+            $state = $states[$cursor['depth']][$cursor['stateKey']] ?? null;
+
+            if (! is_array($state)
+                || (int) ($state['_traversalVersion'] ?? -1) !== $cursor['stateVersion']) {
+                continue;
+            }
+
+            return [
+                'state' => $state,
+                'edge' => $cursor['edge'],
+                'type' => $cursor['type'],
+                'position' => $cursor['position'],
+            ];
+        }
+
+        return null;
+    }
+
+    /** @param array<string, mixed> $state @param array<string, mixed> $edge */
+    private function traversalCandidate(
+        array $state,
+        array $edge,
+        string $neighborId,
+        string $direction,
+        float $minConfidence,
+        ?callable $transition,
+    ): array|false {
+        $transitionState = [];
+
+        if ($transition !== null) {
+            $transitionResult = $transition($state, $edge, $neighborId, $direction);
+
+            if ($transitionResult === false) {
+                return false;
+            }
+
+            if (is_array($transitionResult)) {
+                $transitionState = $transitionResult;
+            }
+        }
+
+        $pathConfidence = round($state['confidence'] * (float) ($edge['confidence'] ?? 1.0), 4);
+
+        if ($pathConfidence < $minConfidence) {
+            return false;
+        }
+
+        $candidate = [
+            'id' => $neighborId,
+            'depth' => (int) $state['depth'] + 1,
+            'confidence' => $pathConfidence,
+            'via' => $state['id'],
+            'edgeType' => $edge['type'],
+            'path' => [...$state['path'], $neighborId],
+            'evidenceKinds' => $this->mergeEvidenceKinds(
+                $state['evidenceKinds'] ?? [],
+                $this->edgeEvidenceKinds($edge),
+            ),
+        ] + $transitionState;
+        $candidate['evidenceCount'] = count($candidate['evidenceKinds']);
+        $stateKey = $this->traversalStateKey($candidate);
+        $stateKeyPath = $state['stateKeyPath'] ?? $this->initialStateKeyPath(
+            $state,
+            $this->traversalStateKey($state),
+        );
+
+        if (in_array($stateKey, $stateKeyPath, true)) {
+            return false;
+        }
+
+        $candidate['stateKeyPath'] = [...$stateKeyPath, $stateKey];
+
+        return $candidate;
+    }
+
+    /** @param array<string, mixed> $state @return array<int, string> */
+    private function initialStateKeyPath(array $state, string $currentStateKey): array
+    {
+        $nodePath = array_values(array_filter(
+            $state['path'] ?? [],
+            static fn (mixed $id): bool => is_string($id),
+        ));
+        $stateKeyPath = array_map(
+            fn (string $id): string => $this->traversalStateKey(['id' => $id]),
+            $nodePath,
+        );
+
+        if ($nodePath !== [] && end($nodePath) === $state['id']) {
+            $stateKeyPath[array_key_last($stateKeyPath)] = $currentStateKey;
+        } else {
+            $stateKeyPath[] = $currentStateKey;
+        }
+
+        return $stateKeyPath;
+    }
+
+    /**
+     * @param array<string, mixed> $state
+     * @param array<string, mixed> $edge
+     * @return array{float, int, string, string, string, string, int}
+     */
+    private function rankedTraversalTransitionPriority(
+        array $state,
+        array $edge,
+        string $direction,
+        int $position,
+    ): array
+    {
+        $neighbor = (string) ($direction === 'out' ? $edge['to'] : $edge['from']);
+
+        return [
+            -round((float) $state['confidence'] * (float) ($edge['confidence'] ?? 1.0), 4),
+            (int) $state['depth'] + 1,
+            implode("\0", [...($state['path'] ?? []), $neighbor]),
+            $neighbor,
+            $this->traversalStateKey($state),
+            (string) $edge['type'],
+            $position,
+        ];
     }
 
     /** @param array<int, string>|null $types */
@@ -863,5 +1325,121 @@ class GraphIndex
             $edges,
             static fn (array $edge): bool => in_array($edge['type'], $types, true)
         ));
+    }
+
+    /**
+     * Merge pre-ranked per-type edge lists without materializing their union.
+     *
+     * @param array<string, array<int, array<string, mixed>>> $edgesByType
+     * @param array<int, string> $types
+     * @return array<int, array<string, mixed>>
+     */
+    private function rankedEdges(
+        array $edgesByType,
+        array $types,
+        int $limit,
+        string $direction,
+        bool &$truncated,
+    ): array {
+        $types = $this->normalizedEdgeTypes($types);
+        $limit = max(0, $limit);
+        $matchingCount = 0;
+
+        foreach ($types as $type) {
+            $matchingCount += count($edgesByType[$type] ?? []);
+        }
+
+        if ($matchingCount > $limit) {
+            $truncated = true;
+        }
+
+        if ($limit === 0 || $matchingCount === 0) {
+            return [];
+        }
+
+        $positions = [];
+        $selected = [];
+
+        while (count($selected) < $limit) {
+            $bestType = null;
+            $bestEdge = null;
+
+            foreach ($types as $type) {
+                $edge = $edgesByType[$type][$positions[$type] ?? 0] ?? null;
+
+                if ($edge === null) {
+                    continue;
+                }
+
+                if ($bestEdge === null || self::compareRankedEdges($edge, $bestEdge, $direction) < 0) {
+                    $bestType = $type;
+                    $bestEdge = $edge;
+                }
+            }
+
+            if ($bestType === null || $bestEdge === null) {
+                break;
+            }
+
+            $selected[] = $bestEdge;
+            $positions[$bestType] = ($positions[$bestType] ?? 0) + 1;
+        }
+
+        return $selected;
+    }
+
+    /** @param array<int, string> $types @return array<int, string> */
+    private function normalizedEdgeTypes(array $types): array
+    {
+        $normalized = [];
+
+        foreach ($types as $type) {
+            if (is_string($type)) {
+                $normalized[$type] = $type;
+            }
+        }
+
+        ksort($normalized);
+
+        return array_values($normalized);
+    }
+
+    /** @param array<string, mixed> $a @param array<string, mixed> $b */
+    private static function compareRankedEdges(array $a, array $b, string $direction): int
+    {
+        $confidence = (float) ($b['confidence'] ?? 1.0) <=> (float) ($a['confidence'] ?? 1.0);
+
+        if ($confidence !== 0) {
+            return $confidence;
+        }
+
+        foreach ([
+            $direction === 'out' ? 'to' : 'from',
+            'type',
+            'from',
+            'to',
+        ] as $field) {
+            $comparison = (string) ($a[$field] ?? '') <=> (string) ($b[$field] ?? '');
+
+            if ($comparison !== 0) {
+                return $comparison;
+            }
+        }
+
+        // Duplicate endpoint/type edges are malformed for a canonical graph,
+        // but keep their order deterministic without walking metadata for the
+        // normal (distinct endpoint) case.
+        return self::stableEdgeKey($a) <=> self::stableEdgeKey($b);
+    }
+
+    /** @param array<string, mixed> $edge */
+    private static function stableEdgeKey(array $edge): string
+    {
+        $encoded = json_encode(
+            $edge,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION,
+        );
+
+        return is_string($encoded) ? $encoded : '';
     }
 }

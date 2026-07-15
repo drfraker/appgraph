@@ -23,6 +23,109 @@ class GraphIndexTest extends TestCase
         $this->assertCount(1, $index->edgesTo('table:notes', ['writes']));
     }
 
+    public function test_ranked_edge_selectors_merge_types_by_confidence_and_report_omitted_edges(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => [],
+            'edges' => [
+                ['from' => 'Root', 'to' => 'A', 'type' => 'calls', 'confidence' => 0.1],
+                ['from' => 'Root', 'to' => 'Z', 'type' => 'dispatches', 'confidence' => 0.9],
+                ['from' => 'Y', 'to' => 'Root', 'type' => 'calls', 'confidence' => 0.8],
+                ['from' => 'X', 'to' => 'Root', 'type' => 'dispatches', 'confidence' => 1.0],
+            ],
+        ];
+        $index = GraphIndex::fromArray($graph);
+        $truncated = false;
+
+        $out = $index->rankedEdgesFrom('Root', ['calls', 'dispatches'], 1, $truncated);
+
+        $this->assertSame(['Z'], array_column($out, 'to'));
+        $this->assertTrue($truncated);
+
+        $truncated = false;
+        $in = $index->rankedEdgesTo('Root', ['calls', 'dispatches'], 2, $truncated);
+
+        $this->assertSame(['X', 'Y'], array_column($in, 'from'));
+        $this->assertFalse($truncated);
+
+        $truncated = false;
+        $this->assertSame([], $index->rankedEdgesFrom('Root', ['calls'], 0, $truncated));
+        $this->assertTrue($truncated);
+
+        $truncated = false;
+        $this->assertSame([], $index->rankedEdgesFrom('Root', ['missing'], 0, $truncated));
+        $this->assertFalse($truncated);
+    }
+
+    public function test_ranked_edge_selection_stays_bounded_on_high_fanout_adjacency(): void
+    {
+        $edges = [];
+
+        for ($index = 0; $index < 10000; $index++) {
+            $edges[] = [
+                'from' => 'Root',
+                'to' => sprintf('N%05d', $index),
+                'type' => 'calls',
+                'confidence' => $index / 10000,
+            ];
+        }
+
+        $truncated = false;
+        $selected = GraphIndex::fromArray([
+            'meta' => [],
+            'nodes' => [],
+            'edges' => $edges,
+        ])->rankedEdgesFrom('Root', ['calls'], 2, $truncated);
+
+        $this->assertSame(['N09999', 'N09998'], array_column($selected, 'to'));
+        $this->assertTrue($truncated);
+    }
+
+    public function test_ranked_source_edges_merge_weighted_adjacencies_globally_and_deterministically(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => [],
+            'edges' => [
+                ['from' => 'Direct', 'to' => 'DirectModel', 'type' => 'uses_model', 'confidence' => 0.75],
+                ['from' => 'Service', 'to' => 'ServiceModel', 'type' => 'uses_model', 'confidence' => 0.95],
+                ['from' => 'Helper', 'to' => 'HelperModel', 'type' => 'uses_model', 'confidence' => 1.0],
+            ],
+        ];
+        $sources = [
+            ['id' => 'Direct', 'confidence' => 1.0, 'depth' => 0, 'path' => ['Direct']],
+            ['id' => 'Service', 'confidence' => 0.8, 'depth' => 1, 'path' => ['Direct', 'Service']],
+            ['id' => 'Helper', 'confidence' => 0.72, 'depth' => 2, 'path' => ['Direct', 'Service', 'Helper']],
+        ];
+        $truncated = false;
+
+        $selected = GraphIndex::fromArray($graph)->rankedEdgesFromSources(
+            $sources,
+            ['uses_model'],
+            2,
+            $truncated,
+        );
+
+        $this->assertSame(['Service', 'Direct'], array_column($selected, 'source'));
+        $this->assertSame(['ServiceModel', 'DirectModel'], array_column(array_column($selected, 'edge'), 'to'));
+        $this->assertTrue($truncated);
+
+        $reordered = $graph;
+        $reordered['edges'] = array_reverse($reordered['edges']);
+        $reorderedTruncated = false;
+        $this->assertSame(
+            $selected,
+            GraphIndex::fromArray($reordered)->rankedEdgesFromSources(
+                array_reverse($sources),
+                ['uses_model'],
+                2,
+                $reorderedTruncated,
+            ),
+        );
+        $this->assertTrue($reorderedTruncated);
+    }
+
     public function test_load_observes_an_atomic_replacement_within_the_same_timestamp_window(): void
     {
         $directory = sys_get_temp_dir().'/appgraph-index-'.bin2hex(random_bytes(4));
@@ -81,6 +184,341 @@ class GraphIndexTest extends TestCase
         $this->assertCount(1, $limited);
         $this->assertTrue($truncated);
         $this->assertSame('App\Http\Controllers\NoteController::update', $limited[0]['id']);
+    }
+
+    public function test_traverse_marks_depth_limited_results_as_truncated_including_at_depth_zero(): void
+    {
+        $index = GraphIndex::fromArray($this->queryFixtureGraph());
+        $truncated = false;
+
+        $shallow = $index->traverse(
+            'App\Http\Controllers\NoteController::update',
+            ['calls'],
+            maxDepth: 1,
+            truncated: $truncated,
+        );
+
+        $this->assertSame(['App\Services\NoteService::save'], array_column($shallow, 'id'));
+        $this->assertTrue($truncated);
+
+        $truncated = false;
+        $none = $index->traverse(
+            'App\Http\Controllers\NoteController::update',
+            ['calls'],
+            maxDepth: 0,
+            truncated: $truncated,
+        );
+
+        $this->assertSame([], $none);
+        $this->assertTrue($truncated);
+    }
+
+    public function test_depth_truncation_ignores_cycles_and_ineligible_transitions(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => array_map(
+                static fn (string $id): array => ['id' => $id, 'type' => 'method', 'label' => $id],
+                ['A', 'B', 'C', 'D'],
+            ),
+            'edges' => [
+                ['from' => 'A', 'to' => 'B', 'type' => 'calls', 'confidence' => 1.0],
+                ['from' => 'B', 'to' => 'A', 'type' => 'calls', 'confidence' => 1.0],
+                ['from' => 'B', 'to' => 'C', 'type' => 'calls', 'confidence' => 0.2],
+                ['from' => 'B', 'to' => 'D', 'type' => 'calls', 'confidence' => 1.0],
+            ],
+        ];
+        $truncated = false;
+
+        $results = GraphIndex::fromArray($graph)->traverseFromSeeds(
+            [['id' => 'A']],
+            ['calls'],
+            maxDepth: 1,
+            minConfidence: 0.5,
+            transition: static fn (
+                array $state,
+                array $edge,
+                string $neighborId,
+                string $direction,
+            ): bool => $neighborId !== 'D',
+            truncated: $truncated,
+        );
+
+        $this->assertSame(['A', 'B'], array_column($results, 'id'));
+        $this->assertFalse($truncated);
+    }
+
+    public function test_depth_truncation_distinguishes_the_same_node_in_different_execution_partitions(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => array_map(
+                static fn (string $id): array => ['id' => $id, 'type' => 'method', 'label' => $id],
+                ['Entry', 'DualRoleJob', 'Listener'],
+            ),
+            'edges' => [
+                [
+                    'from' => 'Entry',
+                    'to' => 'DualRoleJob',
+                    'type' => 'dispatches',
+                    'confidence' => 1.0,
+                    'metadata' => ['partition' => 'dispatch:event'],
+                ],
+                [
+                    'from' => 'DualRoleJob',
+                    'to' => 'Listener',
+                    'type' => 'handled_by',
+                    'confidence' => 1.0,
+                    'metadata' => ['partition' => ''],
+                ],
+                [
+                    'from' => 'Listener',
+                    'to' => 'DualRoleJob',
+                    'type' => 'dispatches',
+                    'confidence' => 1.0,
+                    'metadata' => ['partition' => 'dispatch:job'],
+                ],
+            ],
+        ];
+        $transition = static fn (
+            array $state,
+            array $edge,
+            string $neighborId,
+            string $direction,
+        ): array => ['statePartition' => $edge['metadata']['partition']];
+        $truncated = false;
+
+        GraphIndex::fromArray($graph)->traverseFromSeeds(
+            [['id' => 'Entry']],
+            ['dispatches', 'handled_by'],
+            maxDepth: 2,
+            transition: $transition,
+            truncated: $truncated,
+        );
+
+        $this->assertTrue($truncated);
+
+        $graph['edges'][2]['metadata']['partition'] = 'dispatch:event';
+        $truncated = false;
+
+        GraphIndex::fromArray($graph)->traverseFromSeeds(
+            [['id' => 'Entry']],
+            ['dispatches', 'handled_by'],
+            maxDepth: 2,
+            transition: $transition,
+            truncated: $truncated,
+        );
+
+        $this->assertFalse($truncated);
+    }
+
+    public function test_seeded_traversal_hard_bounds_examined_transitions_deterministically(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => [
+                ['id' => 'A', 'type' => 'entry', 'label' => 'A'],
+                ['id' => 'B', 'type' => 'result', 'label' => 'B'],
+                ['id' => 'C', 'type' => 'result', 'label' => 'C'],
+            ],
+            'edges' => [
+                ['from' => 'A', 'to' => 'C', 'type' => 'calls', 'confidence' => 1.0],
+                ['from' => 'A', 'to' => 'B', 'type' => 'calls', 'confidence' => 1.0],
+            ],
+        ];
+        $index = GraphIndex::fromArray($graph);
+        $truncated = false;
+
+        $none = $index->traverse(
+            'A',
+            ['calls'],
+            truncated: $truncated,
+            maxTransitions: 0,
+        );
+
+        $this->assertSame([], $none);
+        $this->assertTrue($truncated);
+
+        $truncated = false;
+
+        $bounded = $index->traverseFromSeeds(
+            [['id' => 'A']],
+            ['calls'],
+            resultNodeTypes: ['result'],
+            truncated: $truncated,
+            maxTransitions: 1,
+        );
+
+        $this->assertSame(['B'], array_column($bounded, 'id'));
+        $this->assertTrue($truncated);
+
+        $truncated = false;
+        $complete = $index->traverseFromSeeds(
+            [['id' => 'A']],
+            ['calls'],
+            resultNodeTypes: ['result'],
+            truncated: $truncated,
+            maxTransitions: 2,
+        );
+
+        $this->assertSame(['B', 'C'], array_column($complete, 'id'));
+        $this->assertFalse($truncated);
+    }
+
+    public function test_transition_budget_prefers_strong_edges_and_frontier_states_over_lexical_order(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => [
+                ['id' => 'Start', 'type' => 'entry', 'label' => 'Start'],
+                ['id' => 'A', 'type' => 'result', 'label' => 'A'],
+                ['id' => 'Z', 'type' => 'result', 'label' => 'Z'],
+                ['id' => 'ASeed', 'type' => 'entry', 'label' => 'ASeed'],
+                ['id' => 'ZSeed', 'type' => 'entry', 'label' => 'ZSeed'],
+            ],
+            'edges' => [
+                ['from' => 'Start', 'to' => 'A', 'type' => 'calls', 'confidence' => 0.1],
+                ['from' => 'Start', 'to' => 'Z', 'type' => 'calls', 'confidence' => 0.9],
+                ['from' => 'ASeed', 'to' => 'A', 'type' => 'calls', 'confidence' => 0.2],
+                ['from' => 'ZSeed', 'to' => 'Z', 'type' => 'calls', 'confidence' => 1.0],
+            ],
+        ];
+        $index = GraphIndex::fromArray($graph);
+        $truncated = false;
+
+        $edgeRanked = $index->traverse(
+            'Start',
+            ['calls'],
+            truncated: $truncated,
+            maxTransitions: 1,
+        );
+
+        $this->assertSame(['Z'], array_column($edgeRanked, 'id'));
+        $this->assertTrue($truncated);
+
+        $truncated = false;
+        $stateRanked = $index->traverseFromSeeds(
+            [
+                ['id' => 'ASeed', 'confidence' => 1.0],
+                ['id' => 'ZSeed', 'confidence' => 0.8],
+            ],
+            ['calls'],
+            resultNodeTypes: ['result'],
+            truncated: $truncated,
+            maxTransitions: 1,
+        );
+
+        $this->assertSame(['Z'], array_column($stateRanked, 'id'));
+        $this->assertSame(0.8, $stateRanked[0]['confidence']);
+        $this->assertTrue($truncated);
+    }
+
+    public function test_transition_budget_is_best_first_across_newly_discovered_frontier_states(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => array_map(
+                static fn (string $id): array => ['id' => $id, 'type' => 'method', 'label' => $id],
+                ['Start', 'A', 'B', 'Z'],
+            ),
+            'edges' => [
+                ['from' => 'Start', 'to' => 'B', 'type' => 'calls', 'confidence' => 0.01],
+                ['from' => 'A', 'to' => 'Z', 'type' => 'calls', 'confidence' => 1.0],
+                ['from' => 'Start', 'to' => 'A', 'type' => 'calls', 'confidence' => 1.0],
+            ],
+        ];
+        $truncated = false;
+
+        $bounded = GraphIndex::fromArray($graph)->traverse(
+            'Start',
+            ['calls'],
+            maxDepth: 2,
+            truncated: $truncated,
+            maxTransitions: 2,
+        );
+
+        $this->assertSame(['A', 'Z'], array_column($bounded, 'id'));
+        $this->assertSame(['Start', 'A', 'Z'], $bounded[1]['path']);
+        $this->assertTrue($truncated);
+
+        $reordered = $graph;
+        $reordered['edges'] = array_reverse($reordered['edges']);
+        $reorderedTruncated = false;
+        $this->assertSame(
+            $bounded,
+            GraphIndex::fromArray($reordered)->traverse(
+                'Start',
+                ['calls'],
+                maxDepth: 2,
+                truncated: $reorderedTruncated,
+                maxTransitions: 2,
+            ),
+        );
+        $this->assertTrue($reorderedTruncated);
+
+        $reverseGraph = $graph;
+        $reverseGraph['edges'][] = ['from' => 'B', 'to' => 'Z', 'type' => 'calls', 'confidence' => 0.01];
+        $reverseTruncated = false;
+        $reverse = GraphIndex::fromArray($reverseGraph)->traverse(
+            'Z',
+            ['calls'],
+            direction: 'in',
+            maxDepth: 2,
+            truncated: $reverseTruncated,
+            maxTransitions: 2,
+        );
+
+        $this->assertSame(['A', 'Start'], array_column($reverse, 'id'));
+        $this->assertSame(['Z', 'A', 'Start'], $reverse[1]['path']);
+        $this->assertTrue($reverseTruncated);
+
+        $completeTruncated = false;
+        $complete = GraphIndex::fromArray($graph)->traverse(
+            'Start',
+            ['calls'],
+            maxDepth: 2,
+            truncated: $completeTruncated,
+            maxTransitions: 3,
+        );
+
+        $this->assertSame(['A', 'Z', 'B'], array_column($complete, 'id'));
+        $this->assertFalse($completeTruncated);
+    }
+
+    public function test_best_first_transition_queue_handles_a_wide_frontier_without_rescanning_it(): void
+    {
+        $nodes = [['id' => 'Root', 'type' => 'entry', 'label' => 'Root']];
+        $edges = [];
+        $width = 2000;
+
+        for ($index = 0; $index < $width; $index++) {
+            $branch = sprintf('Branch%04d', $index);
+            $leaf = sprintf('Leaf%04d', $index);
+            $nodes[] = ['id' => $branch, 'type' => 'branch', 'label' => $branch];
+            $nodes[] = ['id' => $leaf, 'type' => 'leaf', 'label' => $leaf];
+            $edges[] = ['from' => 'Root', 'to' => $branch, 'type' => 'calls', 'confidence' => 1.0];
+            $edges[] = ['from' => $branch, 'to' => $leaf, 'type' => 'calls', 'confidence' => 1.0];
+        }
+
+        $truncated = false;
+        $results = GraphIndex::fromArray([
+            'meta' => [],
+            'nodes' => $nodes,
+            'edges' => array_reverse($edges),
+        ])->traverseFromSeeds(
+            [['id' => 'Root']],
+            ['calls'],
+            maxDepth: 2,
+            limit: $width,
+            resultNodeTypes: ['leaf'],
+            truncated: $truncated,
+            maxTransitions: $width * 2,
+        );
+
+        $this->assertCount($width, $results);
+        $this->assertSame('Leaf0000', $results[0]['id']);
+        $this->assertSame('Leaf1999', $results[array_key_last($results)]['id']);
+        $this->assertFalse($truncated);
     }
 
     public function test_traverse_replaces_a_weak_shallow_visit_with_a_stronger_ranked_path(): void

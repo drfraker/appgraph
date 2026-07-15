@@ -96,11 +96,23 @@ return [
     'overview' => [
         /*
          * Also write a small, always-loadable "overview" projection (counts, model→table
-         * map, model relationships, and a route→models/tables touch map) alongside the
+         * map, model relationships, and bounded route workflow summaries) alongside the
          * full graph. It is bounded in size so an agent can read it into context to orient
          * itself before querying the full graph.
          */
         'enabled' => true,
+
+        /*
+         * Route summaries follow the same causal execution edges as `flow-from`,
+         * including downstream calls and active event/job handlers. These limits
+         * keep both traversal work and emitted context bounded on large apps.
+         */
+        'route_summary' => [
+            'depth' => 6,
+            'method_limit' => 32,
+            'item_limit' => 12,
+            'transition_limit' => 5000,
+        ],
 
         /*
          * A bare filename is written next to the main output file. A relative path

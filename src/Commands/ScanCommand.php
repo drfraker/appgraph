@@ -146,7 +146,13 @@ class ScanCommand extends Command
 
         if ($this->shouldWriteOverview()) {
             $overviewPath = $this->overviewPath($path);
-            $exporter->exportData((new OverviewBuilder())->build($graph), $overviewPath, $pretty);
+            $overview = new OverviewBuilder(
+                routeDepth: (int) config('appgraph.overview.route_summary.depth', 6),
+                routeMethodLimit: (int) config('appgraph.overview.route_summary.method_limit', 32),
+                routeItemLimit: (int) config('appgraph.overview.route_summary.item_limit', 12),
+                routeTransitionLimit: (int) config('appgraph.overview.route_summary.transition_limit', 5000),
+            );
+            $exporter->exportData($overview->build($graph), $overviewPath, $pretty);
 
             $this->info("AppGraph overview written to {$overviewPath}");
         }

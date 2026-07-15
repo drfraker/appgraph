@@ -278,10 +278,20 @@ Alongside the full graph, the scan writes a small, always-loadable `overview.jso
 - `counts`: node/edge totals and per-type histograms
 - `models`: model class → table name
 - `relationships`: model-to-model relationship adjacency
-- `routes`: each route with its controller action and the models/tables it touches
+- `routes`: each route with its action and bounded, causally reachable models, tables, and dispatched events/jobs
 - `events`: event/job → listener and dispatch-site counts
 
-It is bounded in size (independent of method/column volume) so an agent can read it into context to orient itself before querying the full graph. Disable it with `--no-overview`, or via `appgraph.overview.enabled` in the config.
+Route summaries reuse the ranked execution traversal behind `flow-from`, including
+downstream calls, middleware/FormRequest bridges, and active listener/job handlers.
+Declaration-only or inactive handlers are not treated as execution. Queued work is
+eventual reachability, not a claim that it runs in the HTTP request. Each summary is
+strictly capped and carries `truncated: true` when some reachable context was omitted;
+the effective limits are recorded in `meta.routeTraversal`. Tune them with
+`appgraph.overview.route_summary.depth`, `method_limit`, `item_limit`, and
+`transition_limit` (hard maximums remain in place). The projection stays bounded
+independently of method/column volume, so an agent can load it before targeted
+queries. Disable it with `--no-overview`, or via `appgraph.overview.enabled` in
+the config.
 
 ## Roadmap
 

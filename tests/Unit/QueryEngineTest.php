@@ -256,6 +256,363 @@ class QueryEngineTest extends TestCase
         $this->assertSame('route_has_no_mapped_tests', $flow['analysisWarnings'][0]['reason']);
     }
 
+    public function test_flow_from_retains_the_strongest_duplicate_model_occurrence(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $graph['edges'][] = [
+            'from' => 'App\Services\NoteService::helper',
+            'to' => 'App\Models\Note',
+            'type' => 'uses_model',
+            'confidence' => 0.95,
+        ];
+
+        $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom('notes.update');
+        $model = collect($flow['models'])->firstWhere('id', 'App\Models\Note');
+
+        $this->assertSame('App\Http\Controllers\NoteController::update', $model['from']);
+        $this->assertSame(0, $model['depth']);
+        $this->assertSame(0.9, $model['confidence']);
+    }
+
+    public function test_flow_from_ranks_and_limits_related_groups_independently_from_methods(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $graph['edges'] = [
+            ...$graph['edges'],
+            [
+                'from' => 'App\Services\NoteService::save',
+                'to' => 'App\Other\Tag',
+                'type' => 'uses_model',
+                'confidence' => 0.99,
+            ],
+            [
+                'from' => 'App\Services\NoteService::helper',
+                'to' => 'App\Models\Tag',
+                'type' => 'uses_model',
+                'confidence' => 1.0,
+            ],
+        ];
+
+        $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom(
+            'notes.update',
+            limit: 3,
+            relatedLimit: 1,
+        );
+
+        $this->assertCount(3, $flow['methods']);
+        $this->assertSame(['App\Other\Tag'], array_column($flow['models'], 'id'));
+        $this->assertSame(0.99, $flow['models'][0]['confidence']);
+        $this->assertTrue($flow['truncated']);
+        $this->assertSame(['groups' => ['models']], $flow['truncation']);
+    }
+
+    public function test_flow_from_applies_one_hard_budget_to_ranked_related_facts(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $action = 'App\Http\Controllers\NoteController::update';
+
+        foreach ([0.99, 0.98, 0.97, 0.96] as $index => $confidence) {
+            $model = 'App\Models\Ranked'.$index;
+            $graph['nodes'][] = ['id' => $model, 'type' => 'model', 'label' => 'Ranked'.$index];
+            $graph['edges'][] = [
+                'from' => $action,
+                'to' => $model,
+                'type' => 'uses_model',
+                'confidence' => $confidence,
+            ];
+        }
+
+        $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom(
+            'notes.update',
+            maxRelatedFacts: 2,
+            relatedGroups: ['models'],
+        );
+
+        $this->assertSame(
+            ['App\Models\Ranked0', 'App\Models\Ranked1'],
+            array_column($flow['models'], 'id'),
+        );
+        $this->assertTrue($flow['truncated']);
+        $this->assertSame([
+            'maxRelatedFacts' => 2,
+            'consumed' => 2,
+            'stages' => ['methodEdges'],
+        ], $flow['truncation']['relatedFacts']);
+    }
+
+    public function test_flow_from_ranks_the_related_fact_budget_globally_across_methods(): void
+    {
+        foreach ([false, true] as $reverseInsertion) {
+            $graph = $this->queryFixtureGraph();
+            $action = 'App\Http\Controllers\NoteController::update';
+            $service = 'App\Services\NoteService::save';
+            $helper = 'App\Services\NoteService::helper';
+            $directModel = 'App\Models\DirectCandidate';
+            $serviceModel = 'App\Models\ServiceCandidate';
+            $helperModel = 'App\Models\MisleadingRawCandidate';
+
+            foreach ($graph['edges'] as &$edge) {
+                if ($edge['from'] === $action && $edge['type'] === 'uses_model') {
+                    $edge['confidence'] = 0.1;
+                }
+
+                if ($edge['from'] === $action && $edge['to'] === $service && $edge['type'] === 'calls') {
+                    $edge['confidence'] = 0.8;
+                }
+            }
+            unset($edge);
+
+            $graph['nodes'] = [
+                ...$graph['nodes'],
+                ['id' => $directModel, 'type' => 'model', 'label' => 'DirectCandidate'],
+                ['id' => $serviceModel, 'type' => 'model', 'label' => 'ServiceCandidate'],
+                ['id' => $helperModel, 'type' => 'model', 'label' => 'MisleadingRawCandidate'],
+            ];
+            $graph['edges'] = [
+                ...$graph['edges'],
+                ['from' => $action, 'to' => $directModel, 'type' => 'uses_model', 'confidence' => 0.75],
+                ['from' => $service, 'to' => $serviceModel, 'type' => 'uses_model', 'confidence' => 0.95],
+                ['from' => $helper, 'to' => $helperModel, 'type' => 'uses_model', 'confidence' => 1.0],
+            ];
+
+            if ($reverseInsertion) {
+                $graph['edges'] = array_reverse($graph['edges']);
+            }
+
+            $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom(
+                'notes.update',
+                maxRelatedFacts: 1,
+                relatedGroups: ['models'],
+            );
+
+            $this->assertSame([$serviceModel], array_column($flow['models'], 'id'));
+            $this->assertSame($service, $flow['models'][0]['from']);
+            $this->assertSame(0.76, $flow['models'][0]['confidence']);
+            $this->assertSame([
+                'maxRelatedFacts' => 1,
+                'consumed' => 1,
+                'stages' => ['methodEdges'],
+            ], $flow['truncation']['relatedFacts']);
+        }
+    }
+
+    public function test_flow_from_shares_the_related_fact_budget_with_requested_route_consumers(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $test = 'test:Tests\Feature\NoteTest::test_update';
+        $graph['nodes'][] = ['id' => $test, 'type' => 'test', 'label' => 'NoteTest::test_update'];
+        $graph['edges'][] = [
+            'from' => $test,
+            'to' => 'route:PUT:/notes/{note}',
+            'type' => 'tests_route',
+            'confidence' => 1.0,
+        ];
+
+        $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom(
+            'notes.update',
+            maxRelatedFacts: 1,
+            relatedGroups: ['models', 'tests'],
+        );
+
+        $this->assertSame(['App\Models\Note'], array_column($flow['models'], 'id'));
+        $this->assertArrayNotHasKey('tests', $flow);
+        $this->assertSame(['routeIncoming'], $flow['truncation']['relatedFacts']['stages']);
+        $this->assertArrayNotHasKey('analysisWarnings', $flow);
+    }
+
+    public function test_flow_from_bounds_dispatch_listener_detail_fanout_with_the_shared_budget(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $action = 'App\Http\Controllers\NoteController::update';
+        $event = 'App\Events\FanoutEvent';
+        $graph['nodes'][] = ['id' => $event, 'type' => 'event', 'label' => 'FanoutEvent'];
+        $graph['edges'][] = [
+            'from' => $action,
+            'to' => $event,
+            'type' => 'dispatches',
+            'confidence' => 1.0,
+        ];
+
+        for ($index = 0; $index < 8; $index++) {
+            $listener = sprintf('App\Listeners\Fanout%02d::handle', $index);
+            $graph['nodes'][] = ['id' => $listener, 'type' => 'method', 'label' => 'Fanout listener'];
+            $graph['edges'][] = [
+                'from' => $event,
+                'to' => $listener,
+                'type' => 'handled_by',
+                'confidence' => 1.0,
+                'metadata' => ['kind' => 'listener'],
+            ];
+        }
+
+        $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom(
+            'notes.update',
+            maxRelatedFacts: 3,
+            relatedGroups: ['dispatches'],
+        );
+        $dispatch = $flow['dispatches'][0];
+
+        $this->assertSame([
+            'App\Listeners\Fanout00::handle',
+            'App\Listeners\Fanout01::handle',
+        ], array_column($dispatch['listeners'], 'id'));
+        $this->assertSame([
+            'maxRelatedFacts' => 3,
+            'consumed' => 3,
+            'stages' => ['dispatchListeners'],
+        ], $flow['truncation']['relatedFacts']);
+
+        $compact = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom(
+            'notes.update',
+            maxRelatedFacts: 1,
+            relatedGroups: ['dispatches'],
+            includeDispatchDetails: false,
+        );
+
+        $this->assertArrayNotHasKey('listeners', $compact['dispatches'][0]);
+        $this->assertArrayNotHasKey('relatedFacts', $compact['truncation'] ?? []);
+    }
+
+    public function test_flow_from_can_select_only_overview_groups_without_expanding_dispatch_details(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $action = 'App\Http\Controllers\NoteController::update';
+        $event = 'App\Events\CompactEvent';
+        $listener = 'App\Listeners\CompactListener::handle';
+        $cache = 'side-effect:cache:default:notes';
+        $consumer = 'frontend:resources/js/Note.vue';
+        $test = 'test:Tests\Feature\NoteTest::test_update';
+        $policy = 'App\Policies\NotePolicy::update';
+        $graph['nodes'] = [
+            ...$graph['nodes'],
+            ['id' => $event, 'type' => 'event', 'label' => 'CompactEvent'],
+            ['id' => $listener, 'type' => 'method', 'label' => 'CompactListener::handle'],
+            ['id' => $cache, 'type' => 'cache', 'label' => 'notes'],
+            ['id' => $consumer, 'type' => 'frontend', 'label' => 'Note.vue'],
+            ['id' => $test, 'type' => 'test', 'label' => 'NoteTest::test_update'],
+            ['id' => $policy, 'type' => 'method', 'label' => 'NotePolicy::update'],
+        ];
+        $graph['edges'] = [
+            ...$graph['edges'],
+            [
+                'from' => $action,
+                'to' => $event,
+                'type' => 'dispatches',
+                'confidence' => 1.0,
+                'metadata' => ['dispatchMode' => 'queued', 'queue' => 'notifications'],
+            ],
+            [
+                'from' => $event,
+                'to' => $listener,
+                'type' => 'handled_by',
+                'confidence' => 1.0,
+                'metadata' => ['kind' => 'listener', 'queued' => true],
+            ],
+            ['from' => $action, 'to' => $cache, 'type' => 'writes_cache', 'confidence' => 1.0],
+            ['from' => $action, 'to' => $policy, 'type' => 'authorizes_via', 'confidence' => 1.0],
+            ['from' => $consumer, 'to' => 'route:PUT:/notes/{note}', 'type' => 'consumes_route', 'confidence' => 1.0],
+            ['from' => $test, 'to' => 'route:PUT:/notes/{note}', 'type' => 'tests_route', 'confidence' => 1.0],
+        ];
+
+        $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom(
+            'notes.update',
+            relatedGroups: ['models', 'dataAccess', 'dispatches'],
+            includeDispatchDetails: false,
+            includeDataAccessDetails: false,
+            includeAnalysisWarnings: false,
+        );
+        $dispatch = $flow['dispatches'][0];
+
+        $this->assertSame(['models', 'dataAccess', 'dispatches'], array_values(array_intersect(
+            array_keys($flow),
+            ['formRequests', 'models', 'dataAccess', 'dispatches', 'sideEffects', 'authorization', 'frontendConsumers', 'tests'],
+        )));
+        $this->assertArrayNotHasKey('listeners', $dispatch);
+        $this->assertArrayNotHasKey('mode', $dispatch);
+        $this->assertArrayNotHasKey('queue', $dispatch);
+        $this->assertArrayNotHasKey('ops', $flow['dataAccess'][0]);
+        $this->assertArrayNotHasKey('fields', $flow['dataAccess'][0]);
+        $this->assertArrayNotHasKey('analysisWarnings', $flow);
+    }
+
+    public function test_flow_from_selects_one_ranked_route_action_without_filtering_full_adjacency(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $route = 'route:PUT:/notes/{note}';
+        $preferred = 'App\Http\Controllers\PreferredNoteController::update';
+        $graph['nodes'][] = [
+            'id' => $preferred,
+            'type' => 'method',
+            'label' => 'PreferredNoteController::update',
+        ];
+
+        foreach ($graph['edges'] as &$edge) {
+            if ($edge['type'] === 'routes_to') {
+                $edge['confidence'] = 0.1;
+            }
+        }
+        unset($edge);
+
+        $graph['edges'][] = [
+            'from' => $route,
+            'to' => $preferred,
+            'type' => 'routes_to',
+            'confidence' => 0.9,
+        ];
+
+        for ($index = 0; $index < 1000; $index++) {
+            $graph['edges'][] = [
+                'from' => $route,
+                'to' => 'middleware:'.$index,
+                'type' => 'passes_through',
+                'confidence' => 0.5,
+            ];
+        }
+
+        $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom(
+            'notes.update',
+            maxTransitions: 0,
+            relatedGroups: [],
+        );
+
+        $this->assertSame($preferred, $flow['entrypoint']['id']);
+        $this->assertTrue($flow['truncated']);
+        $this->assertTrue($flow['truncation']['routeActionSelection']);
+        $this->assertTrue($flow['truncation']['executionTraversal']);
+    }
+
+    public function test_flow_from_spends_the_transition_budget_on_ranked_middleware_seeds_first(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $route = 'route:PUT:/notes/{note}';
+        $preferred = 'AA\Middleware\Preferred::handle';
+        $overflow = 'AB\Middleware\Overflow::handle';
+        $downstream = 'AA\Services\Audit::record';
+        $graph['nodes'] = [
+            ...$graph['nodes'],
+            ['id' => $preferred, 'type' => 'method', 'label' => 'Preferred middleware'],
+            ['id' => $overflow, 'type' => 'method', 'label' => 'Overflow middleware'],
+            ['id' => $downstream, 'type' => 'method', 'label' => 'Audit::record'],
+        ];
+        $graph['edges'] = [
+            ...$graph['edges'],
+            ['from' => $route, 'to' => $preferred, 'type' => 'passes_through', 'confidence' => 1.0],
+            ['from' => $route, 'to' => $overflow, 'type' => 'passes_through', 'confidence' => 0.9],
+            ['from' => $preferred, 'to' => $downstream, 'type' => 'calls', 'confidence' => 1.0],
+        ];
+
+        $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom(
+            'notes.update',
+            maxTransitions: 1,
+            relatedGroups: [],
+        );
+
+        $this->assertContains($preferred, array_column($flow['methods'], 'id'));
+        $this->assertNotContains($overflow, array_column($flow['methods'], 'id'));
+        $this->assertNotContains($downstream, array_column($flow['methods'], 'id'));
+        $this->assertTrue($flow['truncation']['executionTraversal']);
+    }
+
     public function test_flow_from_route_runs_middleware_as_a_ranked_entrypoint_and_ignores_container_resolution_edges(): void
     {
         $graph = $this->queryFixtureGraph();
@@ -305,6 +662,14 @@ class QueryEngineTest extends TestCase
         $action = 'App\Http\Controllers\NoteController::update';
         $middleware = 'AA\Middleware::handle';
         $graph['nodes'][] = ['id' => $middleware, 'type' => 'method', 'label' => 'AA Middleware'];
+
+        foreach ($graph['edges'] as &$edge) {
+            if ($edge['type'] === 'routes_to') {
+                $edge['confidence'] = 0.8;
+            }
+        }
+        unset($edge);
+
         $graph['edges'][] = [
             'from' => $route,
             'to' => $middleware,
@@ -317,6 +682,8 @@ class QueryEngineTest extends TestCase
         $this->assertTrue($flow['truncated']);
         $this->assertSame($action, $flow['entrypoint']['id']);
         $this->assertSame([$action], array_column($flow['methods'], 'id'));
+        $this->assertTrue($flow['truncation']['executionTraversal']);
+        $this->assertTrue($flow['truncation']['actionReservation']);
     }
 
     public function test_flow_from_retains_the_routes_to_confidence_on_the_action_seed(): void
@@ -724,6 +1091,100 @@ class QueryEngineTest extends TestCase
         $this->assertArrayNotHasKey('listeners', $dispatch);
         $this->assertNotContains($listener, $methodIds);
         $this->assertNotContains($jobHandler, $methodIds);
+    }
+
+    public function test_flow_from_exposes_dispatch_causal_execution_semantics(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $action = 'App\Http\Controllers\NoteController::update';
+        $default = 'App\Jobs\DefaultCausal';
+        $directFalse = 'App\Jobs\DirectFalse';
+        $allFalse = 'App\Jobs\AllFalse';
+        $mixed = 'App\Jobs\MixedCausality';
+        $malformed = 'App\Jobs\MalformedOccurrences';
+        $empty = 'App\Jobs\EmptyOccurrence';
+        $ordinaryMethod = 'App\Services\NotADispatchTarget::run';
+
+        foreach ([
+            $default,
+            $directFalse,
+            $allFalse,
+            $mixed,
+            $malformed,
+            $empty,
+        ] as $job) {
+            $graph['nodes'][] = ['id' => $job, 'type' => 'job', 'label' => class_basename($job)];
+        }
+
+        $graph['nodes'][] = [
+            'id' => $ordinaryMethod,
+            'type' => 'method',
+            'label' => 'NotADispatchTarget::run',
+        ];
+
+        $graph['edges'] = [
+            ...$graph['edges'],
+            ['from' => $action, 'to' => $default, 'type' => 'dispatches', 'confidence' => 1.0, 'metadata' => ['kind' => 'job']],
+            [
+                'from' => $action,
+                'to' => $directFalse,
+                'type' => 'dispatches',
+                'confidence' => 1.0,
+                'metadata' => ['kind' => 'job', 'causalExecutionProven' => false],
+            ],
+            [
+                'from' => $action,
+                'to' => $allFalse,
+                'type' => 'dispatches',
+                'confidence' => 1.0,
+                'metadata' => ['kind' => 'job', 'dispatchOccurrences' => [
+                    ['kind' => 'job', 'causalExecutionProven' => false],
+                    ['kind' => 'job', 'causalExecutionProven' => false],
+                ]],
+            ],
+            [
+                'from' => $action,
+                'to' => $mixed,
+                'type' => 'dispatches',
+                'confidence' => 1.0,
+                'metadata' => ['kind' => 'job', 'dispatchOccurrences' => [
+                    ['kind' => 'job', 'causalExecutionProven' => false],
+                    ['kind' => 'job', 'causalExecutionProven' => true],
+                ]],
+            ],
+            [
+                'from' => $action,
+                'to' => $malformed,
+                'type' => 'dispatches',
+                'confidence' => 1.0,
+                'metadata' => ['kind' => 'job', 'dispatchOccurrences' => ['invalid']],
+            ],
+            [
+                'from' => $action,
+                'to' => $empty,
+                'type' => 'dispatches',
+                'confidence' => 1.0,
+                'metadata' => ['kind' => 'job', 'dispatchOccurrences' => [[]]],
+            ],
+            [
+                'from' => $action,
+                'to' => $ordinaryMethod,
+                'type' => 'dispatches',
+                'confidence' => 1.0,
+            ],
+        ];
+
+        $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom('notes.update');
+        $dispatches = collect($flow['dispatches'])->keyBy('id');
+
+        $this->assertTrue($dispatches[$default]['causalExecutionProven']);
+        $this->assertFalse($dispatches[$directFalse]['causalExecutionProven']);
+        $this->assertFalse($dispatches[$allFalse]['causalExecutionProven']);
+        $this->assertTrue($dispatches[$mixed]['causalExecutionProven']);
+        $this->assertFalse($dispatches[$malformed]['causalExecutionProven']);
+        $this->assertFalse($dispatches[$empty]['causalExecutionProven']);
+        $this->assertFalse($dispatches[$ordinaryMethod]['causalExecutionProven']);
+        $this->assertNotContains($ordinaryMethod, array_column($flow['methods'], 'id'));
     }
 
     public function test_flow_from_rejects_non_entrypoint_nodes(): void

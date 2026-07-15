@@ -2,6 +2,7 @@
 
 namespace AppGraph\Tests\Feature;
 
+use AppGraph\Support\ScanFingerprint;
 use AppGraph\Tests\Fixtures\ProgressNoteController;
 use AppGraph\Tests\TestCase;
 use Illuminate\Database\Schema\Blueprint;
@@ -46,8 +47,11 @@ class ScanCommandTest extends TestCase
         $graph = json_decode((string) file_get_contents($outputPath), true, flags: JSON_THROW_ON_ERROR);
 
         $this->assertSame('0.4.0', $graph['meta']['appgraphVersion']);
-        $this->assertSame(1, $graph['meta']['scan']['version']);
+        $this->assertSame(ScanFingerprint::VERSION, $graph['meta']['scan']['version']);
         $this->assertSame('sha256', $graph['meta']['scan']['algorithm']);
+        $this->assertSame('testing', $graph['meta']['scan']['applicationEnvironment']);
+        $this->assertMatchesRegularExpression('/^[a-f0-9]{64}$/', $graph['meta']['scan']['containerBindings']);
+        $this->assertMatchesRegularExpression('/^[a-f0-9]{64}$/', $graph['meta']['scan']['laravelExecutionRegistry']);
         $this->assertMatchesRegularExpression('/^[a-f0-9]{64}$/', $graph['meta']['scan']['fingerprint']);
         $this->assertNotEmpty($graph['meta']['scan']['files']);
         $this->assertGraphHasNode($graph, 'route:PUT:/progress-notes/{note}', 'route');
@@ -63,10 +67,18 @@ class ScanCommandTest extends TestCase
         $this->assertGraphHasNode($graph, 'App\Http\Requests\CommandNoteRequest', 'form_request');
         $request = $this->graphNode($graph, 'App\Http\Requests\CommandNoteRequest');
         $this->assertSame(['title' => 'required|string'], $request['metadata']['rules']);
+        $this->assertGraphHasEdge(
+            $graph,
+            'App\Http\Requests\CommandNoteRequest',
+            'App\Http\Requests\CommandNoteRequest::rules',
+            'framework_invokes',
+        );
 
         $this->assertGraphHasNode($graph, 'App\Events\CommandNoteSaved', 'event');
         $this->assertGraphHasEdge($graph, 'App\Services\CommandNotePublisher::publish', 'App\Events\CommandNoteSaved', 'dispatches');
         $this->assertGraphHasEdge($graph, 'App\Listeners\CommandNoteListener::handle', 'App\Events\CommandNoteSaved', 'listens_to');
+        $this->assertGraphHasEdge($graph, 'App\Events\CommandNoteSaved', 'App\Listeners\CommandNoteListener::handle', 'handled_by');
+        $this->assertSame('testing', $graph['meta']['analysis']['containerBindings']['environment']);
 
         // Token-efficient shape: null/empty fields are omitted, schema sources are interned.
         $routeNode = $this->graphNode($graph, 'route:PUT:/progress-notes/{note}');

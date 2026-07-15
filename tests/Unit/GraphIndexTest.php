@@ -109,6 +109,54 @@ class GraphIndexTest extends TestCase
         $this->assertSame(['A', 'B', 'T'], $target['path']);
     }
 
+    public function test_seeded_traversal_ranks_one_causal_graph_filters_intermediate_nodes_and_limits_results(): void
+    {
+        $graph = [
+            'meta' => [],
+            'nodes' => [
+                ['id' => 'Action', 'type' => 'method', 'label' => 'Action'],
+                ['id' => 'Middleware', 'type' => 'method', 'label' => 'Middleware'],
+                ['id' => 'Event', 'type' => 'event', 'label' => 'Event'],
+                ['id' => 'Handler', 'type' => 'method', 'label' => 'Handler'],
+            ],
+            'edges' => [
+                ['from' => 'Action', 'to' => 'Event', 'type' => 'dispatches', 'confidence' => 0.8],
+                ['from' => 'Event', 'to' => 'Handler', 'type' => 'handled_by', 'confidence' => 0.75],
+                ['from' => 'Middleware', 'to' => 'Handler', 'type' => 'calls', 'confidence' => 0.9],
+                ['from' => 'Handler', 'to' => 'Action', 'type' => 'calls', 'confidence' => 1.0],
+            ],
+        ];
+        $truncated = false;
+
+        $results = GraphIndex::fromArray($graph)->traverseFromSeeds(
+            [
+                ['id' => 'Action'],
+                ['id' => 'Middleware', 'confidence' => 0.5],
+            ],
+            ['calls', 'dispatches', 'handled_by'],
+            maxDepth: 4,
+            limit: 2,
+            resultNodeTypes: ['method'],
+            truncated: $truncated,
+        );
+
+        $this->assertTrue($truncated);
+        $this->assertSame(['Action', 'Handler'], array_column($results, 'id'));
+        $this->assertNotContains('Event', array_column($results, 'id'));
+        $this->assertSame(2, $results[1]['depth']);
+        $this->assertSame(0.6, $results[1]['confidence']);
+        $this->assertSame('Event', $results[1]['via']);
+
+        $filteredSeeds = GraphIndex::fromArray($graph)->traverseFromSeeds(
+            [['id' => 'Middleware', 'confidence' => 0.5]],
+            ['calls'],
+            minConfidence: 0.6,
+            resultNodeTypes: ['method'],
+        );
+
+        $this->assertSame([], $filteredSeeds);
+    }
+
     public function test_top_paths_returns_distinct_complete_paths_in_rank_order_and_ignores_cycles(): void
     {
         $graph = [

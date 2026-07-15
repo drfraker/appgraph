@@ -7,6 +7,7 @@ use AppGraph\Graph\Graph;
 use AppGraph\Graph\GraphExporter;
 use AppGraph\Graph\OverviewBuilder;
 use AppGraph\Scanners\CallScanner;
+use AppGraph\Scanners\ContainerBindingScanner;
 use AppGraph\Scanners\DatabaseSchemaScanner;
 use AppGraph\Scanners\DataFlowScanner;
 use AppGraph\Scanners\EventFlowScanner;
@@ -17,6 +18,7 @@ use AppGraph\Scanners\PolicyScanner;
 use AppGraph\Scanners\RouteScanner;
 use AppGraph\Scanners\SideEffectScanner;
 use AppGraph\Scanners\TestScanner;
+use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\MemoryLimit;
 use AppGraph\Support\ScanFingerprint;
 use Illuminate\Console\Command;
@@ -46,10 +48,17 @@ class ScanCommand extends Command
         FrontendRouteScanner $frontendRouteScanner,
         TestScanner $testScanner,
         PolicyScanner $policyScanner,
+        ContainerBindingScanner $containerBindingScanner,
+        ContainerBindingRegistry $containerBindings,
         ScanFingerprint $scanFingerprint,
         GraphExporter $exporter,
     ): int {
         MemoryLimit::ensure(config('appgraph.memory_limit', '256M'));
+        $containerBindings->refresh();
+        // Freeze one read-only booted-container snapshot for every scanner and
+        // for the generation fingerprint. No later scanner may execute factories
+        // merely to make the snapshot more specific.
+        $containerBindings->bindings();
 
         $graph = new Graph([
             'generatedAt' => now()->toISOString(),
@@ -69,6 +78,7 @@ class ScanCommand extends Command
         $includeFrontend = (bool) config('appgraph.scan.frontend', true);
         $includeTests = (bool) config('appgraph.scan.tests', true);
         $includePolicies = (bool) config('appgraph.scan.policies', true);
+        $includeContainerBindings = (bool) config('appgraph.scan.container_bindings', true);
 
         if ($includeRoutes) {
             $this->runScanner($graph, 'routes', fn () => $routeScanner->scan($graph));
@@ -86,16 +96,16 @@ class ScanCommand extends Command
             $this->runScanner($graph, 'form_requests', fn () => $formRequestScanner->scan($graph));
         }
 
+        if ($includeEvents) {
+            $this->runScanner($graph, 'events', fn () => $eventFlowScanner->scan($graph));
+        }
+
         if ($includeCalls) {
             $this->runScanner($graph, 'calls', fn () => $callScanner->scan($graph));
         }
 
         if ($includeDataFlow) {
             $this->runScanner($graph, 'data_flow', fn () => $dataFlowScanner->scan($graph));
-        }
-
-        if ($includeEvents) {
-            $this->runScanner($graph, 'events', fn () => $eventFlowScanner->scan($graph));
         }
 
         if ($includeSideEffects) {
@@ -114,8 +124,12 @@ class ScanCommand extends Command
             $this->runScanner($graph, 'policies', fn () => $policyScanner->scan($graph));
         }
 
+        if ($includeContainerBindings) {
+            $this->runScanner($graph, 'container_bindings', fn () => $containerBindingScanner->scan($graph));
+        }
+
         $graph->addMeta([
-            'scan' => $scanFingerprint->capture(),
+            'scan' => $scanFingerprint->capture(refreshRuntimeEvidence: false),
         ]);
 
         $path = $this->outputPath();

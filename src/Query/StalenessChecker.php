@@ -60,6 +60,12 @@ class StalenessChecker
                 'addedFiles' => count($added),
                 'removedFiles' => count($removed),
                 'configurationChanged' => ($recordedScan['configuration'] ?? null) !== $current['configuration'],
+                'environmentChanged' => ($recordedScan['applicationEnvironment'] ?? null)
+                    !== ($current['applicationEnvironment'] ?? null),
+                'containerBindingsChanged' => ($recordedScan['containerBindings'] ?? null)
+                    !== ($current['containerBindings'] ?? null),
+                'laravelExecutionRegistryChanged' => ($recordedScan['laravelExecutionRegistry'] ?? null)
+                    !== ($current['laravelExecutionRegistry'] ?? null),
                 'versionChanged' => ($recordedScan['appgraphVersion'] ?? null) !== $current['appgraphVersion']
                     || ($recordedScan['laravelVersion'] ?? null) !== ($current['laravelVersion'] ?? null),
                 'samplePaths' => array_slice([...$changed, ...$added, ...$removed], 0, 20),

@@ -11,10 +11,12 @@ use AppGraph\AppGraph;
  */
 class ScanFingerprint
 {
-    public const VERSION = 1;
+    public const VERSION = 2;
 
-    public function __construct(private FileFinder $files)
-    {
+    public function __construct(
+        private FileFinder $files,
+        private ?ContainerBindingRegistry $containerBindings = null,
+    ) {
     }
 
     /**
@@ -25,11 +27,14 @@ class ScanFingerprint
      *     fileCount: int,
      *     files: array<string, string>,
      *     configuration: string,
+     *     containerBindings?: string,
+     *     laravelExecutionRegistry?: string,
      *     appgraphVersion: string,
-     *     laravelVersion?: string
+     *     laravelVersion?: string,
+     *     applicationEnvironment?: string
      * }
      */
-    public function capture(): array
+    public function capture(bool $refreshRuntimeEvidence = true): array
     {
         $files = [];
 
@@ -44,12 +49,18 @@ class ScanFingerprint
         ksort($files);
 
         $configuration = $this->configurationHash();
+        $containerBindings = $this->containerBindings?->fingerprint($refreshRuntimeEvidence);
+        $laravelExecutionRegistry = $this->containerBindings?->executionRegistryFingerprint();
         $frameworkVersion = $this->frameworkVersion();
+        $applicationEnvironment = $this->applicationEnvironment();
         $identity = array_filter([
             'manifestVersion' => self::VERSION,
             'appgraphVersion' => AppGraph::VERSION,
             'laravelVersion' => $frameworkVersion,
+            'applicationEnvironment' => $applicationEnvironment,
             'configuration' => $configuration,
+            'containerBindings' => $containerBindings,
+            'laravelExecutionRegistry' => $laravelExecutionRegistry,
             'files' => $files,
         ], static fn (mixed $value): bool => $value !== null);
 
@@ -60,8 +71,11 @@ class ScanFingerprint
             'fileCount' => count($files),
             'files' => $files,
             'configuration' => $configuration,
+            'containerBindings' => $containerBindings,
+            'laravelExecutionRegistry' => $laravelExecutionRegistry,
             'appgraphVersion' => AppGraph::VERSION,
             'laravelVersion' => $frameworkVersion,
+            'applicationEnvironment' => $applicationEnvironment,
         ], static fn (mixed $value): bool => $value !== null);
     }
 
@@ -139,6 +153,19 @@ class ScanFingerprint
     {
         try {
             return function_exists('app') && app()->bound('app') ? app()->version() : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function applicationEnvironment(): ?string
+    {
+        if ($this->containerBindings !== null) {
+            return $this->containerBindings->environment();
+        }
+
+        try {
+            return function_exists('app') && app()->bound('app') ? (string) app()->environment() : null;
         } catch (\Throwable) {
             return null;
         }

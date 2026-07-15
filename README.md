@@ -8,9 +8,10 @@ Deterministic scanning covers:
 - Eloquent models, inferred model-to-table relationships, and model-to-model relationships
 - Database tables, columns, indexes, and foreign keys (schema-dump or live connection)
 - Method-level `calls` edges and `reads`/`writes` data-flow edges with confidence scores
-- Constructor-injected property calls, declared return types, container helpers, fluent Eloquent/collection chains, and explicit resolution diagnostics
-- FormRequest and inline request/controller/validator validation rules
-- Events, jobs, ordered `Bus::chain()` jobs, listeners, and observers (`dispatches`, `listens_to`, `observes` edges)
+- Constructor-injected property calls, declared return types, booted service-container bindings, container helpers, fluent Eloquent/collection chains, and explicit resolution diagnostics
+- Resolved route middleware pipelines, plus statically recoverable controller middleware, bridged to executable `handle()`/`__invoke()` methods
+- FormRequest lifecycle hooks and inline request/controller/validator validation rules
+- Events, jobs, ordered `Bus::chain()` jobs, listeners, and observers, reconciled with Laravel's already-booted Event and Bus registries and bridged to the methods Laravel executes
 - Cache, filesystem, and Laravel HTTP client side effects
 - Policy authorization calls, frontend named/literal route consumers, and tests that exercise routes
 
@@ -63,7 +64,7 @@ storage/appgraph/appgraph.json
 Graph and overview files are replaced atomically, so concurrent readers never
 observe a partially written JSON document. Each graph also records a content-based
 scan manifest covering PHP, test, frontend, schema, Composer, configuration, and
-framework-analysis inputs. Freshness checks compare this fingerprint rather than
+the relevant booted framework, environment, container-binding, and Event/Bus registry inputs. Freshness checks compare this fingerprint rather than
 depending only on filesystem modification times; older graphs without a manifest
 continue to use the legacy timestamp check.
 
@@ -83,7 +84,7 @@ php artisan vendor:publish --tag=appgraph-config
 
 Individual scanners are gated by `appgraph.scan.*` config keys (`routes`, `database`,
 `models`, `form_requests`, `calls`, `data_flow`, `events`, `side_effects`, `policies`,
-`frontend`, `tests`). If a scanner cannot run,
+`frontend`, `tests`, `container_bindings`). If a scanner cannot run,
 the scan completes with a warning and records it in graph metadata so the remaining map
 is still useful.
 
@@ -207,11 +208,14 @@ The exporter writes:
 - `nodes`: route, method, class, model, table, column, index, foreign key, form_request, event, job, policy, frontend, test, cache, filesystem, and external-service nodes
 - `edges`:
   - `routes_to`, `defined_in`, `validates_with`, `uses_model` — HTTP and controller structure
+  - `passes_through` — a route's resolved middleware occurrences, in pipeline order, bridged to executable methods
+  - `framework_invokes` — FormRequest lifecycle methods Laravel invokes around authorization and validation
+  - `resolves_to` — relevant default and contextual bindings observed from the already-booted service container
   - `uses_table`, `has_column`, `has_index`, `has_foreign_key` — model/schema structure
   - `belongs_to`, `has_many`, `has_one`, `belongs_to_many` — model relationships
   - `calls` — method-to-method call graph, including typed/promoted constructor properties and `app()`/`resolve()` targets
   - `reads`, `writes` — method-to-table data flow, with per-call-site operations and literal field/nested-key writes
-  - `dispatches`, `listens_to`, `observes` — event/job/observer flow
+  - `dispatches`, `listens_to`, `handled_by`, `observes` — event/job/observer flow and executable listener/job handlers
   - `reads_cache`, `writes_cache`, `reads_filesystem`, `writes_filesystem`, `calls_external` — non-database side effects
   - `authorizes_via` — controller/service authorization calls to resolved policy methods
   - `consumes_route`, `tests_route` — frontend and test consumers of HTTP routes
@@ -235,6 +239,23 @@ untyped collection callbacks. Writes through abstract model parameters fan out t
 lower confidence instead of inventing a table for the abstract class. Job nodes and
 dispatch edges include statically declared queue/connection and after-commit behavior when
 available; ordered bus chains include `chained` and `chainPosition` metadata.
+
+Laravel execution bridges are intentionally evidence-bounded. Container factories and
+extenders are never executed during a scan: exact class-string registrations, existing
+instances, aliases, and non-null declared factory return types are recorded, while unknown
+targets become diagnostics instead of guesses. Binding facts describe the environment in which the
+application was scanned and may differ under another environment or tenant. When Laravel has
+already cached a route's computed middleware, AppGraph reuses that exact list. Otherwise it
+reads the already-instantiated router's alias and group registries, expands declarations
+without resolving services or autoloading application middleware, and uses only exact names
+or already-loaded ancestry for priority and exclusion rules. Unavailable ancestry remains in
+declaration order with a diagnostic. AppGraph also statically recovers literal `HasMiddleware`
+declarations and attributes from already-loaded controller source without constructing controllers.
+Dynamic and legacy controller-instance declarations are omitted with diagnostics. Global
+HTTP-kernel middleware is not currently represented. Source-declared event listeners and job-handler
+maps are reconciled with exact already-instantiated Laravel Event and Bus dispatchers. Active
+runtime registrations authorize causal traversal; inactive declarations remain visible as
+evidence, and unavailable or custom dispatcher state is reported instead of treated as proof.
 
 The output is optimized for token efficiency: null and empty fields are omitted from nodes and edges, so a missing key means "not applicable" rather than an error.
 

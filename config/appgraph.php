@@ -50,6 +50,7 @@ return [
         'frontend' => true,
         'tests' => true,
         'policies' => true,
+        'container_bindings' => true,
     ],
 
     'query' => [

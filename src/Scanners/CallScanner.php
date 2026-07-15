@@ -5,6 +5,7 @@ namespace AppGraph\Scanners;
 use AppGraph\Graph\Edge;
 use AppGraph\Graph\Graph;
 use AppGraph\Scanners\Concerns\InteractsWithPhpAst;
+use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\FileFinder;
 use Illuminate\Support\Str;
 use PhpParser\Node;
@@ -210,6 +211,17 @@ class CallScanner
      */
     private array $boundaryCalls = [];
 
+    /** @var array<string, array{reason: string, constructs: bool, consumer?: string}> */
+    private array $containerManagedClasses = [];
+
+    /**
+     * Methods whose arguments Laravel resolves through the container rather
+     * than receiving exclusively from application callers.
+     *
+     * @var array<string, array{reason: string, confidence: float, runtimeClass?: string, routeParameters?: array<int, string>}>
+     */
+    private array $containerInvokedMethods = [];
+
     /**
      * @var array<int, string>
      */
@@ -239,8 +251,10 @@ class CallScanner
         'restored',
     ];
 
-    public function __construct(private FileFinder $files)
-    {
+    public function __construct(
+        private FileFinder $files,
+        private ?ContainerBindingRegistry $containerBindings = null,
+    ) {
         $this->parser = (new ParserFactory())->createForNewestSupportedVersion();
     }
 
@@ -251,6 +265,8 @@ class CallScanner
         $this->relationshipReturnModels = [];
         $this->unresolvedCalls = [];
         $this->boundaryCalls = [];
+        $this->containerManagedClasses = $this->containerManagedClassesFromGraph($graph);
+        $this->containerInvokedMethods = $this->containerInvokedMethodsFromGraph($graph);
 
         $files = $this->files->findPhpFiles(['app', 'routes']);
 
@@ -264,6 +280,8 @@ class CallScanner
             $this->indexStatements($statements, $file, $this->files->relativePath($file) ?? $file);
             unset($statements);
         }
+
+        $this->resolveManagedConstructorProperties();
 
         foreach ($this->methods as $class => $methods) {
             foreach ($methods as $method => $record) {
@@ -385,11 +403,25 @@ class CallScanner
             }
 
             foreach ($statement->getMethods() as $method) {
+                $methodId = $class.'::'.$method->name->toString();
+                $localTypes = $this->parameterTypesWithContextualAttributes($method, $class);
+
+                if (isset($this->containerInvokedMethods[$methodId])) {
+                    $localTypes = $this->resolveContainerInvokedMethodTypes(
+                        $localTypes,
+                        $this->containerInvokedMethods[$methodId],
+                        $method,
+                    );
+                }
+
                 $context = [
                     'class' => $class,
                     'method' => $method->name->toString(),
                     'file' => $this->methods[$class][$method->name->toString()]['file'] ?? null,
-                    'localTypes' => $this->parameterTypes($method, $class),
+                    // Ordinary method parameters are caller supplied. Exact
+                    // container substitution is reserved for Laravel invocation
+                    // boundaries discovered from the graph above.
+                    'localTypes' => $localTypes,
                 ];
 
                 $this->scanMethodStatements($graph, $method->stmts ?? [], $context);
@@ -568,10 +600,27 @@ class CallScanner
             $call->name->toString(),
             $receiver['confidence'],
             $call->getStartLine(),
-            [
+            array_filter([
                 'inference' => $receiver['inference'],
                 'syntax' => 'method_call',
-            ]
+                'requestedAbstract' => $receiver['requestedAbstract'] ?? null,
+                'bindingScope' => $receiver['bindingScope'] ?? null,
+                'bindingConsumer' => $receiver['bindingConsumer'] ?? null,
+                'bindingInference' => $receiver['bindingInference'] ?? null,
+                'bindingEnvironment' => $receiver['bindingEnvironment'] ?? null,
+                'bindingResolutionPath' => $receiver['bindingResolutionPath'] ?? null,
+                'bindingEffectiveLifetime' => $receiver['bindingEffectiveLifetime'] ?? null,
+                'bindingTerminalInference' => $receiver['bindingTerminalInference'] ?? null,
+                'injectionInference' => $receiver['injectionInference'] ?? null,
+                'containerManagedBy' => $receiver['containerManagedBy'] ?? null,
+                'contextualAttribute' => $receiver['contextualAttribute'] ?? null,
+                'contextualTarget' => $receiver['contextualTarget'] ?? null,
+                'ignoredContextualAttribute' => $receiver['ignoredContextualAttribute'] ?? null,
+                'routeParameter' => $receiver['routeParameter'] ?? null,
+                'jobInvocationBoundary' => $receiver['jobInvocationBoundary'] ?? null,
+                'declaredParameterType' => $receiver['declaredParameterType'] ?? null,
+                'containerInvocationBoundary' => $receiver['containerInvocationBoundary'] ?? null,
+            ], static fn (mixed $value): bool => $value !== null)
         );
     }
 
@@ -773,7 +822,9 @@ class CallScanner
             }
 
             if (is_string($expression->name) && isset($context['localTypes'][$expression->name])) {
-                return $context['localTypes'][$expression->name];
+                $type = $context['localTypes'][$expression->name];
+
+                return ($type['containerTargetUnknown'] ?? false) ? null : $type;
             }
 
             return null;
@@ -802,13 +853,35 @@ class CallScanner
             $classExpression = $firstArg instanceof Arg ? $firstArg->value : null;
 
             if (in_array($helper, ['app', 'resolve'], true)
-                && ($class = $this->classFromContainerArgument($classExpression)) !== null) {
+                && ($abstract = $this->classFromContainerArgument($classExpression)) !== null) {
+                $binding = $this->containerBindings?->resolve($abstract);
 
-                return [
-                    'class' => $class,
-                    'confidence' => 0.9,
-                    'inference' => 'container_helper',
-                ];
+                if ($binding !== null) {
+                    return [
+                        'class' => $binding['concrete'],
+                        'confidence' => round((float) $binding['confidence'] * 0.95, 2),
+                        'inference' => 'container_binding',
+                        'requestedAbstract' => $abstract,
+                        'bindingScope' => $binding['scope'],
+                        'bindingInference' => $binding['inference'],
+                        'bindingEnvironment' => $binding['environment'],
+                        'bindingResolutionPath' => $binding['resolutionPath'] ?? null,
+                        'bindingEffectiveLifetime' => $binding['effectiveLifetime'] ?? $binding['lifetime'],
+                        'bindingTerminalInference' => $binding['terminalInference'] ?? $binding['inference'],
+                    ];
+                }
+
+                if ($this->containerBindings?->hasDefaultDeclaration($abstract)) {
+                    return null;
+                }
+
+                if (str_contains($abstract, '\\') || isset($this->classes[$abstract])) {
+                    return [
+                        'class' => $abstract,
+                        'confidence' => 0.9,
+                        'inference' => 'container_helper',
+                    ];
+                }
             }
 
             if ($helper === 'collect') {
@@ -1128,6 +1201,24 @@ class CallScanner
         ], true) || $this->classLooksLikeModel($parent, $visited);
     }
 
+    private function classLooksLikeFormRequest(string $class, array $visited = []): bool
+    {
+        if (isset($visited[$class])) {
+            return false;
+        }
+
+        if ($class === 'Illuminate\\Foundation\\Http\\FormRequest') {
+            return true;
+        }
+
+        $visited[$class] = true;
+        $parent = $this->classes[$class]['extends'] ?? null;
+
+        return is_string($parent)
+            && $parent !== ''
+            && $this->classLooksLikeFormRequest($parent, $visited);
+    }
+
     private function classLooksLikeJob(string $class): bool
     {
         $record = $this->classes[$class] ?? null;
@@ -1148,6 +1239,105 @@ class CallScanner
         }
 
         return in_array('Illuminate\\Foundation\\Bus\\Dispatchable', $record['traits'] ?? [], true);
+    }
+
+    /**
+     * Preserve Laravel contextual-attribute semantics without instantiating an
+     * attribute. Give(class-string) is the one contextual attribute whose
+     * receiver class can be proven from source; all other contextual handlers
+     * deliberately suppress receiver inference at container boundaries.
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    private function parameterTypesWithContextualAttributes(Stmt\ClassMethod $method, string $currentClass): array
+    {
+        $types = $this->parameterTypes($method, $currentClass);
+
+        foreach ($method->params as $param) {
+            if (! $param->var instanceof Expr\Variable
+                || ! is_string($param->var->name)
+                || ! isset($types[$param->var->name])) {
+                continue;
+            }
+
+            foreach ($param->attrGroups as $group) {
+                foreach ($group->attrs as $attribute) {
+                    $attributeClass = $this->resolvedName($attribute->name);
+
+                    if ($attributeClass === null || ! $this->isContextualAttribute($attributeClass)) {
+                        continue;
+                    }
+
+                    $types[$param->var->name]['contextualAttribute'] = $attributeClass;
+
+                    if ($attributeClass === 'Illuminate\\Container\\Attributes\\Give') {
+                        $argument = null;
+
+                        foreach ($attribute->args as $position => $arg) {
+                            if (($arg->name?->toString() ?? null) === 'class' || ($position === 0 && $arg->name === null)) {
+                                $argument = $arg->value;
+                                break;
+                            }
+                        }
+
+                        $target = $this->classFromContainerArgument($argument);
+
+                        if ($target !== null) {
+                            $types[$param->var->name]['contextualTarget'] = $target;
+                            $types[$param->var->name]['contextualResolution'] = 'give';
+                        } else {
+                            $types[$param->var->name]['containerTargetUnknown'] = true;
+                            $types[$param->var->name]['contextualResolution'] = 'dynamic_give_target';
+                        }
+                    } else {
+                        $types[$param->var->name]['containerTargetUnknown'] = true;
+                        $types[$param->var->name]['contextualResolution'] = 'handler_result_unknown';
+                    }
+
+                    // Laravel uses the first ContextualAttribute on a parameter.
+                    continue 3;
+                }
+            }
+        }
+
+        return $types;
+    }
+
+    private function isContextualAttribute(string $class, array $visited = []): bool
+    {
+        if ($class === 'Illuminate\\Contracts\\Container\\ContextualAttribute'
+            || str_starts_with($class, 'Illuminate\\Container\\Attributes\\')) {
+            return true;
+        }
+
+        if (isset($visited[$class])) {
+            return false;
+        }
+
+        $visited[$class] = true;
+        $record = $this->classes[$class] ?? null;
+
+        if (is_array($record)) {
+            foreach ($record['implements'] ?? [] as $interface) {
+                if ($interface === 'Illuminate\\Contracts\\Container\\ContextualAttribute'
+                    || $this->isContextualAttribute($interface, $visited)) {
+                    return true;
+                }
+            }
+
+            $parent = $record['extends'] ?? null;
+
+            if (is_string($parent) && $parent !== '' && $this->isContextualAttribute($parent, $visited)) {
+                return true;
+            }
+        }
+
+        try {
+            return (class_exists($class, false) || interface_exists($class, false))
+                && is_a($class, 'Illuminate\\Contracts\\Container\\ContextualAttribute', true);
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
     /**
@@ -1180,7 +1370,7 @@ class CallScanner
                 continue;
             }
 
-            $parameters = $this->parameterTypes($member, $class);
+            $parameters = $this->parameterTypesWithContextualAttributes($member, $class);
 
             foreach ($member->params as $param) {
                 if (! $param->isPromoted()
@@ -1254,7 +1444,7 @@ class CallScanner
         $type = $this->classes[$class]['propertyTypes'][$property] ?? null;
 
         if (is_array($type)) {
-            return $type;
+            return ($type['containerTargetUnknown'] ?? false) ? null : $type;
         }
 
         foreach ($this->classes[$class]['traits'] ?? [] as $trait) {
@@ -1276,11 +1466,502 @@ class CallScanner
             return $this->resolvedName($expression->class);
         }
 
-        if ($expression instanceof Scalar\String_ && str_contains($expression->value, '\\')) {
+        if ($expression instanceof Scalar\String_ && trim($expression->value) !== '') {
             return ltrim($expression->value, '\\');
         }
 
         return null;
+    }
+
+    /**
+     * Resolve typed injection points through the booted Laravel container while
+     * retaining the requested abstraction as edge evidence.
+     *
+     * @param array<string, array<string, mixed>> $types
+     * @return array<string, array<string, mixed>>
+     */
+    private function resolveContainerTypes(array $types, ?string $consumer): array
+    {
+        if ($this->containerBindings === null) {
+            return $types;
+        }
+
+        foreach ($types as &$type) {
+            if (($type['containerTargetUnknown'] ?? false) === true
+                || ($type['skipContainerResolution'] ?? false) === true) {
+                continue;
+            }
+
+            $declaredType = $type['class'] ?? null;
+            $abstract = $type['contextualTarget'] ?? $declaredType;
+
+            if (! is_string($abstract)) {
+                continue;
+            }
+
+            $binding = $this->containerBindings->resolve($abstract, $consumer);
+
+            if ($binding === null) {
+                if ($this->containerBindings->hasDeclaration($abstract, $consumer)) {
+                    $type['containerTargetUnknown'] = true;
+                    $type['containerResolution'] = 'declared_binding_target_unknown';
+                    $type['requestedAbstract'] = $abstract;
+                } elseif (isset($type['contextualTarget'])) {
+                    $type = [
+                        ...$type,
+                        'class' => $abstract,
+                        'confidence' => round((float) ($type['confidence'] ?? 0.9) * 0.95, 2),
+                        'inference' => 'contextual_give',
+                        'requestedAbstract' => $abstract,
+                        'declaredParameterType' => $declaredType,
+                    ];
+                }
+
+                continue;
+            }
+
+            $type = [
+                ...$type,
+                'class' => $binding['concrete'],
+                'confidence' => round((float) ($type['confidence'] ?? 0.9) * (float) $binding['confidence'] * 0.95, 2),
+                'inference' => 'container_binding',
+                'requestedAbstract' => $abstract,
+                'bindingScope' => $binding['scope'],
+                'bindingConsumer' => $binding['consumer'] ?? null,
+                'bindingInference' => $binding['inference'],
+                'bindingEnvironment' => $binding['environment'],
+                'bindingResolutionPath' => $binding['resolutionPath'] ?? null,
+                'bindingEffectiveLifetime' => $binding['effectiveLifetime'] ?? $binding['lifetime'],
+                'bindingTerminalInference' => $binding['terminalInference'] ?? $binding['inference'],
+                'declaredParameterType' => isset($type['contextualTarget']) ? $declaredType : ($type['declaredParameterType'] ?? null),
+            ];
+        }
+        unset($type);
+
+        return $types;
+    }
+
+    /**
+     * @param array<string, array<string, mixed>> $types
+     * @param array{reason: string, confidence: float, runtimeClass?: string, payloadClass?: string, routeParameters?: array<int, string>} $boundary
+     * @return array<string, array<string, mixed>>
+     */
+    private function resolveContainerInvokedMethodTypes(array $types, array $boundary, Stmt\ClassMethod $method): array
+    {
+        if ($boundary['reason'] === 'mapped_job_handler_direct') {
+            $first = $method->params[0] ?? null;
+            $name = $first?->var instanceof Expr\Variable && is_string($first->var->name)
+                ? $first->var->name
+                : null;
+            $payload = $boundary['payloadClass'] ?? null;
+
+            if (is_string($name) && is_string($payload) && $payload !== '') {
+                $declared = $types[$name]['class'] ?? $this->resolveType($first?->type, $boundary['runtimeClass'] ?? '');
+                $ignoredAttribute = $types[$name]['contextualAttribute'] ?? null;
+                $types[$name] = array_filter([
+                    'class' => $payload,
+                    'confidence' => (float) $boundary['confidence'],
+                    'inference' => 'mapped_job_payload_parameter',
+                    'declaredParameterType' => is_string($declared) && $declared !== $payload ? $declared : null,
+                    'ignoredContextualAttribute' => $ignoredAttribute,
+                    'jobInvocationBoundary' => 'mapped_job_handler_direct',
+                ], static fn (mixed $value): bool => $value !== null);
+            }
+
+            // Dispatcher::dispatchNow calls the mapped handler directly with
+            // exactly the command. It never asks BoundMethod to inject later
+            // method arguments or resolve their contextual attributes.
+            foreach ($types as $parameterName => &$type) {
+                if ($parameterName === $name) {
+                    continue;
+                }
+
+                if (isset($type['contextualAttribute'])) {
+                    $type['ignoredContextualAttribute'] = $type['contextualAttribute'];
+                }
+                unset(
+                    $type['contextualAttribute'],
+                    $type['contextualTarget'],
+                    $type['contextualResolution'],
+                    $type['containerTargetUnknown'],
+                );
+            }
+            unset($type);
+
+            return $types;
+        }
+
+        foreach ($types as $name => &$type) {
+            $type['confidence'] = round(
+                (float) ($type['confidence'] ?? 0.9) * (float) $boundary['confidence'],
+                2,
+            );
+            $type['containerInvocationBoundary'] = $boundary['reason'];
+
+            // BoundMethod consumes an explicitly supplied named argument before
+            // consulting a contextual attribute. A route placeholder with the
+            // same name therefore vetoes #[Give] and all container substitution.
+            if ($boundary['reason'] === 'route_controller_action'
+                && in_array($name, $boundary['routeParameters'] ?? [], true)) {
+                if (isset($type['contextualAttribute'])) {
+                    $type['ignoredContextualAttribute'] = $type['contextualAttribute'];
+                }
+
+                unset(
+                    $type['contextualAttribute'],
+                    $type['contextualTarget'],
+                    $type['contextualResolution'],
+                    $type['containerTargetUnknown'],
+                );
+                $type['routeParameter'] = $name;
+                $type['inference'] = is_string($type['class'] ?? null)
+                    && $this->classLooksLikeModel($type['class'])
+                        ? 'route_model_parameter'
+                        : 'route_supplied_parameter';
+                $type['skipContainerResolution'] = true;
+
+                continue;
+            }
+
+            // When no same-named value is supplied, Laravel considers the
+            // contextual attribute before ordinary class resolution.
+            if (! isset($type['contextualAttribute'])) {
+                $class = $type['class'] ?? null;
+
+                if (is_string($class) && $this->classLooksLikeFormRequest($class)) {
+                    if ($this->containerBindings === null
+                        || ! $this->containerBindings->hasDefaultDeclaration($class)) {
+                        $type['inference'] = 'form_request_parameter';
+                        $type['skipContainerResolution'] = true;
+                        continue;
+                    }
+
+                    $binding = $this->containerBindings->resolve($class);
+
+                    if ($binding === null
+                        || ! is_string($binding['concrete'] ?? null)
+                        || ! $this->classLooksLikeFormRequest($binding['concrete'])) {
+                        $type['containerTargetUnknown'] = true;
+                        $type['containerResolution'] = $binding === null
+                            ? 'declared_form_request_binding_target_unknown'
+                            : 'form_request_binding_target_not_form_request';
+                        $type['requestedAbstract'] = $class;
+                        continue;
+                    }
+                }
+
+                if (is_string($class)
+                    && $this->classLooksLikeModel($class)
+                    && in_array($name, $boundary['routeParameters'] ?? [], true)) {
+                    $type['inference'] = 'route_model_parameter';
+                    $type['skipContainerResolution'] = true;
+                    continue;
+                }
+            }
+
+            $type['injectionInference'] = 'container_invoked_method_parameter';
+            $type['containerManagedBy'] = $boundary['reason'];
+            $type['inference'] = 'container_injected_parameter';
+        }
+        unset($type);
+
+        return $this->resolveContainerTypes($types, null);
+    }
+
+    /**
+     * @return array<string, array{reason: string, confidence: float, runtimeClass?: string, payloadClass?: string, routeParameters?: array<int, string>}>
+     */
+    private function containerInvokedMethodsFromGraph(Graph $graph): array
+    {
+        $boundaries = [];
+
+        foreach ($graph->edges() as $edge) {
+            if ($edge->type === 'handled_by'
+                && ($edge->metadata['kind'] ?? null) === 'job'
+                && ($edge->metadata['causalExecutionProven'] ?? null) !== false) {
+                $handlerClass = $edge->metadata['handlerClass'] ?? null;
+                $payloadClass = $edge->metadata['payloadClass'] ?? null;
+                $source = $edge->metadata['source'] ?? null;
+                $isMappedHandler = (is_string($source) && $source !== 'laravel_job_convention')
+                    || (is_string($handlerClass)
+                        && is_string($payloadClass)
+                        && $handlerClass !== $payloadClass);
+
+                // Laravel container-calls a self-handled job, which permits
+                // method injection. A mapped handler is container-constructed
+                // but invoked directly with the command as its sole argument.
+                if ($isMappedHandler) {
+                    $existing = $boundaries[$edge->to] ?? null;
+                    $boundaries[$edge->to] = [
+                        'reason' => 'mapped_job_handler_direct',
+                        'confidence' => max((float) ($existing['confidence'] ?? 0.0), $edge->confidence),
+                        'runtimeClass' => is_string($handlerClass)
+                            ? $handlerClass
+                            : (strstr($edge->to, '::', true) ?: $edge->to),
+                        'payloadClass' => is_string($payloadClass) ? $payloadClass : $edge->from,
+                    ];
+
+                    continue;
+                }
+
+                $existing = $boundaries[$edge->to] ?? null;
+                $boundaries[$edge->to] = [
+                    'reason' => 'laravel_job_handler',
+                    'confidence' => max((float) ($existing['confidence'] ?? 0.0), $edge->confidence),
+                    'runtimeClass' => $edge->metadata['handlerClass']
+                        ?? (strstr($edge->to, '::', true) ?: $edge->to),
+                ];
+
+                continue;
+            }
+
+            if ($edge->type === 'framework_invokes'
+                && in_array($edge->metadata['hook'] ?? null, ['authorize', 'rules', 'validator', 'after'], true)
+                && ($edge->metadata['causalExecutionProven'] ?? null) !== false) {
+                $existing = $boundaries[$edge->to] ?? null;
+                $boundaries[$edge->to] = [
+                    'reason' => 'form_request_container_callback',
+                    'confidence' => max((float) ($existing['confidence'] ?? 0.0), $edge->confidence),
+                    'runtimeClass' => $edge->metadata['runtimeRequest']
+                        ?? (strstr($edge->to, '::', true) ?: $edge->to),
+                ];
+
+                continue;
+            }
+
+            if ($edge->type !== 'routes_to') {
+                continue;
+            }
+
+            $route = $graph->node($edge->from);
+            $uri = $route?->metadata['uri'] ?? null;
+            $routeParameters = [];
+
+            if (is_string($uri) && preg_match_all('/\{([^}:?]+)(?:[^}]*)\}/', $uri, $matches) > 0) {
+                $routeParameters = array_values(array_unique($matches[1]));
+                sort($routeParameters);
+            }
+
+            $existing = $boundaries[$edge->to] ?? null;
+            $parameters = array_values(array_unique([
+                ...($existing['routeParameters'] ?? []),
+                ...$routeParameters,
+            ]));
+            sort($parameters);
+
+            $boundaries[$edge->to] = [
+                'reason' => 'route_controller_action',
+                'confidence' => max((float) ($existing['confidence'] ?? 0.0), $edge->confidence),
+                'runtimeClass' => $edge->metadata['runtimeController']
+                    ?? (strstr($edge->to, '::', true) ?: $edge->to),
+                'routeParameters' => $parameters,
+            ];
+        }
+
+        return $boundaries;
+    }
+
+    /** @return array<string, array{reason: string, constructs: bool, consumer?: string}> */
+    private function containerManagedClassesFromGraph(Graph $graph): array
+    {
+        $managed = [];
+
+        foreach ($graph->edges() as $edge) {
+            if ($edge->type === 'routes_to') {
+                $class = $edge->metadata['runtimeController']
+                    ?? (strstr($edge->to, '::', true) ?: $edge->to);
+                $binding = $edge->metadata['container_binding'] ?? null;
+                $constructs = is_array($binding)
+                    ? in_array($binding['terminalInference'] ?? $binding['inference'] ?? null, [
+                        'class_string_binding',
+                        'laravel_class_string_wrapper',
+                    ], true)
+                    : $this->containerConstructsClass($class);
+                $managed[$class] = [
+                    'reason' => 'route_controller',
+                    'constructs' => $constructs,
+                ];
+
+                $declaringClass = strstr($edge->to, '::', true) ?: $edge->to;
+
+                if ($declaringClass !== $class) {
+                    $managed[$declaringClass] = [
+                        'reason' => 'route_controller_inherited_body',
+                        'constructs' => $constructs,
+                        'consumer' => $class,
+                    ];
+                }
+                continue;
+            }
+
+            if ($edge->type === 'validates_with') {
+                $managed[$edge->to] = [
+                    'reason' => 'route_form_request',
+                    'constructs' => $this->containerConstructsClass($edge->to),
+                ];
+                continue;
+            }
+
+            if ($edge->type === 'framework_invokes') {
+                $managed[$edge->from] = [
+                    'reason' => 'form_request_lifecycle',
+                    'constructs' => $this->containerConstructsClass($edge->from),
+                ];
+                continue;
+            }
+
+            if ($edge->type === 'passes_through') {
+                foreach ($edge->metadata['occurrences'] ?? [] as $occurrence) {
+                    $class = is_array($occurrence) ? ($occurrence['resolved_class'] ?? null) : null;
+
+                    if (is_string($class) && $class !== '') {
+                        $binding = $occurrence['container_binding'] ?? null;
+                        $managed[$class] = [
+                            'reason' => 'route_middleware',
+                            'constructs' => is_array($binding)
+                                ? in_array($binding['terminalInference'] ?? $binding['inference'] ?? null, [
+                                    'class_string_binding',
+                                    'laravel_class_string_wrapper',
+                                ], true)
+                                : $this->containerConstructsClass($class),
+                        ];
+                    }
+                }
+                continue;
+            }
+
+            if ($edge->type === 'handled_by' && ($edge->metadata['kind'] ?? null) === 'listener') {
+                $class = $edge->metadata['handlerClass'] ?? null;
+
+                if (is_string($class) && $class !== '') {
+                    $managed[$class] = [
+                        'reason' => 'event_listener',
+                        'constructs' => $this->containerConstructsClass($class),
+                    ];
+                }
+
+                continue;
+            }
+
+            if ($edge->type === 'handled_by'
+                && ($edge->metadata['kind'] ?? null) === 'job'
+                && ($edge->metadata['causalExecutionProven'] ?? null) !== false) {
+                $class = $edge->metadata['handlerClass'] ?? null;
+                $payload = $edge->metadata['payloadClass'] ?? null;
+
+                // Self-handled jobs are instantiated by application code or
+                // deserialization, not by the container. An explicitly mapped
+                // handler is container-resolved and may receive constructor DI.
+                if (is_string($class) && $class !== '' && $class !== $payload) {
+                    $managed[$class] = [
+                        'reason' => 'mapped_job_handler',
+                        'constructs' => $this->containerConstructsClass($class),
+                    ];
+                }
+            }
+        }
+
+        return $managed;
+    }
+
+    private function containerConstructsClass(string $class): bool
+    {
+        if ($this->containerBindings === null) {
+            return false;
+        }
+
+        if (! $this->containerBindings->hasDefaultDeclaration($class)) {
+            return true;
+        }
+
+        $binding = $this->containerBindings->resolve($class);
+
+        return $binding !== null
+            && ($binding['concrete'] ?? null) === $class
+            && in_array($binding['terminalInference'] ?? $binding['inference'] ?? null, [
+                'class_string_binding',
+                'laravel_class_string_wrapper',
+            ], true);
+    }
+
+    /**
+     * Resolve constructor-carried properties only for classes already proven to
+     * be instantiated by Laravel. Exact injected concrete classes are then
+     * transitively managed because Laravel must construct those dependencies too.
+     */
+    private function resolveManagedConstructorProperties(): void
+    {
+        if ($this->containerBindings === null) {
+            return;
+        }
+
+        $pending = array_keys($this->containerManagedClasses);
+        $processed = [];
+
+        while (($class = array_shift($pending)) !== null) {
+            if (isset($processed[$class], $this->classes[$class])) {
+                continue;
+            }
+
+            if (! isset($this->classes[$class])) {
+                continue;
+            }
+
+            $processed[$class] = true;
+
+            if (! ($this->containerManagedClasses[$class]['constructs'] ?? false)) {
+                continue;
+            }
+
+            foreach ($this->classes[$class]['propertyTypes'] as $property => $type) {
+                $injection = $type['injectionInference'] ?? $type['inference'] ?? null;
+
+                if (! in_array($injection, ['constructor_promoted_property', 'constructor_property_assignment'], true)) {
+                    continue;
+                }
+
+                $abstract = $type['requestedAbstract'] ?? $type['class'] ?? null;
+
+                if (! is_string($abstract)) {
+                    continue;
+                }
+
+                $consumer = $this->containerManagedClasses[$class]['consumer'] ?? $class;
+                $resolved = $this->resolveContainerTypes([$property => $type], $consumer)[$property];
+
+                if (isset($resolved['bindingInference'])
+                    || isset($resolved['contextualTarget'])
+                    || ($resolved['containerTargetUnknown'] ?? false)) {
+                    $resolved['injectionInference'] = $injection;
+                    $resolved['containerManagedBy'] = $this->containerManagedClasses[$class]['reason'];
+                    $this->classes[$class]['propertyTypes'][$property] = $resolved;
+                }
+
+                $dependency = $resolved['class'] ?? $abstract;
+                $bindingConstructsDependency = ($resolved['containerTargetUnknown'] ?? false)
+                    ? false
+                    : (($resolved['inference'] ?? null) === 'contextual_give'
+                        ? $this->containerConstructsClass((string) $dependency)
+                        : (isset($resolved['requestedAbstract'])
+                            ? in_array($resolved['bindingTerminalInference'] ?? null, [
+                        'class_string_binding',
+                        'laravel_class_string_wrapper',
+                            ], true)
+                            : $this->containerConstructsClass($abstract)));
+
+                if (is_string($dependency)
+                    && $bindingConstructsDependency
+                    && isset($this->classes[$dependency])
+                    && ($this->classes[$dependency]['type'] ?? null) === 'class'
+                    && ! isset($this->containerManagedClasses[$dependency])) {
+                    $this->containerManagedClasses[$dependency] = [
+                        'reason' => 'constructor_dependency:'.$class,
+                        'constructs' => true,
+                    ];
+                    $pending[] = $dependency;
+                }
+            }
+        }
     }
 
     private function frameworkBoundaryClass(string $class, array $visited = []): ?string

@@ -114,7 +114,7 @@ class McpToolsTest extends TestCase
         $this->assertFileDoesNotExist($path);
 
         // Keep the auto-scan fast and deterministic: scanners off, just meta.
-        foreach (['routes', 'database', 'models', 'calls', 'data_flow', 'form_requests', 'events', 'side_effects', 'frontend', 'tests', 'policies'] as $scanner) {
+        foreach (['routes', 'database', 'models', 'calls', 'data_flow', 'form_requests', 'events', 'side_effects', 'frontend', 'tests', 'policies', 'container_bindings'] as $scanner) {
             config()->set("appgraph.scan.{$scanner}", false);
         }
 
@@ -125,7 +125,7 @@ class McpToolsTest extends TestCase
 
     public function test_refresh_tool_rebuilds_the_graph_explicitly(): void
     {
-        foreach (['routes', 'database', 'models', 'calls', 'data_flow', 'form_requests', 'events', 'side_effects', 'frontend', 'tests', 'policies'] as $scanner) {
+        foreach (['routes', 'database', 'models', 'calls', 'data_flow', 'form_requests', 'events', 'side_effects', 'frontend', 'tests', 'policies', 'container_bindings'] as $scanner) {
             config()->set("appgraph.scan.{$scanner}", false);
         }
 

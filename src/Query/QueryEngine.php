@@ -6,6 +6,15 @@ use AppGraph\Graph\OverviewBuilder;
 
 class QueryEngine
 {
+    /** @var array<int, string> */
+    private const FLOW_EXECUTION_EDGES = [
+        'calls',
+        'validates_with',
+        'framework_invokes',
+        'dispatches',
+        'handled_by',
+    ];
+
     public function __construct(
         private GraphIndex $index,
         private ?StalenessChecker $staleness = null,
@@ -152,6 +161,7 @@ class QueryEngine
         $resolvedNode = $this->index->node($resolvedId);
         $route = null;
         $entrypointId = $resolvedId;
+        $entrypointConfidence = 1.0;
 
         if (($resolvedNode['type'] ?? null) === 'route') {
             $routeEdge = $this->index->edgesFrom($resolvedId, ['routes_to'])[0] ?? null;
@@ -161,6 +171,7 @@ class QueryEngine
             }
 
             $entrypointId = $routeEdge['to'];
+            $entrypointConfidence = round((float) ($routeEdge['confidence'] ?? 1.0), 4);
             $route = array_filter([
                 'id' => $resolvedId,
                 'label' => $resolvedNode['label'] ?? null,
@@ -169,6 +180,7 @@ class QueryEngine
                 'methods' => $resolvedNode['metadata']['methods'] ?? null,
                 'middleware' => $resolvedNode['metadata']['middleware'] ?? null,
                 'action' => $entrypointId,
+                'actionConfidence' => $entrypointConfidence,
             ], static fn ($value): bool => $value !== null);
         } elseif (($resolvedNode['type'] ?? null) !== 'method') {
             throw new UnresolvedTargetException($target, [$resolvedId]);
@@ -181,20 +193,67 @@ class QueryEngine
         }
 
         $truncated = false;
-        $methodHits = [[
+        $methodSeeds = [[
             'id' => $entrypointId,
-            'depth' => 0,
-            'confidence' => 1.0,
+            'confidence' => $entrypointConfidence,
+            'path' => [$entrypointId],
         ]];
-        $methodHits = array_merge($methodHits, $this->index->traverse(
-            $entrypointId,
-            ['calls'],
-            'out',
-            $depth,
-            $minConfidence,
-            $limit,
-            $truncated,
-        ));
+
+        if ($route !== null) {
+            foreach ($this->index->edgesFrom($resolvedId, ['passes_through']) as $middlewareEdge) {
+                $middleware = $this->index->node($middlewareEdge['to']);
+                $middlewareConfidence = round((float) ($middlewareEdge['confidence'] ?? 1.0), 4);
+
+                if (($middleware['type'] ?? null) !== 'method' || $middlewareConfidence < $minConfidence) {
+                    continue;
+                }
+
+                $methodSeeds[] = [
+                    'id' => $middlewareEdge['to'],
+                    'confidence' => $middlewareConfidence,
+                    'via' => $resolvedId,
+                    'edgeType' => 'passes_through',
+                    'path' => [$resolvedId, $middlewareEdge['to']],
+                ];
+            }
+        }
+
+        // Intermediate FormRequest, event, and job nodes are execution bridges,
+        // not method results. Filter only the returned rows; traversal still
+        // crosses those nodes to reach framework-invoked application methods.
+        $methodHits = $this->index->traverseFromSeeds(
+            $methodSeeds,
+            self::FLOW_EXECUTION_EDGES,
+            direction: 'out',
+            maxDepth: $depth,
+            minConfidence: $minConfidence,
+            limit: max(1, $limit),
+            resultNodeTypes: ['method'],
+            transition: fn (array $state, array $edge, string $neighborId, string $direction): array|false => $this->flowExecutionTransition(
+                $state,
+                $edge,
+                $neighborId,
+                $direction,
+            ),
+            truncated: $truncated,
+        );
+
+        if (! in_array($entrypointId, array_column($methodHits, 'id'), true)) {
+            $truncated = true;
+            array_unshift($methodHits, [
+                'id' => $entrypointId,
+                'depth' => 0,
+                'confidence' => $entrypointConfidence,
+                'via' => $entrypointId,
+                'edgeType' => '',
+                'path' => [$entrypointId],
+                'evidenceCount' => 0,
+            ]);
+
+            if (count($methodHits) > max(1, $limit)) {
+                $methodHits = array_slice($methodHits, 0, max(1, $limit));
+            }
+        }
 
         $methods = [];
         $models = [];
@@ -292,30 +351,62 @@ class QueryEngine
                 }
 
                 $listeners = [];
+                $dispatchKinds = $this->dispatchKinds($edge, $related);
 
-                foreach ($this->index->edgesTo($edge['to'], ['listens_to']) as $listenerEdge) {
-                    $listener = $this->index->node($listenerEdge['from']);
-                    $listeners[] = array_filter([
-                        'id' => $listenerEdge['from'],
-                        'confidence' => $listenerEdge['confidence'] ?? 1.0,
-                        'queued' => $listenerEdge['metadata']['queued'] ?? null,
-                        'afterCommit' => $listenerEdge['metadata']['afterCommit'] ?? null,
-                        'file' => $listener['file'] ?? null,
-                        'line' => $listener['line'] ?? null,
-                    ], static fn ($value): bool => $value !== null);
+                if (in_array('event', $dispatchKinds, true)) {
+                    // A listens_to edge records registration, not execution. A
+                    // queued listener whose shouldQueue() returned false still
+                    // has that edge, while EventFlow deliberately omits its
+                    // handled_by edge. Build this compact execution summary from
+                    // the same active bridge used by flow traversal.
+                    foreach ($this->index->edgesFrom($edge['to'], ['handled_by']) as $listenerEdge) {
+                        if (($listenerEdge['metadata']['kind'] ?? null) !== 'listener') {
+                            continue;
+                        }
+
+                        if (($listenerEdge['metadata']['causalExecutionProven'] ?? null) === false) {
+                            continue;
+                        }
+
+                        $listener = $this->index->node($listenerEdge['to']);
+                        $listeners[] = array_filter([
+                            'id' => $listenerEdge['to'],
+                            'confidence' => $listenerEdge['confidence'] ?? 1.0,
+                            'queued' => $listenerEdge['metadata']['queued'] ?? null,
+                            'afterCommit' => $listenerEdge['metadata']['afterCommit'] ?? null,
+                            'file' => $listener['file'] ?? null,
+                            'line' => $listener['line'] ?? null,
+                        ], static fn ($value): bool => $value !== null);
+                    }
                 }
 
                 usort($listeners, static fn (array $a, array $b): int => $a['id'] <=> $b['id']);
+                $dispatchMetadata = $edge['metadata'] ?? [];
+                $occurrences = is_array($dispatchMetadata['dispatchOccurrences'] ?? null)
+                    ? $dispatchMetadata['dispatchOccurrences']
+                    : [];
+                $hasOccurrenceEvidence = $occurrences !== [];
 
                 $dispatches[$hit['id'].'|'.$edge['to']] = array_filter([
                     'id' => $edge['to'],
-                    'type' => $related['type'] ?? ($edge['metadata']['kind'] ?? null),
+                    'type' => count($dispatchKinds) === 1 ? $dispatchKinds[0] : ($related['type'] ?? null),
+                    'kinds' => count($dispatchKinds) > 1 ? $dispatchKinds : null,
                     'from' => $hit['id'],
                     'depth' => $hit['depth'],
                     'confidence' => $edgeConfidence,
-                    'afterCommit' => $edge['metadata']['afterCommit'] ?? null,
-                    'connection' => $edge['metadata']['connection'] ?? ($related['metadata']['connection'] ?? null),
-                    'queue' => $edge['metadata']['queue'] ?? ($related['metadata']['queue'] ?? null),
+                    'mode' => $dispatchMetadata['dispatchMode'] ?? null,
+                    'modes' => $dispatchMetadata['dispatchModes'] ?? null,
+                    'method' => $dispatchMetadata['dispatchMethod'] ?? null,
+                    'methods' => $dispatchMetadata['dispatchMethods'] ?? null,
+                    'afterCommit' => $dispatchMetadata['afterCommit'] ?? null,
+                    'afterCommitValues' => $dispatchMetadata['afterCommitValues'] ?? null,
+                    'connection' => $dispatchMetadata['connection']
+                        ?? (! $hasOccurrenceEvidence ? ($related['metadata']['connection'] ?? null) : null),
+                    'connections' => $dispatchMetadata['connections'] ?? null,
+                    'queue' => $dispatchMetadata['queue']
+                        ?? (! $hasOccurrenceEvidence ? ($related['metadata']['queue'] ?? null) : null),
+                    'queues' => $dispatchMetadata['queues'] ?? null,
+                    'occurrences' => $hasOccurrenceEvidence ? array_values($occurrences) : null,
                     'listeners' => $listeners ?: null,
                     'file' => $related['file'] ?? null,
                     'line' => $related['line'] ?? null,
@@ -877,6 +968,146 @@ class QueryEngine
         }
 
         return [$id, null, null];
+    }
+
+    /**
+     * Keep a dual-role event/job class on the execution bridge selected by the
+     * dispatch occurrence that reached it. The state partition prevents a
+     * stronger event path from lending its confidence to a separate job path.
+     *
+     * @param array<string, mixed> $state
+     * @param array<string, mixed> $edge
+     * @return array<string, mixed>|false
+     */
+    private function flowExecutionTransition(array $state, array $edge, string $neighborId, string $direction): array|false
+    {
+        if ($direction !== 'out') {
+            return [];
+        }
+
+        if (($edge['type'] ?? null) === 'dispatches') {
+            if (($edge['metadata']['causalExecutionProven'] ?? null) === false) {
+                return false;
+            }
+
+            $kinds = $this->dispatchKinds($edge, $this->index->node($neighborId));
+
+            // Once occurrence evidence exists it is authoritative. If every
+            // occurrence is explicitly non-causal, there is no execution
+            // bridge to cross even if merged edge or target metadata still
+            // describes event/job roles.
+            if ($this->hasDispatchOccurrences($edge) && $kinds === []) {
+                return false;
+            }
+
+            return [
+                'dispatchKinds' => $kinds,
+                'statePartition' => $kinds === [] ? '' : 'dispatch:'.implode(',', $kinds),
+            ];
+        }
+
+        if (($edge['type'] ?? null) !== 'handled_by') {
+            return [];
+        }
+
+        // A scanner may retain a declaration-only handler edge so agents can
+        // inspect configuration that is present in source but absent from the
+        // booted application. It must not become a causal execution path.
+        if (($edge['metadata']['causalExecutionProven'] ?? null) === false) {
+            return false;
+        }
+
+        $activeKinds = array_values(array_filter(
+            $state['dispatchKinds'] ?? [],
+            static fn (mixed $kind): bool => is_string($kind),
+        ));
+        $handlerKind = $edge['metadata']['kind'] ?? null;
+        $requiredDispatchKind = match ($handlerKind) {
+            'listener' => 'event',
+            'job' => 'job',
+            default => null,
+        };
+
+        if ($requiredDispatchKind !== null
+            && $activeKinds !== []
+            && ! in_array($requiredDispatchKind, $activeKinds, true)) {
+            return false;
+        }
+
+        return [
+            'dispatchKinds' => [],
+            'statePartition' => '',
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $edge
+     * @param array<string, mixed>|null $target
+     * @return array<int, string>
+     */
+    private function dispatchKinds(array $edge, ?array $target): array
+    {
+        $metadata = $edge['metadata'] ?? [];
+        $kinds = [];
+        $occurrences = is_array($metadata['dispatchOccurrences'] ?? null)
+            ? $metadata['dispatchOccurrences']
+            : [];
+
+        if ($occurrences !== []) {
+            foreach ($occurrences as $occurrence) {
+                if (! is_array($occurrence)
+                    || ($occurrence['causalExecutionProven'] ?? null) === false) {
+                    continue;
+                }
+
+                $kind = $occurrence['kind'] ?? null;
+
+                if (is_string($kind) && in_array($kind, ['event', 'job'], true)) {
+                    $kinds[$kind] = $kind;
+                }
+            }
+
+            ksort($kinds);
+
+            return array_values($kinds);
+        }
+
+        foreach ($metadata['dispatchKinds'] ?? [] as $kind) {
+            if (is_string($kind) && in_array($kind, ['event', 'job'], true)) {
+                $kinds[$kind] = $kind;
+            }
+        }
+
+        if (is_string($metadata['kind'] ?? null)
+            && in_array($metadata['kind'], ['event', 'job'], true)) {
+            $kinds[$metadata['kind']] = $metadata['kind'];
+        }
+
+        $useTargetRoles = $kinds === [];
+
+        foreach ($target['metadata']['roles'] ?? [] as $role) {
+            if ($useTargetRoles && is_string($role) && in_array($role, ['event', 'job'], true)) {
+                $kinds[$role] = $role;
+            }
+        }
+
+        $targetType = $target['type'] ?? null;
+
+        if ($kinds === [] && is_string($targetType) && in_array($targetType, ['event', 'job'], true)) {
+            $kinds[$targetType] = $targetType;
+        }
+
+        ksort($kinds);
+
+        return array_values($kinds);
+    }
+
+    /** @param array<string, mixed> $edge */
+    private function hasDispatchOccurrences(array $edge): bool
+    {
+        $occurrences = $edge['metadata']['dispatchOccurrences'] ?? null;
+
+        return is_array($occurrences) && $occurrences !== [];
     }
 
     /**

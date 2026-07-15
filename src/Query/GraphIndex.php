@@ -225,9 +225,8 @@ class GraphIndex
         int $limit = 50,
         bool &$truncated = false,
     ): array {
-        $resultsById = [];
-        $states = [[
-            $startId => [
+        return $this->traverseSeedStates(
+            [[
                 'id' => $startId,
                 'depth' => 0,
                 'confidence' => 1.0,
@@ -235,8 +234,119 @@ class GraphIndex
                 'edgeType' => '',
                 'path' => [$startId],
                 'evidenceCount' => 0,
-            ],
-        ]];
+            ]],
+            $edgeTypes,
+            $direction,
+            $maxDepth,
+            $minConfidence,
+            $limit,
+            null,
+            [$startId => true],
+            null,
+            $truncated,
+        );
+    }
+
+    /**
+     * Traverse one causal graph from several entry points. Seed confidence is
+     * retained and multiplied through every traversed edge, while all seeds
+     * compete in the same deterministic strongest-path ranking.
+     *
+     * This is useful for framework entry points such as an HTTP action and its
+     * middleware handlers: they share one bounded traversal without inventing a
+     * synthetic node or allowing intermediate event/request nodes to consume a
+     * method-result limit.
+     *
+     * @param array<int, array{id: string, confidence?: float, via?: string, edgeType?: string, path?: array<int, string>}> $seeds
+     * @param array<int, string> $edgeTypes
+     * @param array<int, string>|null $resultNodeTypes
+     * @param callable(array<string, mixed>, array<string, mixed>, string, string):(array<string, mixed>|false)|null $transition
+     * @return array<int, array{id: string, depth: int, confidence: float, via: string, edgeType: string, path: array<int, string>, evidenceCount: int}>
+     */
+    public function traverseFromSeeds(
+        array $seeds,
+        array $edgeTypes,
+        string $direction = 'out',
+        int $maxDepth = 4,
+        float $minConfidence = 0.0,
+        int $limit = 50,
+        ?array $resultNodeTypes = null,
+        ?callable $transition = null,
+        bool &$truncated = false,
+    ): array {
+        $seedStates = [];
+
+        foreach ($seeds as $seed) {
+            if (! isset($seed['id']) || ! is_string($seed['id'])) {
+                continue;
+            }
+
+            $state = [
+                'id' => $seed['id'],
+                'depth' => 0,
+                'confidence' => round((float) ($seed['confidence'] ?? 1.0), 4),
+                'via' => (string) ($seed['via'] ?? $seed['id']),
+                'edgeType' => (string) ($seed['edgeType'] ?? ''),
+                'path' => $seed['path'] ?? [$seed['id']],
+                'evidenceKinds' => [],
+                'evidenceCount' => 0,
+            ];
+
+            if ($state['confidence'] < $minConfidence) {
+                continue;
+            }
+
+            if (! isset($seedStates[$state['id']]) || $this->pathRanksBefore($state, $seedStates[$state['id']])) {
+                $seedStates[$state['id']] = $state;
+            }
+        }
+
+        return $this->traverseSeedStates(
+            array_values($seedStates),
+            $edgeTypes,
+            $direction,
+            $maxDepth,
+            $minConfidence,
+            $limit,
+            $resultNodeTypes,
+            [],
+            $transition,
+            $truncated,
+        );
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $seedStates
+     * @param array<int, string> $edgeTypes
+     * @param array<int, string>|null $resultNodeTypes
+     * @param array<string, bool> $excludedResultIds
+     * @param callable(array<string, mixed>, array<string, mixed>, string, string):(array<string, mixed>|false)|null $transition
+     * @return array<int, array{id: string, depth: int, confidence: float, via: string, edgeType: string, path: array<int, string>, evidenceCount: int}>
+     */
+    private function traverseSeedStates(
+        array $seedStates,
+        array $edgeTypes,
+        string $direction,
+        int $maxDepth,
+        float $minConfidence,
+        int $limit,
+        ?array $resultNodeTypes,
+        array $excludedResultIds,
+        ?callable $transition,
+        bool &$truncated,
+    ): array {
+        $resultsById = [];
+        $states = [[]];
+
+        foreach ($seedStates as $state) {
+            $states[0][$this->traversalStateKey($state)] = $state;
+
+            if (! isset($excludedResultIds[$state['id']])
+                && $this->nodeMatchesTypes($state['id'], $resultNodeTypes)
+                && (! isset($resultsById[$state['id']]) || $this->pathRanksBefore($state, $resultsById[$state['id']]))) {
+                $resultsById[$state['id']] = $state;
+            }
+        }
 
         for ($depth = 0; $depth < $maxDepth; $depth++) {
             $nextStates = [];
@@ -258,6 +368,20 @@ class GraphIndex
                 foreach ($edges as $edge) {
                     $neighborId = $direction === 'out' ? $edge['to'] : $edge['from'];
 
+                    $transitionState = [];
+
+                    if ($transition !== null) {
+                        $transitionResult = $transition($state, $edge, $neighborId, $direction);
+
+                        if ($transitionResult === false) {
+                            continue;
+                        }
+
+                        if (is_array($transitionResult)) {
+                            $transitionState = $transitionResult;
+                        }
+                    }
+
                     $pathConfidence = round($state['confidence'] * (float) ($edge['confidence'] ?? 1.0), 4);
 
                     if ($pathConfidence < $minConfidence) {
@@ -275,14 +399,16 @@ class GraphIndex
                             $state['evidenceKinds'] ?? [],
                             $this->edgeEvidenceKinds($edge),
                         ),
-                    ];
+                    ] + $transitionState;
                     $candidate['evidenceCount'] = count($candidate['evidenceKinds']);
+                    $stateKey = $this->traversalStateKey($candidate);
 
-                    if (! isset($nextStates[$neighborId]) || $this->pathRanksBefore($candidate, $nextStates[$neighborId])) {
-                        $nextStates[$neighborId] = $candidate;
+                    if (! isset($nextStates[$stateKey]) || $this->pathRanksBefore($candidate, $nextStates[$stateKey])) {
+                        $nextStates[$stateKey] = $candidate;
                     }
 
-                    if ($neighborId !== $startId
+                    if (! isset($excludedResultIds[$neighborId])
+                        && $this->nodeMatchesTypes($neighborId, $resultNodeTypes)
                         && (! isset($resultsById[$neighborId]) || $this->pathRanksBefore($candidate, $resultsById[$neighborId]))) {
                         $resultsById[$neighborId] = $candidate;
                     }
@@ -306,6 +432,20 @@ class GraphIndex
         }
 
         return $results;
+    }
+
+    /** @param array<string, mixed> $state */
+    private function traversalStateKey(array $state): string
+    {
+        $partition = $state['statePartition'] ?? '';
+
+        return (string) $state['id']."\0".(is_scalar($partition) ? (string) $partition : '');
+    }
+
+    /** @param array<int, string>|null $types */
+    private function nodeMatchesTypes(string $id, ?array $types): bool
+    {
+        return $types === null || in_array($this->nodesById[$id]['type'] ?? null, $types, true);
     }
 
     /**

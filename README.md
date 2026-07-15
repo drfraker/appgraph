@@ -16,7 +16,7 @@ Deterministic scanning covers:
 
 ## Install
 
-Requires PHP 8.2+ and Laravel 12+.
+Requires PHP 8.4+ and Laravel 12+.
 
 ```bash
 composer config repositories.appgraph vcs https://github.com/drfraker/appgraph

@@ -7,6 +7,7 @@ use AppGraph\Graph\Graph;
 use AppGraph\Graph\Node as GraphNode;
 use AppGraph\Scanners\Concerns\InteractsWithPhpAst;
 use AppGraph\Support\FileFinder;
+use AppGraph\Support\PhpFileFacts;
 use Illuminate\Support\Str;
 use PhpParser\Node;
 use PhpParser\Node\Arg;
@@ -14,14 +15,10 @@ use PhpParser\Node\Expr;
 use PhpParser\Node\Identifier;
 use PhpParser\Node\Scalar;
 use PhpParser\Node\Stmt;
-use PhpParser\Parser;
-use PhpParser\ParserFactory;
 
 class DataFlowScanner
 {
     use InteractsWithPhpAst;
-
-    private Parser $parser;
 
     /**
      * @var array<string, array<string, mixed>>
@@ -156,9 +153,11 @@ class DataFlowScanner
         'toggle',
     ];
 
-    public function __construct(private FileFinder $files)
-    {
-        $this->parser = (new ParserFactory())->createForNewestSupportedVersion();
+    public function __construct(
+        private FileFinder $files,
+        ?PhpFileFacts $phpFileFacts = null,
+    ) {
+        $this->initializePhpFileFacts($phpFileFacts);
     }
 
     public function scan(Graph $graph): Graph

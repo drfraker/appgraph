@@ -7,20 +7,17 @@ use AppGraph\Graph\Graph;
 use AppGraph\Graph\Node as GraphNode;
 use AppGraph\Scanners\Concerns\InteractsWithPhpAst;
 use AppGraph\Support\FileFinder;
+use AppGraph\Support\PhpFileFacts;
 use PhpParser\Node;
 use PhpParser\Node\Expr;
 use PhpParser\Node\Identifier;
 use PhpParser\Node\Name;
 use PhpParser\Node\Scalar;
 use PhpParser\Node\Stmt;
-use PhpParser\Parser;
-use PhpParser\ParserFactory;
 
 class TestScanner
 {
     use InteractsWithPhpAst;
-
-    private Parser $parser;
 
     /** @var array<string, array<string, mixed>> */
     private array $classes = [];
@@ -34,9 +31,11 @@ class TestScanner
     /** @var array<int, array{id: string, methods: array<int, string>, uri: string}> */
     private array $routes = [];
 
-    public function __construct(private FileFinder $files)
-    {
-        $this->parser = (new ParserFactory())->createForNewestSupportedVersion();
+    public function __construct(
+        private FileFinder $files,
+        ?PhpFileFacts $phpFileFacts = null,
+    ) {
+        $this->initializePhpFileFacts($phpFileFacts);
     }
 
     protected function scannerName(): string

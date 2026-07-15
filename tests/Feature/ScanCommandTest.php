@@ -79,6 +79,15 @@ class ScanCommandTest extends TestCase
         $this->assertGraphHasEdge($graph, 'App\Listeners\CommandNoteListener::handle', 'App\Events\CommandNoteSaved', 'listens_to');
         $this->assertGraphHasEdge($graph, 'App\Events\CommandNoteSaved', 'App\Listeners\CommandNoteListener::handle', 'handled_by');
         $this->assertSame('testing', $graph['meta']['analysis']['containerBindings']['environment']);
+        $phpFacts = $graph['meta']['analysis']['phpFileFacts'];
+        $this->assertFalse($phpFacts['persistent']);
+        $this->assertMatchesRegularExpression('/^[a-f0-9]{64}$/', $phpFacts['identity']);
+        $this->assertGreaterThan(0, $phpFacts['counters']['parses']);
+        $this->assertGreaterThan(0, $phpFacts['counters']['memoryHits']);
+        $this->assertGreaterThan(
+            $phpFacts['counters']['parses'],
+            $phpFacts['counters']['requests'],
+        );
 
         // Token-efficient shape: null/empty fields are omitted, schema sources are interned.
         $routeNode = $this->graphNode($graph, 'route:PUT:/progress-notes/{note}');

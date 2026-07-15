@@ -68,6 +68,18 @@ the relevant booted framework, environment, container-binding, and Event/Bus reg
 depending only on filesystem modification times; older graphs without a manifest
 continue to use the legacy timestamp check.
 
+Every PHP scanner consumes the same name-resolved syntax tree for a source file.
+Those facts are keyed by source content, PHP/php-parser versions, parser target,
+and resolver options, then cached as JSON under
+`storage/appgraph/cache/php-facts` by default. This avoids reparsing unchanged PHP
+across scanners and later scan processes. Writes are atomic, corrupt entries are
+discarded and rebuilt, and syntax errors are cached deterministically. The cache
+does not deserialize PHP objects or execute application source, and it is always
+safe to delete. Disable it with `appgraph.php_facts.persistent_cache` or change its
+location with `appgraph.php_facts.cache_path`; relative paths are resolved below
+the application's `storage` directory. Cache identity and hit/miss counters are
+recorded in `meta.analysis.phpFileFacts` for scan diagnostics.
+
 You can override it:
 
 ```bash

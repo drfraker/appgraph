@@ -8,6 +8,7 @@ use AppGraph\Graph\Node as GraphNode;
 use AppGraph\Scanners\Concerns\InteractsWithPhpAst;
 use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\FileFinder;
+use AppGraph\Support\PhpFileFacts;
 use PhpParser\Node as AstNode;
 use PhpParser\Node\Arg;
 use PhpParser\Node\Expr;
@@ -16,16 +17,12 @@ use PhpParser\Node\Name;
 use PhpParser\Node\Scalar;
 use PhpParser\Node\Stmt;
 use PhpParser\Node\Stmt\TraitUseAdaptation;
-use PhpParser\Parser;
-use PhpParser\ParserFactory;
 
 class FormRequestScanner
 {
     use InteractsWithPhpAst;
 
     private const FORM_REQUEST_CLASS = 'Illuminate\Foundation\Http\FormRequest';
-
-    private Parser $parser;
 
     /**
      * @var array<string, array<string, mixed>>
@@ -53,8 +50,9 @@ class FormRequestScanner
     public function __construct(
         private FileFinder $files,
         private ?ContainerBindingRegistry $containerBindings = null,
+        ?PhpFileFacts $phpFileFacts = null,
     ) {
-        $this->parser = (new ParserFactory())->createForNewestSupportedVersion();
+        $this->initializePhpFileFacts($phpFileFacts);
     }
 
     protected function scannerName(): string

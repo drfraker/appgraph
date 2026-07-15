@@ -16,10 +16,6 @@ use PhpParser\Node\Name;
 use PhpParser\Node\Scalar;
 use PhpParser\Node\Stmt;
 use PhpParser\NodeFinder;
-use PhpParser\NodeTraverser;
-use PhpParser\NodeVisitor\NameResolver;
-use PhpParser\Parser;
-use PhpParser\ParserFactory;
 use ReflectionAttribute;
 use ReflectionClass;
 use ReflectionException;
@@ -28,11 +24,13 @@ use Throwable;
 
 class LaravelMiddlewarePipeline
 {
-    private Parser $parser;
+    private PhpFileFacts $phpFileFacts;
 
-    public function __construct(private ContainerBindingRegistry $containerBindings)
-    {
-        $this->parser = (new ParserFactory())->createForNewestSupportedVersion();
+    public function __construct(
+        private ContainerBindingRegistry $containerBindings,
+        ?PhpFileFacts $phpFileFacts = null,
+    ) {
+        $this->phpFileFacts = $phpFileFacts ?? new PhpFileFacts();
     }
 
     /**
@@ -611,20 +609,8 @@ class LaravelMiddlewarePipeline
             return null;
         }
 
-        $source = file_get_contents($file);
-
-        if ($source === false) {
-            return null;
-        }
-
         try {
-            $statements = $this->parser->parse($source) ?? [];
-            $traverser = new NodeTraverser();
-            $traverser->addVisitor(new NameResolver(null, [
-                'replaceNodes' => false,
-                'preserveOriginalNames' => true,
-            ]));
-            $statements = $traverser->traverse($statements);
+            $statements = $this->phpFileFacts->statements($file);
             $finder = new NodeFinder();
 
             /** @var Stmt\ClassMethod|null $astMethod */

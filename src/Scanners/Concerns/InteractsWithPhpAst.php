@@ -4,6 +4,7 @@ namespace AppGraph\Scanners\Concerns;
 
 use AppGraph\Graph\Graph;
 use AppGraph\Graph\Node as GraphNode;
+use AppGraph\Support\PhpFileFacts;
 use PhpParser\Node;
 use PhpParser\Node\Expr;
 use PhpParser\Node\Identifier;
@@ -11,42 +12,35 @@ use PhpParser\Node\Name;
 use PhpParser\Node\NullableType;
 use PhpParser\Node\Param;
 use PhpParser\Node\Stmt;
-use PhpParser\NodeTraverser;
-use PhpParser\NodeVisitor\NameResolver;
 use Throwable;
 
 /**
  * Shared AST parsing, name/type resolution, and method-node construction for
- * php-parser based scanners. Consumers must define `private Parser $parser`,
- * `private FileFinder $files`, and a `private array $classes` index keyed by
- * FQCN with an `extends` entry (used for parent:: resolution).
+ * php-parser based scanners. Consumers must define `private FileFinder $files`
+ * and a `private array $classes` index keyed by FQCN with an `extends` entry
+ * (used for parent:: resolution). Constructors should call
+ * initializePhpFileFacts() with their optional shared fact service.
  */
 trait InteractsWithPhpAst
 {
+    private ?PhpFileFacts $phpFileFacts = null;
+
     abstract protected function scannerName(): string;
 
     abstract protected function scannerSourceLabel(): string;
+
+    private function initializePhpFileFacts(?PhpFileFacts $phpFileFacts = null): void
+    {
+        $this->phpFileFacts = $phpFileFacts ?? new PhpFileFacts();
+    }
 
     /**
      * @return array<int, Node>|null
      */
     private function parseFile(string $file, Graph $graph): ?array
     {
-        $source = file_get_contents($file);
-
-        if ($source === false) {
-            return null;
-        }
-
         try {
-            $statements = $this->parser->parse($source) ?? [];
-            $traverser = new NodeTraverser();
-            $traverser->addVisitor(new NameResolver(null, [
-                'replaceNodes' => false,
-                'preserveOriginalNames' => true,
-            ]));
-
-            return $traverser->traverse($statements);
+            return ($this->phpFileFacts ??= new PhpFileFacts())->statements($file);
         } catch (Throwable $throwable) {
             $graph->addWarning([
                 'scanner' => $this->scannerName(),

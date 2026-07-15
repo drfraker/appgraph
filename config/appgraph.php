@@ -5,6 +5,16 @@ return [
 
     'memory_limit' => '1024M',
 
+    'php_facts' => [
+        /*
+         * Name-resolved PHP ASTs are shared by every PHP scanner in memory and,
+         * by default, reused across processes through a content-addressed JSON
+         * cache. The cache never unserializes PHP objects or executes source.
+         */
+        'persistent_cache' => true,
+        'cache_path' => 'appgraph/cache/php-facts',
+    ],
+
     'database' => [
         /*
          * "dump" uses Laravel's schema dump implementation, then parses the SQL file.

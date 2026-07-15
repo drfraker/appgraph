@@ -8,6 +8,7 @@ use AppGraph\Graph\Node as GraphNode;
 use AppGraph\Scanners\Concerns\InteractsWithPhpAst;
 use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\FileFinder;
+use AppGraph\Support\PhpFileFacts;
 use Illuminate\Bus\Dispatcher as LaravelBusDispatcher;
 use Illuminate\Events\Dispatcher as LaravelEventDispatcher;
 use Illuminate\Support\Str;
@@ -17,8 +18,6 @@ use PhpParser\Node\Identifier;
 use PhpParser\Node\Name;
 use PhpParser\Node\Scalar;
 use PhpParser\Node\Stmt;
-use PhpParser\Parser;
-use PhpParser\ParserFactory;
 use ReflectionClass;
 use ReflectionMethod;
 use ReflectionNamedType;
@@ -79,8 +78,6 @@ class EventFlowScanner
         'dispatchAfterResponse',
     ];
 
-    private Parser $parser;
-
     /**
      * @var array<string, array<string, mixed>>
      */
@@ -115,8 +112,9 @@ class EventFlowScanner
     public function __construct(
         private FileFinder $files,
         private ?ContainerBindingRegistry $containerBindings = null,
+        ?PhpFileFacts $phpFileFacts = null,
     ) {
-        $this->parser = (new ParserFactory())->createForNewestSupportedVersion();
+        $this->initializePhpFileFacts($phpFileFacts);
     }
 
     protected function scannerName(): string

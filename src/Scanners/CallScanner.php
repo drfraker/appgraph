@@ -7,6 +7,7 @@ use AppGraph\Graph\Graph;
 use AppGraph\Scanners\Concerns\InteractsWithPhpAst;
 use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\FileFinder;
+use AppGraph\Support\PhpFileFacts;
 use Illuminate\Support\Str;
 use PhpParser\Node;
 use PhpParser\Node\Arg;
@@ -14,8 +15,6 @@ use PhpParser\Node\Expr;
 use PhpParser\Node\Identifier;
 use PhpParser\Node\Scalar;
 use PhpParser\Node\Stmt;
-use PhpParser\Parser;
-use PhpParser\ParserFactory;
 
 class CallScanner
 {
@@ -175,8 +174,6 @@ class CallScanner
         ],
     ];
 
-    private Parser $parser;
-
     /**
      * @var array<string, array<string, mixed>>
      */
@@ -254,8 +251,9 @@ class CallScanner
     public function __construct(
         private FileFinder $files,
         private ?ContainerBindingRegistry $containerBindings = null,
+        ?PhpFileFacts $phpFileFacts = null,
     ) {
-        $this->parser = (new ParserFactory())->createForNewestSupportedVersion();
+        $this->initializePhpFileFacts($phpFileFacts);
     }
 
     public function scan(Graph $graph): Graph

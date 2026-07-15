@@ -20,6 +20,7 @@ use AppGraph\Scanners\SideEffectScanner;
 use AppGraph\Scanners\TestScanner;
 use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\MemoryLimit;
+use AppGraph\Support\PhpFileFacts;
 use AppGraph\Support\ScanFingerprint;
 use Illuminate\Console\Command;
 use Throwable;
@@ -50,10 +51,12 @@ class ScanCommand extends Command
         PolicyScanner $policyScanner,
         ContainerBindingScanner $containerBindingScanner,
         ContainerBindingRegistry $containerBindings,
+        PhpFileFacts $phpFileFacts,
         ScanFingerprint $scanFingerprint,
         GraphExporter $exporter,
     ): int {
         MemoryLimit::ensure(config('appgraph.memory_limit', '256M'));
+        $phpFileFacts->resetStats();
         $containerBindings->refresh();
         // Freeze one read-only booted-container snapshot for every scanner and
         // for the generation fingerprint. No later scanner may execute factories
@@ -130,6 +133,9 @@ class ScanCommand extends Command
 
         $graph->addMeta([
             'scan' => $scanFingerprint->capture(refreshRuntimeEvidence: false),
+            'analysis' => [
+                'phpFileFacts' => $phpFileFacts->stats(),
+            ],
         ]);
 
         $path = $this->outputPath();

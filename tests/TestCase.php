@@ -29,6 +29,7 @@ abstract class TestCase extends Orchestra
     protected function defineEnvironment($app): void
     {
         $app['config']->set('app.name', 'AppGraph Test App');
+        $app['config']->set('appgraph.php_facts.persistent_cache', false);
         $app['config']->set('database.default', 'testing');
         $app['config']->set('database.connections.testing', [
             'driver' => 'sqlite',

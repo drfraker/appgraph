@@ -3,8 +3,10 @@
 namespace AppGraph\Tests\Unit;
 
 use AppGraph\Graph\Graph;
+use AppGraph\Scanners\DataFlowScanner;
 use AppGraph\Scanners\SideEffectScanner;
 use AppGraph\Support\FileFinder;
+use AppGraph\Support\PhpFileFacts;
 use AppGraph\Tests\TestCase;
 use Illuminate\Filesystem\Filesystem;
 
@@ -63,5 +65,62 @@ PHP);
 
         $dynamic = $this->graphEdge($array, $method, 'side-effect:cache:default:{dynamic}', 'writes_cache');
         $this->assertSame(0.45, $dynamic['confidence']);
+    }
+
+    public function test_different_scanners_share_one_in_memory_php_parse(): void
+    {
+        file_put_contents($this->fixturePath.'/app/Services/SharedFactsService.php', <<<'PHP'
+<?php
+
+namespace AppGraph\Tests\GeneratedSideEffects;
+
+use Illuminate\Support\Facades\Cache;
+
+class SharedFactsService
+{
+    public function load(): mixed
+    {
+        return Cache::get('shared-facts');
+    }
+}
+PHP);
+
+        $files = new FileFinder($this->fixturePath);
+        $facts = new PhpFileFacts();
+        (new DataFlowScanner($files, $facts))->scan(new Graph());
+        (new SideEffectScanner($files, $facts))->scan(new Graph());
+
+        $stats = $facts->stats();
+
+        $this->assertSame(1, $stats['counters']['parses']);
+        $this->assertGreaterThan(0, $stats['counters']['memoryHits']);
+    }
+
+    public function test_shared_parse_failures_keep_each_scanners_warning_identity(): void
+    {
+        file_put_contents(
+            $this->fixturePath.'/app/Services/BrokenService.php',
+            '<?php namespace AppGraph\\Tests\\GeneratedSideEffects; class BrokenService {',
+        );
+
+        $files = new FileFinder($this->fixturePath);
+        $facts = new PhpFileFacts();
+        $dataFlowGraph = new Graph();
+        $sideEffectGraph = new Graph();
+        (new DataFlowScanner($files, $facts))->scan($dataFlowGraph);
+        (new SideEffectScanner($files, $facts))->scan($sideEffectGraph);
+
+        $dataFlowScanners = array_values(array_unique(array_column(
+            $dataFlowGraph->toArray()['meta']['warnings'] ?? [],
+            'scanner',
+        )));
+        $sideEffectScanners = array_values(array_unique(array_column(
+            $sideEffectGraph->toArray()['meta']['warnings'] ?? [],
+            'scanner',
+        )));
+
+        $this->assertSame(['data_flow'], $dataFlowScanners);
+        $this->assertSame(['side_effects'], $sideEffectScanners);
+        $this->assertSame(1, $facts->stats()['counters']['parses']);
     }
 }

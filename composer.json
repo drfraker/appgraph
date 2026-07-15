@@ -1,0 +1,51 @@
+{
+    "name": "drfraker/appgraph",
+    "description": "Local-first Laravel code graph and MCP tools for AI-assisted feature work and refactoring.",
+    "keywords": [
+        "ai",
+        "code-graph",
+        "laravel",
+        "mcp",
+        "static-analysis"
+    ],
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": "^8.2",
+        "illuminate/console": "^12.0|^13.0",
+        "illuminate/database": "^12.0|^13.0",
+        "illuminate/filesystem": "^12.0|^13.0",
+        "illuminate/routing": "^12.0|^13.0",
+        "illuminate/support": "^12.0|^13.0",
+        "laravel/mcp": "^0.5.1|^0.6.0|^0.7.0|^0.8.0",
+        "nikic/php-parser": "^5.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^10.0|^11.0",
+        "phpunit/phpunit": "^11.0|^12.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "AppGraph\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "AppGraph\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "AppGraph\\AppGraphServiceProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}

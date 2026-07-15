@@ -53,7 +53,7 @@ class QueryEngine
         $sourcePath = $this->index->sourcePath();
 
         if ($this->staleness !== null && $sourcePath !== null) {
-            $staleness = $this->staleness->check($sourcePath);
+            $staleness = $this->staleness->check($sourcePath, is_array($meta['scan'] ?? null) ? $meta['scan'] : null);
 
             if ($staleness !== []) {
                 $payload['staleness'] = $staleness;

@@ -72,4 +72,33 @@ class GraphSerializationTest extends TestCase
             array_keys($edge->metadata['operations'])
         );
     }
+
+    public function test_edge_merge_preserves_evidence_from_every_call_site(): void
+    {
+        $graph = new Graph();
+        $graph->addNode(Node::make('A::m', 'method', 'A::m', [
+            'file' => 'app/A.php',
+            'line' => 5,
+        ]));
+        $graph->addEdge(new Edge('A::m', 'B::n', 'calls', 0.9, [
+            'line' => 10,
+            'inference' => 'typed_parameter',
+            'syntax' => 'method_call',
+        ]));
+        $graph->addEdge(new Edge('A::m', 'B::n', 'calls', 0.8, [
+            'line' => 20,
+            'inference' => 'container_helper',
+            'syntax' => 'method_call',
+        ]));
+
+        $edge = $graph->edges()[0] ?? null;
+
+        $this->assertNotNull($edge);
+        $this->assertCount(2, $edge->metadata['evidence']);
+        $this->assertSame([10, 20], array_column(array_values($edge->metadata['evidence']), 'line'));
+        $this->assertSame(
+            ['typed_parameter', 'container_helper'],
+            array_column(array_values($edge->metadata['evidence']), 'inference')
+        );
+    }
 }

@@ -2,6 +2,7 @@
 
 namespace AppGraph\Tests\Unit;
 
+use AppGraph\Graph\GraphExporter;
 use AppGraph\Query\GraphIndex;
 use AppGraph\Tests\Support\BuildsQueryFixtureGraph;
 use AppGraph\Tests\TestCase;
@@ -20,6 +21,34 @@ class GraphIndexTest extends TestCase
         $this->assertSame(3, $index->countsByEdgeType()['calls']);
         $this->assertCount(1, $index->edgesFrom('App\Models\Note', ['uses_table']));
         $this->assertCount(1, $index->edgesTo('table:notes', ['writes']));
+    }
+
+    public function test_load_observes_an_atomic_replacement_within_the_same_timestamp_window(): void
+    {
+        $directory = sys_get_temp_dir().'/appgraph-index-'.bin2hex(random_bytes(4));
+        $path = $directory.'/graph.json';
+        mkdir($directory, 0775, true);
+        $exporter = new GraphExporter();
+
+        try {
+            $exporter->exportData(['meta' => [], 'nodes' => [
+                ['id' => 'first', 'type' => 'class', 'label' => 'first'],
+            ], 'edges' => []], $path);
+            $first = GraphIndex::load($path);
+            $this->assertNotNull($first->node('first'));
+
+            $exporter->exportData(['meta' => [], 'nodes' => [
+                ['id' => 'other', 'type' => 'class', 'label' => 'other'],
+            ], 'edges' => []], $path);
+            $second = GraphIndex::load($path);
+
+            $this->assertNull($second->node('first'));
+            $this->assertNotNull($second->node('other'));
+        } finally {
+            GraphIndex::forget($path);
+            @unlink($path);
+            @rmdir($directory);
+        }
     }
 
     public function test_traverse_walks_calls_with_cycle_guard_and_confidence(): void

@@ -70,7 +70,7 @@ trait InteractsWithQueryEngine
     {
         $staleness = (new StalenessChecker(new FileFinder()))->check($path);
 
-        return ($staleness['newerSourceFiles'] ?? 0) > 0;
+        return (bool) ($staleness['stale'] ?? false) || ($staleness['newerSourceFiles'] ?? 0) > 0;
     }
 
     private function autoScan(): void

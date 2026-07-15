@@ -34,6 +34,7 @@ class Graph
 
     public function addEdge(Edge $edge): Edge
     {
+        $this->attachEvidence($edge);
         $key = $edge->key();
 
         if (isset($this->edges[$key])) {
@@ -43,6 +44,31 @@ class Graph
         $this->edges[$key] = $edge;
 
         return $edge;
+    }
+
+    private function attachEvidence(Edge $edge): void
+    {
+        $from = $this->nodes[$edge->from] ?? null;
+        $file = $edge->metadata['file'] ?? $from?->file;
+        $line = $edge->metadata['line'] ?? $from?->line;
+        $record = array_filter([
+            'file' => is_string($file) && $file !== '' ? $file : null,
+            'line' => is_int($line) ? $line : null,
+            'source' => $edge->metadata['source'] ?? null,
+            'rule' => $edge->metadata['rule'] ?? null,
+            'inference' => $edge->metadata['inference'] ?? null,
+            'syntax' => $edge->metadata['syntax'] ?? null,
+        ], static fn (mixed $value): bool => $value !== null && $value !== '');
+
+        if ($record === []) {
+            return;
+        }
+
+        $digest = substr(hash('sha256', json_encode($record, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)), 0, 8);
+        $key = sprintf('%09d:%s', $record['line'] ?? 0, $digest);
+        $edge->metadata['evidence'] ??= [];
+        $edge->metadata['evidence'][$key] = $record;
+        ksort($edge->metadata['evidence']);
     }
 
     public function hasNode(string $id): bool

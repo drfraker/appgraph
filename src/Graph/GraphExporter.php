@@ -44,8 +44,24 @@ class GraphExporter
             throw new RuntimeException("Unable to create AppGraph output directory [{$directory}].");
         }
 
-        if (file_put_contents($path, $json) === false) {
-            throw new RuntimeException("Unable to write AppGraph output file [{$path}].");
+        $temporary = tempnam($directory, '.appgraph-');
+
+        if ($temporary === false) {
+            throw new RuntimeException("Unable to create a temporary AppGraph output file in [{$directory}].");
+        }
+
+        try {
+            if (file_put_contents($temporary, $json, LOCK_EX) === false) {
+                throw new RuntimeException("Unable to write temporary AppGraph output file [{$temporary}].");
+            }
+
+            if (! rename($temporary, $path)) {
+                throw new RuntimeException("Unable to atomically replace AppGraph output file [{$path}].");
+            }
+        } finally {
+            if (is_file($temporary)) {
+                @unlink($temporary);
+            }
         }
 
         return $path;

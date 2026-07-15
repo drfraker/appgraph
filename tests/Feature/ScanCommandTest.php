@@ -46,6 +46,10 @@ class ScanCommandTest extends TestCase
         $graph = json_decode((string) file_get_contents($outputPath), true, flags: JSON_THROW_ON_ERROR);
 
         $this->assertSame('0.4.0', $graph['meta']['appgraphVersion']);
+        $this->assertSame(1, $graph['meta']['scan']['version']);
+        $this->assertSame('sha256', $graph['meta']['scan']['algorithm']);
+        $this->assertMatchesRegularExpression('/^[a-f0-9]{64}$/', $graph['meta']['scan']['fingerprint']);
+        $this->assertNotEmpty($graph['meta']['scan']['files']);
         $this->assertGraphHasNode($graph, 'route:PUT:/progress-notes/{note}', 'route');
         $this->assertGraphHasNode($graph, ProgressNoteController::class.'::update', 'method');
         $this->assertGraphHasNode($graph, 'table:progress_notes', 'table');

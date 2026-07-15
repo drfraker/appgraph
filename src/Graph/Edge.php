@@ -30,7 +30,14 @@ class Edge
         // out, recursively merge the rest, then union by key (first writer wins) + ksort.
         $ownOperations = $this->metadata['operations'] ?? [];
         $otherOperations = $edge->metadata['operations'] ?? [];
-        unset($this->metadata['operations'], $edge->metadata['operations']);
+        $ownEvidence = $this->metadata['evidence'] ?? [];
+        $otherEvidence = $edge->metadata['evidence'] ?? [];
+        unset(
+            $this->metadata['operations'],
+            $edge->metadata['operations'],
+            $this->metadata['evidence'],
+            $edge->metadata['evidence'],
+        );
 
         $this->metadata = array_replace_recursive($this->metadata, $edge->metadata);
 
@@ -39,6 +46,13 @@ class Edge
         if ($operations !== []) {
             ksort($operations);
             $this->metadata['operations'] = $operations;
+        }
+
+        $evidence = $ownEvidence + $otherEvidence;
+
+        if ($evidence !== []) {
+            ksort($evidence);
+            $this->metadata['evidence'] = $evidence;
         }
 
         return $this;

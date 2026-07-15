@@ -18,6 +18,7 @@ use AppGraph\Scanners\RouteScanner;
 use AppGraph\Scanners\SideEffectScanner;
 use AppGraph\Scanners\TestScanner;
 use AppGraph\Support\MemoryLimit;
+use AppGraph\Support\ScanFingerprint;
 use Illuminate\Console\Command;
 use Throwable;
 
@@ -45,6 +46,7 @@ class ScanCommand extends Command
         FrontendRouteScanner $frontendRouteScanner,
         TestScanner $testScanner,
         PolicyScanner $policyScanner,
+        ScanFingerprint $scanFingerprint,
         GraphExporter $exporter,
     ): int {
         MemoryLimit::ensure(config('appgraph.memory_limit', '256M'));
@@ -111,6 +113,10 @@ class ScanCommand extends Command
         if ($includePolicies) {
             $this->runScanner($graph, 'policies', fn () => $policyScanner->scan($graph));
         }
+
+        $graph->addMeta([
+            'scan' => $scanFingerprint->capture(),
+        ]);
 
         $path = $this->outputPath();
         $pretty = (bool) $this->option('pretty');

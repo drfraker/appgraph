@@ -60,6 +60,13 @@ The default output path is:
 storage/appgraph/appgraph.json
 ```
 
+Graph and overview files are replaced atomically, so concurrent readers never
+observe a partially written JSON document. Each graph also records a content-based
+scan manifest covering PHP, test, frontend, schema, Composer, configuration, and
+framework-analysis inputs. Freshness checks compare this fingerprint rather than
+depending only on filesystem modification times; older graphs without a manifest
+continue to use the legacy timestamp check.
+
 You can override it:
 
 ```bash
@@ -206,6 +213,9 @@ literal array; non-literal expressions degrade to `'{expr}'` placeholders with
 form-request nodes linked from the calling method with `validates_with`.
 
 Uncertain inferred relationships include a confidence score below `1.0` and explanatory metadata.
+Edges with source provenance also retain a deduplicated `metadata.evidence` map, so
+multiple call sites supporting the same `(from, to, type)` relationship are not lost
+when deterministic edge merging combines them.
 Call inference follows declared application return types and common Eloquent query/model
 results. It also carries model element types through common collection operations and
 untyped collection callbacks. Writes through abstract model parameters fan out to indexed concrete descendant tables at

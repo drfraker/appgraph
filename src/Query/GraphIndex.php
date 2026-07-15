@@ -8,7 +8,7 @@ use RuntimeException;
 class GraphIndex
 {
     /**
-     * @var array<string, array{mtime: int, index: self}>
+     * @var array<string, array{signature: string, index: self}>
      */
     private static array $cache = [];
 
@@ -41,9 +41,14 @@ class GraphIndex
             throw new RuntimeException("AppGraph graph not found at [{$path}]. Run `php artisan appgraph:scan` first.");
         }
 
-        $mtime = (int) filemtime($path);
+        clearstatcache(true, $path);
+        $signature = implode(':', [
+            (int) filemtime($path),
+            (int) filesize($path),
+            (int) fileinode($path),
+        ]);
 
-        if (isset(self::$cache[$path]) && self::$cache[$path]['mtime'] === $mtime) {
+        if (isset(self::$cache[$path]) && self::$cache[$path]['signature'] === $signature) {
             return self::$cache[$path]['index'];
         }
 
@@ -65,7 +70,7 @@ class GraphIndex
 
         $index = self::fromArray($graph, $path);
 
-        self::$cache = [$path => ['mtime' => $mtime, 'index' => $index]];
+        self::$cache = [$path => ['signature' => $signature, 'index' => $index]];
 
         return $index;
     }

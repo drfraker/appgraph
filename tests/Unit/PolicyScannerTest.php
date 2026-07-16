@@ -67,6 +67,9 @@ PHP);
         $controller = 'AppGraph\Tests\GeneratedPolicies\Http\Controllers\ProgressNoteController::sign';
         $policy = 'AppGraph\Tests\GeneratedPolicies\Policies\ProgressNotePolicy::sign';
         $this->assertGraphHasNode($array, 'AppGraph\Tests\GeneratedPolicies\Policies\ProgressNotePolicy', 'policy');
+        $policyNode = $this->graphNode($array, 'AppGraph\Tests\GeneratedPolicies\Policies\ProgressNotePolicy');
+        $this->assertSame(3, $policyNode['line']);
+        $this->assertSame(3, $policyNode['endLine']);
         $this->assertGraphHasEdge($array, $controller, $policy, 'authorizes_via');
         $this->assertGraphHasEdge(
             $array,

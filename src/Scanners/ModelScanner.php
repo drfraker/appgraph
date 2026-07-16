@@ -85,6 +85,7 @@ class ModelScanner
             'class' => $model->getShortName(),
             'file' => $this->files->relativePath($model->getFileName() ?: null),
             'line' => $model->getStartLine(),
+            'endLine' => $model->getEndLine() ?: null,
             'metadata' => [
                 'table' => $table,
                 'tableInference' => $metadata,

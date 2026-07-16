@@ -3,18 +3,10 @@
 namespace AppGraph\Query;
 
 use AppGraph\Graph\OverviewBuilder;
+use Illuminate\Container\Container;
 
 class QueryEngine
 {
-    /** @var array<int, string> */
-    private const FLOW_EXECUTION_EDGES = [
-        'calls',
-        'validates_with',
-        'framework_invokes',
-        'dispatches',
-        'handled_by',
-    ];
-
     /** @var array<string, array<int, string>> */
     private const FLOW_RELATED_GROUP_EDGE_TYPES = [
         'formRequests' => ['validates_with'],
@@ -35,10 +27,27 @@ class QueryEngine
 
     private const DEFAULT_MAX_RELATED_FACTS = 10000;
 
+    private LaravelExecutionSemantics $executionSemantics;
+
+    private FieldAccessClassifier $fieldAccessClassifier;
+
+    private string $basePath;
+
     public function __construct(
         private GraphIndex $index,
         private ?StalenessChecker $staleness = null,
+        ?string $basePath = null,
     ) {
+        $this->executionSemantics = new LaravelExecutionSemantics($index);
+        $this->fieldAccessClassifier = new FieldAccessClassifier;
+        $application = Container::getInstance();
+        $applicationBasePath = method_exists($application, 'basePath')
+            ? $application->basePath()
+            : null;
+        $this->basePath = $basePath
+            ?? (is_string($applicationBasePath) && $applicationBasePath !== ''
+                ? $applicationBasePath
+                : (getcwd() ?: '.'));
     }
 
     /**
@@ -90,6 +99,50 @@ class QueryEngine
         }
 
         return $this->envelope('overview', null, $payload);
+    }
+
+    /**
+     * Compile a bounded source-reading plan around an agent's concrete task.
+     * The token budget covers recommended source spans, not the JSON response,
+     * and source contents are never returned by this query.
+     *
+     * @param array<int, string> $targets
+     * @param array<int, string> $changedFiles
+     * @return array<string, mixed>
+     */
+    public function contextForTask(
+        string $task,
+        array $targets = [],
+        array $changedFiles = [],
+        int $tokenBudget = 4000,
+        int $depth = 4,
+        float $minConfidence = 0.0,
+    ): array {
+        $payload = (new TaskContextPlanner($this->index, $this->basePath))->plan(
+            $task,
+            $targets,
+            $changedFiles,
+            $tokenBudget,
+            $depth,
+            $minConfidence,
+        );
+        $truncated = (bool) $payload['truncated'];
+        unset($payload['truncated']);
+        $sourcePath = $this->index->sourcePath();
+
+        if ($this->staleness !== null && $sourcePath !== null) {
+            $meta = $this->index->meta();
+            $staleness = $this->staleness->check(
+                $sourcePath,
+                is_array($meta['scan'] ?? null) ? $meta['scan'] : null,
+            );
+
+            if ($staleness !== []) {
+                $payload['staleness'] = $staleness;
+            }
+        }
+
+        return $this->envelope('context-for-task', null, $payload, $truncated);
     }
 
     /**
@@ -241,6 +294,7 @@ class QueryEngine
 
         $truncated = $routeActionSelectionTruncated;
         $executionTraversalTruncated = false;
+        $executionMetadataTruncated = false;
         $actionReservationTruncated = false;
         $remainingTransitions = $maxTransitions;
         $methodSeeds = [[
@@ -283,23 +337,40 @@ class QueryEngine
         // crosses those nodes to reach framework-invoked application methods.
         $methodHits = $this->index->traverseFromSeeds(
             $methodSeeds,
-            self::FLOW_EXECUTION_EDGES,
+            $this->executionSemantics->executionEdgeTypes(),
             direction: 'out',
             maxDepth: $depth,
             minConfidence: $minConfidence,
             limit: max(1, $limit),
             resultNodeTypes: ['method'],
-            transition: fn (array $state, array $edge, string $neighborId, string $direction): array|false => $this->flowExecutionTransition(
-                $state,
-                $edge,
-                $neighborId,
-                $direction,
-            ),
+            transition: function (array $state, array $edge, string $neighborId, string $direction) use (&$executionMetadataTruncated, $minConfidence): array|false {
+                $transition = $this->executionSemantics->transition($state, $edge, $neighborId, $direction);
+                $pathConfidence = round(
+                    (float) ($state['confidence'] ?? 1.0) * (float) ($edge['confidence'] ?? 1.0),
+                    4,
+                );
+
+                if ($pathConfidence >= $minConfidence && ($edge['type'] ?? null) === 'dispatches') {
+                    $analysis = $this->executionSemantics->dispatchAnalysis(
+                        $edge,
+                        $this->index->node($neighborId),
+                    );
+                    $executionMetadataTruncated = $executionMetadataTruncated || $analysis['truncated'];
+                }
+
+                if ($pathConfidence >= $minConfidence
+                    && is_array($transition)
+                    && ($transition['metadataTruncated'] ?? false)) {
+                    $executionMetadataTruncated = true;
+                }
+
+                return $transition;
+            },
             maxTransitions: $remainingTransitions,
             truncated: $executionTraversalTruncated,
         );
 
-        $truncated = $truncated || $executionTraversalTruncated;
+        $truncated = $truncated || $executionTraversalTruncated || $executionMetadataTruncated;
 
         if (! in_array($entrypointId, array_column($methodHits, 'id'), true)) {
             $truncated = true;
@@ -453,7 +524,9 @@ class QueryEngine
             }
 
             $listeners = [];
-            $dispatchKinds = $this->dispatchKinds($edge, $related);
+            $dispatchAnalysis = $this->executionSemantics->dispatchAnalysis($edge, $related);
+            $dispatchKinds = $dispatchAnalysis['kinds'];
+            $executionMetadataTruncated = $executionMetadataTruncated || $dispatchAnalysis['truncated'];
 
             if ($includeDispatchDetails && in_array('event', $dispatchKinds, true)) {
                 // A listens_to edge records registration, not execution. A
@@ -512,7 +585,7 @@ class QueryEngine
                 'depth' => $hit['depth'],
                 'confidence' => $edgeConfidence,
                 'causalExecutionProven' => $dispatchKinds !== []
-                    && $this->dispatchCausalExecutionProven($edge),
+                    && $dispatchAnalysis['causalExecutionProven'],
             ];
 
             if ($includeDispatchDetails) {
@@ -529,7 +602,14 @@ class QueryEngine
                     'queue' => $dispatchMetadata['queue']
                         ?? (! $hasOccurrenceEvidence ? ($related['metadata']['queue'] ?? null) : null),
                     'queues' => $dispatchMetadata['queues'] ?? null,
-                    'occurrences' => $hasOccurrenceEvidence ? array_values($occurrences) : null,
+                    'occurrences' => $hasOccurrenceEvidence
+                        ? array_slice(
+                            array_values($occurrences),
+                            0,
+                            LaravelExecutionSemantics::MAX_DISPATCH_OCCURRENCES,
+                        )
+                        : null,
+                    'metadataTruncated' => $dispatchAnalysis['truncated'] ?: null,
                     'listeners' => $listeners ?: null,
                     'file' => $related['file'] ?? null,
                     'line' => $related['line'] ?? null,
@@ -547,6 +627,13 @@ class QueryEngine
         $analysisWarnings = $includeAnalysisWarnings
             ? $this->flowAnalysisWarnings(array_keys($methods))
             : [];
+
+        if ($includeAnalysisWarnings && $executionMetadataTruncated) {
+            $analysisWarnings[] = [
+                'reason' => 'dispatch_metadata_limit',
+                'message' => 'Laravel dispatch role metadata was bounded; omitted occurrences may hide additional causal handlers.',
+            ];
+        }
 
         if ($route !== null) {
             $incomingEdgeTypes = [];
@@ -638,9 +725,14 @@ class QueryEngine
             $truncated = true;
         }
 
+        if ($executionMetadataTruncated) {
+            $truncated = true;
+        }
+
         $truncation = array_filter([
             'routeActionSelection' => $routeActionSelectionTruncated ?: null,
             'executionTraversal' => $executionTraversalTruncated ?: null,
+            'executionMetadata' => $executionMetadataTruncated ?: null,
             'actionReservation' => $actionReservationTruncated ?: null,
             'relatedFacts' => $relatedFactsTruncated ? [
                 'maxRelatedFacts' => $maxRelatedFacts,
@@ -807,7 +899,7 @@ class QueryEngine
         $tableName = str_starts_with($tableId, 'table:') ? substr($tableId, 6) : $tableId;
 
         foreach ($this->index->edgesTo($tableId, [$edgeType]) as $edge) {
-            $classified = $this->classifyFieldOperations($edge, $field, $tableName);
+            $classified = $this->fieldAccessClassifier->classify($edge, $field, $tableName);
             $fromNode = $this->index->node($edge['from']);
             $row = array_filter([
                 'id' => $edge['from'],
@@ -855,112 +947,6 @@ class QueryEngine
             'matches' => $matches,
             'counts' => $counts,
         ], $truncated);
-    }
-
-    /**
-     * @param array<string, mixed> $edge
-     * @return array{match: string, ops: array<int, string>, fields: array<int, string>, provenOps: array<int, string>, possibleOps: array<int, string>, excludedOps: array<int, string>}
-     */
-    private function classifyFieldOperations(array $edge, string $field, string $table): array
-    {
-        $operations = $edge['metadata']['operations'] ?? [];
-
-        if ($operations === []) {
-            return [
-                'match' => 'possible',
-                'ops' => [],
-                'fields' => [],
-                'provenOps' => [],
-                'possibleOps' => [],
-                'excludedOps' => [],
-            ];
-        }
-
-        $classified = ['proven' => [], 'possible' => [], 'excluded' => []];
-        $allFields = [];
-
-        foreach ($operations as $operation) {
-            if (! is_array($operation)) {
-                continue;
-            }
-
-            $name = isset($operation['operation']) ? (string) $operation['operation'] : 'unknown';
-            $fields = array_values(array_filter(
-                $operation['fields'] ?? [],
-                static fn (mixed $value): bool => is_string($value) && $value !== '',
-            ));
-
-            foreach ($fields as $operationField) {
-                $allFields[$operationField] = $operationField;
-            }
-
-            $coverage = $operation['fieldCoverage'] ?? 'unknown';
-
-            if ($coverage === 'whole_row' || $this->fieldsProveColumn($fields, $field, $table)) {
-                $classified['proven'][$name] = $name;
-                continue;
-            }
-
-            if ($coverage !== 'complete' || $this->fieldsAreDynamic($fields)) {
-                $classified['possible'][$name] = $name;
-            } else {
-                $classified['excluded'][$name] = $name;
-            }
-        }
-
-        foreach ($classified as &$ops) {
-            sort($ops);
-            $ops = array_values($ops);
-        }
-        unset($ops);
-        sort($allFields);
-
-        $match = $classified['proven'] !== []
-            ? 'proven'
-            : ($classified['possible'] !== [] ? 'possible' : 'excluded');
-        $relevant = $match === 'proven'
-            ? [...$classified['proven'], ...$classified['possible']]
-            : $classified[$match];
-        $relevant = array_values(array_unique($relevant));
-        sort($relevant);
-
-        return [
-            'match' => $match,
-            'ops' => $relevant,
-            'fields' => array_values($allFields),
-            'provenOps' => $classified['proven'],
-            'possibleOps' => $classified['possible'],
-            'excludedOps' => $classified['excluded'],
-        ];
-    }
-
-    /** @param array<int, string> $fields */
-    private function fieldsProveColumn(array $fields, string $column, string $table): bool
-    {
-        foreach ($fields as $field) {
-            $root = preg_split('/\.|->/', $field, 2)[0] ?? $field;
-
-            if ($field === $column
-                || $root === $column
-                || $field === $table.'.'.$column
-                || str_starts_with($field, $table.'.'.$column.'->')) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /** @param array<int, string> $fields */
-    private function fieldsAreDynamic(array $fields): bool
-    {
-        foreach ($fields as $field) {
-            if (str_contains($field, '{dynamic}')) {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     /**
@@ -1200,166 +1186,6 @@ class QueryEngine
         }
 
         return array_values($types);
-    }
-
-    /**
-     * Keep a dual-role event/job class on the execution bridge selected by the
-     * dispatch occurrence that reached it. The state partition prevents a
-     * stronger event path from lending its confidence to a separate job path.
-     *
-     * @param array<string, mixed> $state
-     * @param array<string, mixed> $edge
-     * @return array<string, mixed>|false
-     */
-    private function flowExecutionTransition(array $state, array $edge, string $neighborId, string $direction): array|false
-    {
-        if ($direction !== 'out') {
-            return [];
-        }
-
-        if (($edge['type'] ?? null) === 'dispatches') {
-            if (! $this->dispatchCausalExecutionProven($edge)) {
-                return false;
-            }
-
-            $kinds = $this->dispatchKinds($edge, $this->index->node($neighborId));
-
-            // A dispatch bridge must resolve an actual event/job role. This
-            // also rejects malformed occurrence evidence and raw dispatches
-            // aimed at an ordinary method node.
-            if ($kinds === []) {
-                return false;
-            }
-
-            return [
-                'dispatchKinds' => $kinds,
-                'statePartition' => $kinds === [] ? '' : 'dispatch:'.implode(',', $kinds),
-            ];
-        }
-
-        if (($edge['type'] ?? null) !== 'handled_by') {
-            return [];
-        }
-
-        // A scanner may retain a declaration-only handler edge so agents can
-        // inspect configuration that is present in source but absent from the
-        // booted application. It must not become a causal execution path.
-        if (($edge['metadata']['causalExecutionProven'] ?? null) === false) {
-            return false;
-        }
-
-        $activeKinds = array_values(array_filter(
-            $state['dispatchKinds'] ?? [],
-            static fn (mixed $kind): bool => is_string($kind),
-        ));
-        $handlerKind = $edge['metadata']['kind'] ?? null;
-        $requiredDispatchKind = match ($handlerKind) {
-            'listener' => 'event',
-            'job' => 'job',
-            default => null,
-        };
-
-        if ($requiredDispatchKind !== null
-            && $activeKinds !== []
-            && ! in_array($requiredDispatchKind, $activeKinds, true)) {
-            return false;
-        }
-
-        return [
-            'dispatchKinds' => [],
-            'statePartition' => '',
-        ];
-    }
-
-    /** @param array<string, mixed> $edge */
-    private function dispatchCausalExecutionProven(array $edge): bool
-    {
-        $metadata = $edge['metadata'] ?? [];
-
-        if (($metadata['causalExecutionProven'] ?? null) === false) {
-            return false;
-        }
-
-        $occurrences = $metadata['dispatchOccurrences'] ?? null;
-
-        if (! is_array($occurrences) || $occurrences === []) {
-            return true;
-        }
-
-        foreach ($occurrences as $occurrence) {
-            if (! is_array($occurrence)) {
-                continue;
-            }
-
-            if (in_array($occurrence['kind'] ?? null, ['event', 'job'], true)
-                && ($occurrence['causalExecutionProven'] ?? null) !== false) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * @param array<string, mixed> $edge
-     * @param array<string, mixed>|null $target
-     * @return array<int, string>
-     */
-    private function dispatchKinds(array $edge, ?array $target): array
-    {
-        $metadata = $edge['metadata'] ?? [];
-        $kinds = [];
-        $occurrences = is_array($metadata['dispatchOccurrences'] ?? null)
-            ? $metadata['dispatchOccurrences']
-            : [];
-
-        if ($occurrences !== []) {
-            foreach ($occurrences as $occurrence) {
-                if (! is_array($occurrence)
-                    || ($occurrence['causalExecutionProven'] ?? null) === false) {
-                    continue;
-                }
-
-                $kind = $occurrence['kind'] ?? null;
-
-                if (is_string($kind) && in_array($kind, ['event', 'job'], true)) {
-                    $kinds[$kind] = $kind;
-                }
-            }
-
-            ksort($kinds);
-
-            return array_values($kinds);
-        }
-
-        foreach ($metadata['dispatchKinds'] ?? [] as $kind) {
-            if (is_string($kind) && in_array($kind, ['event', 'job'], true)) {
-                $kinds[$kind] = $kind;
-            }
-        }
-
-        if (is_string($metadata['kind'] ?? null)
-            && in_array($metadata['kind'], ['event', 'job'], true)) {
-            $kinds[$metadata['kind']] = $metadata['kind'];
-        }
-
-        $useTargetRoles = $kinds === [];
-
-        foreach ($target['metadata']['roles'] ?? [] as $role) {
-            if ($useTargetRoles && is_string($role) && in_array($role, ['event', 'job'], true)) {
-                $kinds[$role] = $role;
-            }
-        }
-
-        $targetType = $target['type'] ?? null;
-
-        if ($kinds === [] && is_string($targetType) && in_array($targetType, ['event', 'job'], true)) {
-            $kinds[$targetType] = $targetType;
-        }
-
-        ksort($kinds);
-
-        return array_values($kinds);
     }
 
     /**

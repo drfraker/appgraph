@@ -192,6 +192,7 @@ trait InteractsWithPhpAst
             'method' => $method,
             'file' => $record['file'],
             'line' => $record['line'],
+            'endLine' => $record['endLine'] ?? null,
             'signature' => $record['signature'],
             'inputs' => $record['inputs'],
             'outputs' => $record['outputs'],

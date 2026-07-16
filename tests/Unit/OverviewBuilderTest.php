@@ -6,10 +6,25 @@ use AppGraph\Graph\Edge;
 use AppGraph\Graph\Graph;
 use AppGraph\Graph\Node;
 use AppGraph\Graph\OverviewBuilder;
+use Illuminate\Container\Container;
 use PHPUnit\Framework\TestCase;
 
 class OverviewBuilderTest extends TestCase
 {
+    public function test_it_builds_when_the_global_container_is_not_a_laravel_application(): void
+    {
+        $previous = Container::getInstance();
+        Container::setInstance(new Container);
+
+        try {
+            $overview = (new OverviewBuilder)->build(new Graph);
+        } finally {
+            Container::setInstance($previous);
+        }
+
+        $this->assertSame([], $overview['routes']);
+    }
+
     public function test_it_builds_a_bounded_overview_projection(): void
     {
         $graph = new Graph([

@@ -110,6 +110,8 @@ PHP);
         $update = $this->graphNode($array, $namespace.'\UpdateNoteRequest');
 
         $this->assertSame('app/Http/Requests/UpdateNoteRequest.php', $update['file']);
+        $this->assertSame(9, $update['line']);
+        $this->assertSame(20, $update['endLine']);
         $this->assertSame([
             'body' => '{expr}',
             'status' => ['required', 'Enum'],

@@ -123,6 +123,7 @@ class InstallCommandTest extends TestCase
         $contents = (string) file_get_contents($this->guidelinesPath);
 
         $this->assertStringStartsWith('# Existing project instructions', $contents);
+        $this->assertStringContainsString('appgraph_context', $contents);
         $this->assertStringContainsString('appgraph_overview', $contents);
         $this->assertStringContainsString('flow-from', $contents);
         $this->assertSame(1, substr_count($contents, '<!-- >>> appgraph >>>'));

@@ -223,6 +223,7 @@ class EventFlowScanner
                         'node' => $method,
                         'file' => $relativeFile,
                         'line' => $method->getStartLine(),
+                        'endLine' => $method->getEndLine(),
                         'signature' => $this->methodSignature($method),
                         'inputs' => $this->methodInputs($method),
                         'outputs' => $this->methodOutputs($method),
@@ -249,6 +250,7 @@ class EventFlowScanner
                 'namespace' => $this->namespaceFromClass($class),
                 'file' => $relativeFile,
                 'line' => $statement->getStartLine(),
+                'endLine' => $statement->getEndLine(),
                 'extends' => $statement instanceof Stmt\Class_ ? $this->resolvedName($statement->extends) : null,
                 'declarationKind' => $statement instanceof Stmt\Trait_ ? 'trait' : 'class',
                 'abstract' => $statement instanceof Stmt\Class_ && $statement->isAbstract(),
@@ -279,6 +281,7 @@ class EventFlowScanner
                     'node' => $method,
                     'file' => $relativeFile,
                     'line' => $method->getStartLine(),
+                    'endLine' => $method->getEndLine(),
                     'signature' => $this->methodSignature($method),
                     'inputs' => $this->methodInputs($method),
                     'outputs' => $this->methodOutputs($method),
@@ -2011,6 +2014,7 @@ class EventFlowScanner
             'node' => null,
             'file' => $file,
             'line' => $method->getStartLine() ?: 1,
+            'endLine' => $method->getEndLine() ?: null,
             'signature' => $signature,
             'inputs' => $parameters,
             'outputs' => $returnType === null ? [] : [[
@@ -2625,6 +2629,7 @@ class EventFlowScanner
             'class' => class_basename($class),
             'file' => $record['file'] ?? null,
             'line' => $record['line'] ?? null,
+            'endLine' => $record['endLine'] ?? null,
             'metadata' => $metadata,
         ], static fn ($value): bool => $value !== null)));
 

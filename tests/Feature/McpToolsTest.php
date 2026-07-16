@@ -4,6 +4,7 @@ namespace AppGraph\Tests\Feature;
 
 use AppGraph\Graph\GraphExporter;
 use AppGraph\Mcp\AppGraphServer;
+use AppGraph\Mcp\Tools\ContextTool;
 use AppGraph\Mcp\Tools\OverviewTool;
 use AppGraph\Mcp\Tools\QueryTool;
 use AppGraph\Mcp\Tools\RefreshTool;
@@ -53,6 +54,116 @@ class McpToolsTest extends TestCase
                 ->where('meta.appName', 'Query Fixture App')
                 ->has('staleness.newerSourceFiles')
                 ->etc());
+    }
+
+    public function test_context_tool_compiles_task_specific_context(): void
+    {
+        AppGraphServer::tool(ContextTool::class, [
+            'task' => 'Update the note workflow safely',
+            'targets' => ['notes.update'],
+            'changed_files' => ['app/Services/NoteService.php'],
+            'token_budget' => 1024,
+            'depth' => 3,
+            'min_confidence' => 0.5,
+        ])
+            ->assertOk()
+            ->assertStructuredContent(fn (AssertableJson $json) => $json
+                ->where('query', 'context-for-task')
+                ->where('task', 'Update the note workflow safely')
+                ->has('seeds')
+                ->etc());
+    }
+
+    public function test_context_tool_preserves_valid_utf8_at_bounded_label_and_evidence_boundaries(): void
+    {
+        $boundaryText = str_repeat('x', 510).'🙂tail';
+        $expectedPrefix = str_repeat('x', 510);
+        $graph = $this->queryFixtureGraph();
+        $graph['nodes'][0]['label'] = $boundaryText;
+        $graph['edges'][0]['metadata']['evidence'] = [[
+            'file' => 'routes/web.php',
+            'line' => 12,
+            'rule' => $boundaryText,
+        ]];
+        (new GraphExporter())->exportData(
+            $graph,
+            storage_path(config('appgraph.output_path', 'appgraph/appgraph.json')),
+        );
+
+        AppGraphServer::tool(ContextTool::class, [
+            'task' => 'Inspect the note route',
+            'targets' => ['route:PUT:/notes/{note}'],
+        ])
+            ->assertOk()
+            ->assertStructuredContent(function (AssertableJson $json) use ($expectedPrefix): void {
+                $payload = json_decode(
+                    json_encode($json->toArray(), JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
+                    true,
+                    flags: JSON_THROW_ON_ERROR,
+                );
+                $route = collect($payload['seeds'])->firstWhere('id', 'route:PUT:/notes/{note}');
+                $path = collect($payload['paths'])->first(
+                    static fn (array $candidate): bool => in_array(
+                        'App\Http\Controllers\NoteController::update',
+                        $candidate['nodes'] ?? [],
+                        true,
+                    ),
+                );
+
+                $this->assertSame($expectedPrefix, $route['label']);
+                $this->assertSame($expectedPrefix, $path['edges'][0]['evidence'][0]['rule']);
+                $this->assertSame(1, preg_match('//u', $route['label']));
+                $this->assertSame(1, preg_match('//u', $path['edges'][0]['evidence'][0]['rule']));
+                $json->etc();
+            });
+    }
+
+    public function test_context_tool_advertises_explicit_input_bounds(): void
+    {
+        $schema = app(ContextTool::class)->toArray()['inputSchema'];
+
+        $this->assertContains('task', $schema['required']);
+        $this->assertSame(1, $schema['properties']['task']['minLength']);
+        $this->assertSame(4000, $schema['properties']['task']['maxLength']);
+        $this->assertSame(10, $schema['properties']['targets']['maxItems']);
+        $this->assertTrue($schema['properties']['targets']['uniqueItems']);
+        $this->assertSame(512, $schema['properties']['targets']['items']['maxLength']);
+        $this->assertSame(50, $schema['properties']['changed_files']['maxItems']);
+        $this->assertSame(1024, $schema['properties']['changed_files']['items']['maxLength']);
+        $this->assertSame(512, $schema['properties']['token_budget']['minimum']);
+        $this->assertSame(16000, $schema['properties']['token_budget']['maximum']);
+        $this->assertSame(1, $schema['properties']['depth']['minimum']);
+        $this->assertSame(6, $schema['properties']['depth']['maximum']);
+        $this->assertSame(0, $schema['properties']['min_confidence']['minimum']);
+        $this->assertSame(1, $schema['properties']['min_confidence']['maximum']);
+    }
+
+    public function test_context_tool_enforces_runtime_validation_bounds(): void
+    {
+        $invalidArguments = [
+            [],
+            ['task' => '   '],
+            ['task' => str_repeat('x', 4001)],
+            ['task' => 'Update notes', 'targets' => array_fill(0, 11, 'notes.update')],
+            ['task' => 'Update notes', 'targets' => ['notes.update', 'notes.update']],
+            ['task' => 'Update notes', 'targets' => [str_repeat('x', 513)]],
+            ['task' => 'Update notes', 'changed_files' => array_map(static fn (int $i): string => "app/File{$i}.php", range(1, 51))],
+            ['task' => 'Update notes', 'changed_files' => ['app/Note.php', 'app/Note.php']],
+            ['task' => 'Update notes', 'changed_files' => [str_repeat('x', 1025)]],
+            ['task' => 'Update notes', 'token_budget' => 511],
+            ['task' => 'Update notes', 'token_budget' => 16001],
+            ['task' => 'Update notes', 'depth' => 0],
+            ['task' => 'Update notes', 'depth' => 7],
+            ['task' => 'Update notes', 'min_confidence' => -0.01],
+            ['task' => 'Update notes', 'min_confidence' => 1.01],
+        ];
+
+        foreach ($invalidArguments as $arguments) {
+            AppGraphServer::tool(ContextTool::class, $arguments)->assertHasErrors();
+        }
+
+        AppGraphServer::tool(ContextTool::class, ['task' => str_repeat('🙂', 3000)])
+            ->assertOk();
     }
 
     public function test_search_tool_finds_nodes(): void

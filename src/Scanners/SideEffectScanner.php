@@ -111,6 +111,7 @@ class SideEffectScanner
                     'node' => $method,
                     'file' => $relativeFile,
                     'line' => $method->getStartLine(),
+                    'endLine' => $method->getEndLine(),
                     'signature' => $this->methodSignature($method),
                     'inputs' => $this->methodInputs($method),
                     'outputs' => $this->methodOutputs($method),

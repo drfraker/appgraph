@@ -23,6 +23,7 @@ class Node
         public array $outputs = [],
         public ?string $summary = null,
         public array $metadata = [],
+        public ?int $endLine = null,
     ) {
     }
 
@@ -45,6 +46,7 @@ class Node
             outputs: $attributes['outputs'] ?? [],
             summary: $attributes['summary'] ?? null,
             metadata: $attributes['metadata'] ?? [],
+            endLine: $attributes['endLine'] ?? null,
         );
     }
 
@@ -58,7 +60,7 @@ class Node
             $this->label = $node->label;
         }
 
-        foreach (['namespace', 'class', 'method', 'file', 'line', 'signature', 'summary'] as $property) {
+        foreach (['namespace', 'class', 'method', 'file', 'line', 'endLine', 'signature', 'summary'] as $property) {
             if ($this->{$property} === null && $node->{$property} !== null) {
                 $this->{$property} = $node->{$property};
             }
@@ -105,7 +107,7 @@ class Node
             'label' => $this->label,
         ];
 
-        foreach (['namespace', 'class', 'method', 'file', 'line', 'signature', 'summary'] as $key) {
+        foreach (['namespace', 'class', 'method', 'file', 'line', 'endLine', 'signature', 'summary'] as $key) {
             if ($this->{$key} !== null) {
                 $data[$key] = $this->{$key};
             }

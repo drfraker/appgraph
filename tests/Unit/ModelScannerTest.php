@@ -77,6 +77,10 @@ PHP);
         $this->assertGraphHasEdge($array, $modelId, 'table:progress_notes', 'uses_table');
         $this->assertGraphHasEdge($array, $modelId, $userId, 'belongs_to');
 
+        $model = $this->graphNode($array, $modelId);
+        $this->assertSame(7, $model['line']);
+        $this->assertSame(15, $model['endLine']);
+
         $edge = $this->graphEdge($array, $modelId, 'table:progress_notes', 'uses_table');
 
         $this->assertSame(1.0, $edge['confidence']);

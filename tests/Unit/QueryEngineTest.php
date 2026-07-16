@@ -3,6 +3,7 @@
 namespace AppGraph\Tests\Unit;
 
 use AppGraph\Query\GraphIndex;
+use AppGraph\Query\LaravelExecutionSemantics;
 use AppGraph\Query\QueryEngine;
 use AppGraph\Query\UnresolvedTargetException;
 use AppGraph\Tests\Support\BuildsQueryFixtureGraph;
@@ -1047,6 +1048,53 @@ class QueryEngineTest extends TestCase
         $this->assertNotContains($jobHandler, $methodIds);
         $this->assertSame('event', $dispatch['type']);
         $this->assertSame($listener, $dispatch['listeners'][0]['id']);
+    }
+
+    public function test_flow_from_reports_dispatch_roles_omitted_beyond_the_metadata_bound(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $action = 'App\\Http\\Controllers\\NoteController::update';
+        $message = 'App\\Messages\\TailOnlyMessage';
+        $handler = 'App\\Jobs\\TailOnlyMessage::handle';
+        $occurrences = array_fill(0, LaravelExecutionSemantics::MAX_DISPATCH_OCCURRENCES, [
+            'kind' => 'event',
+            'causalExecutionProven' => false,
+        ]);
+        $occurrences[] = ['kind' => 'job', 'causalExecutionProven' => true];
+        $graph['nodes'][] = [
+            'id' => $message,
+            'type' => 'event',
+            'label' => 'TailOnlyMessage',
+            'metadata' => ['roles' => ['event', 'job']],
+        ];
+        $graph['nodes'][] = ['id' => $handler, 'type' => 'method', 'label' => 'TailOnlyMessage::handle'];
+        $graph['edges'][] = [
+            'from' => $action,
+            'to' => $message,
+            'type' => 'dispatches',
+            'confidence' => 1.0,
+            'metadata' => ['dispatchOccurrences' => $occurrences],
+        ];
+        $graph['edges'][] = [
+            'from' => $message,
+            'to' => $handler,
+            'type' => 'handled_by',
+            'confidence' => 1.0,
+            'metadata' => ['kind' => 'job'],
+        ];
+
+        $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom('notes.update');
+        $dispatch = collect($flow['dispatches'])->firstWhere('id', $message);
+
+        $this->assertTrue($flow['truncated']);
+        $this->assertTrue($flow['truncation']['executionMetadata']);
+        $this->assertSame(
+            'dispatch_metadata_limit',
+            collect($flow['analysisWarnings'])->firstWhere('reason', 'dispatch_metadata_limit')['reason'],
+        );
+        $this->assertTrue($dispatch['metadataTruncated']);
+        $this->assertCount(LaravelExecutionSemantics::MAX_DISPATCH_OCCURRENCES, $dispatch['occurrences']);
+        $this->assertNotContains($handler, array_column($flow['methods'], 'id'));
     }
 
     public function test_flow_from_does_not_cross_a_dispatch_when_all_occurrences_are_non_causal(): void

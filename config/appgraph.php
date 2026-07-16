@@ -66,6 +66,17 @@ return [
     'query' => [
         'limit' => 50,
         'depth' => 4,
+
+        /*
+         * Task context budgets measure recommended source spans rather than
+         * response JSON. Internal hard ceilings still apply, so configuration
+         * can tune normal usage without making agent queries unbounded.
+         */
+        'context' => [
+            'token_budget' => 4000,
+            'depth' => 4,
+            'min_confidence' => 0.0,
+        ],
     ],
 
     'mcp' => [

@@ -15,9 +15,28 @@ class GraphSerializationTest extends TestCase
 
         $this->assertSame(['id', 'type', 'label'], array_keys($array));
         $this->assertArrayNotHasKey('namespace', $array);
+        $this->assertArrayNotHasKey('endLine', $array);
         $this->assertArrayNotHasKey('signature', $array);
         $this->assertArrayNotHasKey('inputs', $array);
         $this->assertArrayNotHasKey('metadata', $array);
+    }
+
+    public function test_node_serializes_and_merges_an_optional_end_line(): void
+    {
+        $graph = new Graph();
+        $graph->addNode(Node::make('A::m', 'method', 'A::m', [
+            'file' => 'app/A.php',
+            'line' => 10,
+        ]));
+        $graph->addNode(Node::make('A::m', 'method', 'A::m', [
+            'endLine' => 24,
+        ]));
+
+        $node = $graph->node('A::m');
+
+        $this->assertNotNull($node);
+        $this->assertSame(24, $node->endLine);
+        $this->assertSame(24, $node->toArray()['endLine']);
     }
 
     public function test_edge_to_array_omits_empty_metadata(): void

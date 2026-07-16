@@ -74,6 +74,144 @@ class QueryCommandTest extends TestCase
         $this->assertSame('notes', $payload['dataAccess'][0]['table']);
     }
 
+    public function test_context_for_task_accepts_task_targets_changed_files_and_budgets(): void
+    {
+        $payload = $this->runQuery([
+            'query' => 'context-for-task',
+            'target' => 'Update the note workflow safely',
+            '--context-target' => ['notes.update'],
+            '--changed-file' => ['app/Services/NoteService.php'],
+            '--token-budget' => '1024',
+            '--depth' => '3',
+            '--min-confidence' => '0.5',
+        ]);
+
+        $this->assertSame('context-for-task', $payload['query']);
+        $this->assertSame('Update the note workflow safely', $payload['task']);
+        $this->assertContains(
+            'route:PUT:/notes/{note}',
+            array_column($payload['seeds'], 'id'),
+        );
+    }
+
+    public function test_context_for_task_cli_preserves_valid_utf8_at_bounded_label_and_evidence_boundaries(): void
+    {
+        $boundaryText = str_repeat('x', 510).'🙂tail';
+        $expectedPrefix = str_repeat('x', 510);
+        $graph = $this->queryFixtureGraph();
+        $graph['nodes'][0]['label'] = $boundaryText;
+        $graph['edges'][0]['metadata']['evidence'] = [[
+            'file' => 'routes/web.php',
+            'line' => 12,
+            'rule' => $boundaryText,
+        ]];
+        (new GraphExporter())->exportData($graph, $this->graphPath);
+
+        $payload = $this->runQuery([
+            'query' => 'context-for-task',
+            'target' => 'Inspect the note route',
+            '--context-target' => ['route:PUT:/notes/{note}'],
+        ]);
+        $route = collect($payload['seeds'])->firstWhere('id', 'route:PUT:/notes/{note}');
+        $path = collect($payload['paths'])->first(
+            static fn (array $candidate): bool => in_array(
+                'App\Http\Controllers\NoteController::update',
+                $candidate['nodes'] ?? [],
+                true,
+            ),
+        );
+
+        $this->assertSame($expectedPrefix, $route['label']);
+        $this->assertSame($expectedPrefix, $path['edges'][0]['evidence'][0]['rule']);
+        $this->assertSame(1, preg_match('//u', $route['label']));
+        $this->assertSame(1, preg_match('//u', $path['edges'][0]['evidence'][0]['rule']));
+        $this->assertLessThanOrEqual(512, strlen($route['label']));
+        $this->assertLessThanOrEqual(512, strlen($path['edges'][0]['evidence'][0]['rule']));
+    }
+
+    public function test_context_for_task_rejects_invalid_scalar_options_with_json_errors(): void
+    {
+        $cases = [
+            ['--token-budget' => 'abc'],
+            ['--token-budget' => '511'],
+            ['--token-budget' => '16001'],
+            ['--depth' => '1.5'],
+            ['--depth' => '0'],
+            ['--depth' => '7'],
+            ['--min-confidence' => 'nope'],
+            ['--min-confidence' => '-0.01'],
+            ['--min-confidence' => '1.01'],
+        ];
+
+        foreach ($cases as $options) {
+            $payload = $this->runQuery([
+                'query' => 'context-for-task',
+                'target' => 'Update notes',
+                ...$options,
+            ], expectedExitCode: 1);
+
+            $this->assertArrayHasKey('error', $payload);
+        }
+    }
+
+    public function test_context_for_task_rejects_invalid_task_and_list_options(): void
+    {
+        $payload = $this->runQuery([
+            'query' => 'context-for-task',
+            'target' => '   ',
+        ], expectedExitCode: 1);
+        $this->assertStringContainsString('nonblank task description', $payload['error']);
+
+        $payload = $this->runQuery([
+            'query' => 'context-for-task',
+            'target' => str_repeat('x', 4001),
+        ], expectedExitCode: 1);
+        $this->assertStringContainsString('4000 characters', $payload['error']);
+
+        $payload = $this->runQuery([
+            'query' => 'context-for-task',
+            'target' => str_repeat('🙂', 3000),
+        ]);
+        $this->assertSame('context-for-task', $payload['query']);
+
+        $invalidLists = [
+            ['--context-target' => array_fill(0, 11, 'notes.update')],
+            ['--context-target' => ['notes.update', ' notes.update ']],
+            ['--context-target' => [str_repeat('x', 513)]],
+            ['--changed-file' => array_map(static fn (int $i): string => "app/File{$i}.php", range(1, 51))],
+            ['--changed-file' => ['app/Note.php', ' app/Note.php ']],
+            ['--changed-file' => [str_repeat('x', 1025)]],
+        ];
+
+        foreach ($invalidLists as $options) {
+            $payload = $this->runQuery([
+                'query' => 'context-for-task',
+                'target' => 'Update notes',
+                ...$options,
+            ], expectedExitCode: 1);
+
+            $this->assertArrayHasKey('error', $payload);
+        }
+    }
+
+    public function test_context_for_task_uses_bounded_configured_defaults(): void
+    {
+        config()->set('appgraph.query.context', [
+            'token_budget' => 1024,
+            'depth' => 2,
+            'min_confidence' => 0.5,
+        ]);
+
+        $payload = $this->runQuery([
+            'query' => 'context-for-task',
+            'target' => 'Inspect notes',
+            '--context-target' => ['notes.update'],
+        ]);
+
+        $this->assertSame(1024, $payload['budget']['requestedTokens']);
+        $this->assertSame(1024, $payload['budget']['effectiveTokens']);
+    }
+
     public function test_limit_and_min_confidence_options_are_applied(): void
     {
         $payload = $this->runQuery([
@@ -125,6 +263,9 @@ class QueryCommandTest extends TestCase
 
         $payload = $this->runQuery(['query' => 'writes-to'], expectedExitCode: 1);
         $this->assertStringContainsString('requires a target', $payload['error']);
+
+        $payload = $this->runQuery(['query' => 'context-for-task'], expectedExitCode: 1);
+        $this->assertStringContainsString('requires a nonblank task description', $payload['error']);
     }
 
     /**

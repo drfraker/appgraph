@@ -111,6 +111,7 @@ php artisan appgraph:query <query> [target] [--limit=50] [--depth=4] [--min-conf
 | Query | Target | Answers |
 |---|---|---|
 | `overview` | — | Counts by node/edge type, graph age, files changed since scan |
+| `context-for-task` | task description | Ranked graph seeds, causal paths, token-budgeted source spans, mapped tests, and explicit uncertainty (`--context-target=*`, `--changed-file=*`, `--token-budget=4000`) |
 | `search` | substring | Find node ids by id/label match (`--type` to filter) |
 | `node` | any id | One node plus its in/out edges (`--full` for metadata) |
 | `flow-from` | route name/id/label or `Class::method` | Feature slice: middleware, calls, validation, policies, models, field-level data access, events/jobs, side effects, frontend consumers, tests, and resolution warnings |
@@ -132,6 +133,37 @@ For feature work, start from the HTTP entry point:
 ```bash
 php artisan appgraph:query flow-from notes.update --pretty
 ```
+
+For agent-driven feature work or refactoring, let AppGraph compile the first read set:
+
+```bash
+php artisan appgraph:query context-for-task "Add auditing to note updates" \
+    --context-target=notes.update \
+    --changed-file=app/Services/NoteService.php \
+    --token-budget=4000 \
+    --pretty
+```
+
+`context-for-task` combines explicit targets, nodes in changed files, exact identifiers,
+and bounded lexical matches. It follows Laravel's executable route, middleware,
+FormRequest, call, event, job, and active-handler bridges in both directions, then adds
+models, policies, data access, schema, side effects, and mapped tests as ranked context.
+The budget estimates the source spans an agent should read with
+`ceil(UTF-8 bytes / 4)`; source text is never embedded in the response. Exact scanner
+end lines are preferred, while older graphs receive visibly approximate bounded spans.
+Source planning refuses files above 2 MB, limits each span to 200 lines and 1,200
+estimated tokens, and reports every capacity omission through `omitted`, `uncertainties`,
+and the top-level `truncated` flag. Edge evidence is likewise bounded and marked when
+additional provenance exists.
+
+Shared tables are not traversal hubs: a table reached downstream from one method stays
+a leaf and cannot pull unrelated readers or writers into the task. An explicitly supplied
+table or column may open that reverse fan-out; column targets retain the same
+`proven`/`possible`/`excluded` field certainty used by reader/writer queries. Ambiguous
+targets, stale graphs, approximate spans, and absent static test mappings are reported as
+uncertainties rather than silently guessed or described as missing runtime coverage.
+When one test maps to several relevant routes, the strongest route remains in `route`
+and the complete bounded mapping is retained in `routes`.
 
 ```bash
 php artisan appgraph:query impact-of progress_notes.title --pretty
@@ -155,7 +187,10 @@ php artisan appgraph:query impact-of progress_notes.title --pretty
 }
 ```
 
-Confidence values multiply along multi-hop paths — treat them as a ranking heuristic for how certain the static analysis is, not a probability. Filter noise with `--min-confidence`.
+Confidence values multiply along multi-hop paths — treat them as a ranking heuristic for how certain the static analysis is, not a probability. `--min-confidence` applies to
+accumulated graph-edge confidence (rounded to four decimals); task/seed relevance ranks
+surviving paths separately, so a lexically modest but strongly supported path is not
+discarded merely for wording. Filter weak graph support with `--min-confidence`.
 Traversal keeps the strongest supported path to each node, even when it is longer
 than a weak direct edge. Complete path queries can retain several distinct ranked
 paths using confidence, evidence diversity, depth, and deterministic path ordering.
@@ -180,8 +215,13 @@ runtime code coverage or prove that every branch is exercised.
 
 The MCP server is built in — [laravel/mcp](https://laravel.com/docs/mcp) is a hard
 dependency, so there is nothing extra to install. AppGraph exposes native agent tools:
-`appgraph_overview`, `appgraph_search`, `appgraph_node`, `appgraph_query`, and
-`appgraph_refresh`.
+`appgraph_context`, `appgraph_overview`, `appgraph_search`, `appgraph_node`,
+`appgraph_query`, and `appgraph_refresh`.
+
+Use `appgraph_context` first for a concrete feature or refactor. It accepts `task`, up to
+10 optional `targets`, up to 50 optional `changed_files`, a 512–16000 source-reading
+`token_budget`, traversal `depth` from 1–6, and `min_confidence` from 0–1. The same
+defaults are configurable under `appgraph.query.context`.
 
 Register it with your editor/agent once:
 
@@ -295,7 +335,7 @@ the config.
 
 ## Roadmap
 
-- Incremental rescan via per-file content hashes
+- Persistent SQLite/FTS graph storage and generation-to-generation change queries
 - Blade/Livewire view edges, Pest closure tests, scheduler entries
 - Runtime coverage integration for branch-level test evidence
 - Agent benchmark harness (tokens/turns/accuracy with vs. without AppGraph)

@@ -93,6 +93,7 @@ class PolicyScanner
             $this->classes[$class] = [
                 'file' => $file,
                 'line' => $statement->getStartLine(),
+                'endLine' => $statement->getEndLine(),
                 'extends' => $this->resolvedName($statement->extends),
                 'policy' => str_starts_with($file, 'app/Policies/') || str_contains('\\'.$class, '\\Policies\\'),
                 'model' => str_starts_with($file, 'app/Models/') || str_contains('\\'.$class, '\\Models\\'),
@@ -107,6 +108,7 @@ class PolicyScanner
                     'node' => $method,
                     'file' => $file,
                     'line' => $method->getStartLine(),
+                    'endLine' => $method->getEndLine(),
                     'signature' => $this->methodSignature($method),
                     'inputs' => $this->methodInputs($method),
                     'outputs' => $this->methodOutputs($method),
@@ -315,6 +317,7 @@ class PolicyScanner
         $graph->addNode(GraphNode::make($policy, 'policy', class_basename($policy), [
             'file' => $this->classes[$policy]['file'] ?? null,
             'line' => $this->classes[$policy]['line'] ?? null,
+            'endLine' => $this->classes[$policy]['endLine'] ?? null,
         ]));
         $graph->addNode($this->methodNode($policy, $ability, $this->methods[$policy][$ability]));
         $graph->addEdge(new Edge($target, $policy, 'defined_in'));

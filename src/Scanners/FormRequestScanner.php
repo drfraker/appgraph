@@ -118,6 +118,7 @@ class FormRequestScanner
                 'class' => $record['shortName'],
                 'file' => $record['file'],
                 'line' => $record['line'],
+                'endLine' => $record['endLine'],
                 // No 'source' key: when RouteScanner already created this node from a
                 // typed controller parameter, merging must not clobber that provenance.
                 'metadata' => array_filter([
@@ -387,6 +388,7 @@ class FormRequestScanner
                 'namespace' => $this->namespaceFromClass($class),
                 'file' => $relativeFile,
                 'line' => $statement->getStartLine(),
+                'endLine' => $statement->getEndLine(),
                 'traits' => $this->usedTraits($statement),
                 'traitUses' => $this->traitUses($statement),
             ];
@@ -408,6 +410,7 @@ class FormRequestScanner
                     'node' => $method,
                     'file' => $relativeFile,
                     'line' => $method->getStartLine(),
+                    'endLine' => $method->getEndLine(),
                     'signature' => $this->methodSignature($method),
                     'inputs' => $this->methodInputs($method),
                     'outputs' => $this->methodOutputs($method),

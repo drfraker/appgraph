@@ -595,6 +595,60 @@ class GraphIndexTest extends TestCase
         $this->assertSame([], $filteredSeeds);
     }
 
+    public function test_seeded_traversal_caps_and_sanitizes_supplied_edge_histories_with_explicit_omissions(): void
+    {
+        $history = [];
+
+        for ($edge = 0; $edge < 100; $edge++) {
+            $history[] = [
+                'from' => "Node{$edge}",
+                'to' => 'Node'.($edge + 1),
+                'type' => 'calls',
+                'confidence' => 0.9,
+                'unbounded' => str_repeat('discard-me', 100),
+                'metadata' => [
+                    'unbounded' => str_repeat('discard-me', 100),
+                    'evidence' => [
+                        ['file' => 'app/Action.php', 'line' => $edge + 1, 'rule' => 'call', 'secret' => 'discard-me'],
+                        ['source' => 'reflection'],
+                        ['syntax' => 'method_call'],
+                    ],
+                ],
+            ];
+        }
+
+        $results = GraphIndex::fromArray([
+            'meta' => [],
+            'nodes' => [
+                ['id' => 'Seed', 'type' => 'method', 'label' => 'Seed'],
+            ],
+            'edges' => [],
+        ])->traverseFromSeeds(
+            [['id' => 'Seed', 'edges' => $history]],
+            [],
+            includeEdges: true,
+            maxEvidencePerEdge: 1,
+        );
+
+        $this->assertCount(1, $results);
+        $this->assertCount(64, $results[0]['edges']);
+        $this->assertSame(36, $results[0]['edgesOmitted']);
+        $this->assertSame([
+            'from' => 'Node0',
+            'to' => 'Node1',
+            'type' => 'calls',
+            'confidence' => 0.9,
+            'evidence' => [[
+                'file' => 'app/Action.php',
+                'line' => 1,
+                'rule' => 'call',
+            ]],
+            'evidenceOmitted' => 2,
+        ], $results[0]['edges'][0]);
+        $this->assertArrayNotHasKey('metadata', $results[0]['edges'][0]);
+        $this->assertArrayNotHasKey('unbounded', $results[0]['edges'][0]);
+    }
+
     public function test_top_paths_returns_distinct_complete_paths_in_rank_order_and_ignores_cycles(): void
     {
         $graph = [
@@ -758,5 +812,24 @@ class GraphIndexTest extends TestCase
 
         $this->assertNull($index->resolveId('DoesNotExist')['id']);
         $this->assertSame([], $index->resolveId('DoesNotExist')['candidates']);
+    }
+
+    public function test_resolve_id_bounds_large_ambiguity_buckets(): void
+    {
+        $nodes = [];
+
+        for ($index = 0; $index < 12; $index++) {
+            $nodes[] = [
+                'id' => sprintf('App\\Shared\\Candidate%02d', $index),
+                'type' => 'class',
+                'label' => 'Shared',
+            ];
+        }
+
+        $resolved = GraphIndex::fromArray(['nodes' => $nodes, 'edges' => []])->resolveId('Shared');
+
+        $this->assertNull($resolved['id']);
+        $this->assertCount(10, $resolved['candidates']);
+        $this->assertTrue($resolved['candidatesTruncated']);
     }
 }

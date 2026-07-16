@@ -359,6 +359,14 @@ PHP);
         $this->assertGraphHasNode($array, $ns.'\Jobs\GenerateSuperbill', 'job');
         $this->assertGraphHasNode($array, $ns.'\Jobs\RefreshIndex', 'job');
 
+        $savedEvent = $this->graphNode($array, $ns.'\Events\NoteSaved');
+        $this->assertSame(7, $savedEvent['line']);
+        $this->assertSame(10, $savedEvent['endLine']);
+
+        $syncJob = $this->graphNode($array, $ns.'\Jobs\SyncNote');
+        $this->assertSame(9, $syncJob['line']);
+        $this->assertSame(22, $syncJob['endLine']);
+
         $this->assertGraphHasEdge($array, $ns.'\Jobs\SyncNote', $ns.'\Jobs\SyncNote::handle', 'handled_by');
         $this->assertGraphHasEdge($array, $ns.'\Jobs\GenerateSuperbill', $ns.'\Jobs\GenerateSuperbill::handle', 'handled_by');
         $this->assertGraphHasEdge($array, $ns.'\Jobs\RefreshIndex', $ns.'\Jobs\RefreshIndex::__invoke', 'handled_by');
@@ -483,6 +491,11 @@ PHP);
         $this->assertSame(0.9, $observeCall['confidence']);
         $this->assertSame('observe_call', $observeCall['metadata']['source']);
         $this->assertGraphHasNode($array, $ns.'\Models\Tag', 'model');
+
+        $observerNode = $this->graphNode($array, $ns.'\Observers\NoteObserver');
+        $this->assertSame('class', $observerNode['type']);
+        $this->assertSame(5, $observerNode['line']);
+        $this->assertSame(10, $observerNode['endLine']);
 
         foreach ($array['edges'] as $edge) {
             $this->assertNotNull($this->graphNode($array, $edge['from']), "Missing edge source [{$edge['from']}].");

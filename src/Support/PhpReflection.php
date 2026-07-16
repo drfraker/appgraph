@@ -67,6 +67,7 @@ class PhpReflection
             'class' => $class->getShortName(),
             'file' => $this->files->relativePath($class->getFileName() ?: null),
             'line' => $class->getStartLine(),
+            'endLine' => $class->getEndLine(),
             'metadata' => [
                 'abstract' => $class->isAbstract(),
             ],
@@ -83,6 +84,7 @@ class PhpReflection
             'method' => $method->getName(),
             'file' => $this->files->relativePath($method->getFileName() ?: null),
             'line' => $method->getStartLine(),
+            'endLine' => $method->getEndLine(),
             'signature' => $this->methodSignature($method),
             'inputs' => $this->methodInputs($method),
             'outputs' => $this->methodOutputs($method),

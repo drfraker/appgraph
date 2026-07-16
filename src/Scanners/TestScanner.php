@@ -120,6 +120,7 @@ class TestScanner
                     'method' => $methodName,
                     'file' => $file,
                     'line' => $method->getStartLine(),
+                    'endLine' => $method->getEndLine(),
                 ]));
 
                 foreach ($method->stmts ?? [] as $methodStatement) {

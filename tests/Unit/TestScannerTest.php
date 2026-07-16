@@ -68,5 +68,7 @@ PHP);
         $this->assertGraphHasEdge($array, 'test:'.$class.'::literal_route', $routeId, 'tests_route');
         $namedRoute = $this->graphEdge($array, 'test:'.$class.'::test_named_route', $routeId, 'tests_route');
         $this->assertStringContainsString('routeForTenant', $namedRoute['metadata']['helper']);
+        $this->assertSame(12, $this->graphNode($array, 'test:'.$class.'::test_named_route')['endLine']);
+        $this->assertSame(18, $this->graphNode($array, 'test:'.$class.'::literal_route')['endLine']);
     }
 }

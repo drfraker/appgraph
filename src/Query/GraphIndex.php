@@ -2,11 +2,16 @@
 
 namespace AppGraph\Query;
 
+use AppGraph\Support\BoundedText;
 use JsonException;
 use RuntimeException;
 
 class GraphIndex
 {
+    private const MAX_INCLUDED_SEED_EDGES = 64;
+
+    private const MAX_SUFFIXES_PER_ID = 64;
+
     /**
      * @var array<string, array{signature: string, index: self}>
      */
@@ -21,6 +26,10 @@ class GraphIndex
      * @param array<string, mixed> $meta
      * @param array<string, array<string, mixed>> $nodesById
      * @param array<string, array<int, string>> $nodeIdsByType
+     * @param array<string, array<int, string>> $nodeIdsByFile
+     * @param array<string, array<int, string>> $nodeIdsByLabel
+     * @param array<string, array<int, string>> $nodeIdsByName
+     * @param array<string, array<int, string>> $nodeIdsBySuffix
      * @param array<string, array<int, array<string, mixed>>> $outEdges
      * @param array<string, array<int, array<string, mixed>>> $inEdges
      * @param array<string, array<string, array<int, array<string, mixed>>>> $rankedOutEdges
@@ -30,6 +39,10 @@ class GraphIndex
         private array $meta,
         private array $nodesById,
         private array $nodeIdsByType,
+        private array $nodeIdsByFile,
+        private array $nodeIdsByLabel,
+        private array $nodeIdsByName,
+        private array $nodeIdsBySuffix,
         private array $outEdges,
         private array $inEdges,
         private array $rankedOutEdges,
@@ -86,15 +99,78 @@ class GraphIndex
     {
         $nodesById = [];
         $nodeIdsByType = [];
+        $nodeIdsByFile = [];
+        $nodeIdsByLabel = [];
+        $nodeIdsByName = [];
+        $nodeIdsBySuffix = [];
 
         foreach ($graph['nodes'] ?? [] as $node) {
-            if (! is_array($node) || ! isset($node['id'], $node['type'])) {
+            if (! is_array($node)
+                || ! is_string($node['id'] ?? null)
+                || $node['id'] === ''
+                || ! is_string($node['type'] ?? null)
+                || $node['type'] === '') {
                 continue;
             }
 
             $nodesById[$node['id']] = $node;
             $nodeIdsByType[$node['type']][] = $node['id'];
+
+            if (is_string($node['file'] ?? null)
+                && $node['file'] !== ''
+                && strlen($node['file']) <= 4096) {
+                $nodeIdsByFile[str_replace('\\', '/', $node['file'])][] = $node['id'];
+            }
         }
+
+        ksort($nodesById);
+
+        foreach ($nodesById as $id => $node) {
+            if (strlen($id) <= 2048
+                && isset($node['label'])
+                && is_scalar($node['label'])
+                && strlen((string) $node['label']) <= 2048) {
+                $nodeIdsByLabel[strtolower((string) $node['label'])][] = $id;
+            }
+
+            if (strlen($id) <= 2048
+                && isset($node['metadata']['name'])
+                && is_scalar($node['metadata']['name'])
+                && strlen((string) $node['metadata']['name']) <= 2048) {
+                $nodeIdsByName[strtolower((string) $node['metadata']['name'])][] = $id;
+            }
+
+            $offset = 0;
+            $suffixes = 0;
+
+            while (strlen($id) <= 2048
+                && $suffixes < self::MAX_SUFFIXES_PER_ID
+                && ($separator = strpos($id, '\\', $offset)) !== false) {
+                $suffix = substr($id, $separator + 1);
+
+                if ($suffix !== '') {
+                    $nodeIdsBySuffix[$suffix][] = $id;
+                    $suffixes++;
+                }
+
+                $offset = $separator + 1;
+            }
+        }
+
+        foreach ($nodeIdsByFile as &$ids) {
+            usort($ids, static fn (string $left, string $right): int => [
+                is_int($nodesById[$left]['line'] ?? null) ? $nodesById[$left]['line'] : PHP_INT_MAX,
+                $left,
+            ] <=> [
+                is_int($nodesById[$right]['line'] ?? null) ? $nodesById[$right]['line'] : PHP_INT_MAX,
+                $right,
+            ]);
+        }
+        unset($ids);
+        ksort($nodeIdsByFile);
+        ksort($nodeIdsByLabel);
+        ksort($nodeIdsByName);
+        ksort($nodeIdsBySuffix);
 
         $outEdges = [];
         $inEdges = [];
@@ -103,7 +179,10 @@ class GraphIndex
         $edgeCount = 0;
 
         foreach ($graph['edges'] ?? [] as $edge) {
-            if (! is_array($edge) || ! isset($edge['from'], $edge['to'], $edge['type'])) {
+            if (! is_array($edge)
+                || ! is_string($edge['from'] ?? null)
+                || ! is_string($edge['to'] ?? null)
+                || ! is_string($edge['type'] ?? null)) {
                 continue;
             }
 
@@ -134,6 +213,10 @@ class GraphIndex
             meta: $graph['meta'] ?? [],
             nodesById: $nodesById,
             nodeIdsByType: $nodeIdsByType,
+            nodeIdsByFile: $nodeIdsByFile,
+            nodeIdsByLabel: $nodeIdsByLabel,
+            nodeIdsByName: $nodeIdsByName,
+            nodeIdsBySuffix: $nodeIdsBySuffix,
             outEdges: $outEdges,
             inEdges: $inEdges,
             rankedOutEdges: $rankedOutEdges,
@@ -165,6 +248,22 @@ class GraphIndex
     }
 
     /**
+     * Iterate every indexed node without copying the graph into a second array.
+     *
+     * Task-oriented discovery intentionally performs one bounded scoring pass
+     * over this generator. A future persistent GraphStore can satisfy the same
+     * contract without changing query consumers.
+     *
+     * @return iterable<string, array<string, mixed>>
+     */
+    public function nodes(): iterable
+    {
+        foreach ($this->nodesById as $id => $node) {
+            yield $id => $node;
+        }
+    }
+
+    /**
      * @return array<int, array<string, mixed>>
      */
     public function nodesOfType(string $type): array
@@ -173,6 +272,71 @@ class GraphIndex
             fn (string $id): array => $this->nodesById[$id],
             $this->nodeIdsByType[$type] ?? []
         );
+    }
+
+    /**
+     * Return a deterministic bounded set of nodes declared in one graph file.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function nodesInFile(
+        string $file,
+        int $limit,
+        bool &$truncated = false,
+        ?int &$total = null,
+    ): array {
+        $file = str_replace('\\', '/', $file);
+        $ids = $this->nodeIdsByFile[$file] ?? [];
+        $total = count($ids);
+        $limit = max(0, $limit);
+
+        if ($total > $limit) {
+            $truncated = true;
+        }
+
+        return array_map(
+            fn (string $id): array => $this->nodesById[$id],
+            array_slice($ids, 0, $limit),
+        );
+    }
+
+    /**
+     * Sample a bounded set across the full deterministic file index. This keeps
+     * large classes representative without copying every node into query state.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function sampledNodesInFile(
+        string $file,
+        int $limit,
+        bool &$truncated = false,
+        ?int &$total = null,
+    ): array {
+        $file = str_replace('\\', '/', $file);
+        $ids = $this->nodeIdsByFile[$file] ?? [];
+        $total = count($ids);
+        $limit = max(0, $limit);
+
+        if ($total > $limit) {
+            $truncated = true;
+        }
+
+        if ($limit === 0 || $total === 0) {
+            return [];
+        }
+
+        if ($total <= $limit || $limit === 1) {
+            $selected = $limit === 1 ? [$ids[0]] : $ids;
+        } else {
+            $selected = [];
+
+            for ($position = 0; $position < $limit; $position++) {
+                $index = intdiv($position * ($total - 1), $limit - 1);
+                $selected[] = $ids[$index];
+            }
+        }
+
+        return array_map(fn (string $id): array => $this->nodesById[$id], $selected);
     }
 
     public function nodeCount(): int
@@ -385,6 +549,9 @@ class GraphIndex
             [$startId => true],
             null,
             $maxTransitions,
+            false,
+            0,
+            null,
             $truncated,
         );
     }
@@ -399,7 +566,7 @@ class GraphIndex
      * synthetic node or allowing intermediate event/request nodes to consume a
      * method-result limit.
      *
-     * @param array<int, array{id: string, confidence?: float, via?: string, edgeType?: string, path?: array<int, string>, statePartition?: scalar}> $seeds
+     * @param array<int, array{id: string, confidence?: float, graphConfidence?: float, via?: string, edgeType?: string, path?: array<int, string>, edges?: array<int, array<string, mixed>>, statePartition?: scalar}> $seeds
      * @param array<int, string> $edgeTypes
      * @param array<int, string>|null $resultNodeTypes
      * @param callable(array<string, mixed>, array<string, mixed>, string, string):(array<string, mixed>|false)|null $transition
@@ -417,6 +584,9 @@ class GraphIndex
         ?callable $transition = null,
         bool &$truncated = false,
         ?int $maxTransitions = null,
+        bool $includeEdges = false,
+        int $maxEvidencePerEdge = 3,
+        ?int $maxEvidenceKindsPerEdge = null,
     ): array {
         $seedStates = [];
 
@@ -438,6 +608,35 @@ class GraphIndex
 
             if (array_key_exists('statePartition', $seed) && is_scalar($seed['statePartition'])) {
                 $state['statePartition'] = $seed['statePartition'];
+            }
+
+            if (isset($seed['graphConfidence']) && is_numeric($seed['graphConfidence'])) {
+                $state['graphConfidence'] = round((float) $seed['graphConfidence'], 4);
+            }
+
+            if ($includeEdges) {
+                $state['edges'] = [];
+                $suppliedEdges = is_array($seed['edges'] ?? null) ? $seed['edges'] : [];
+                $examined = 0;
+
+                foreach ($suppliedEdges as $edge) {
+                    $examined++;
+
+                    if (is_array($edge)) {
+                        $state['edges'][] = $this->compactTraversalEdge($edge, max(0, $maxEvidencePerEdge));
+                    }
+
+                    if (count($state['edges']) >= self::MAX_INCLUDED_SEED_EDGES
+                        || $examined >= self::MAX_INCLUDED_SEED_EDGES * 4) {
+                        break;
+                    }
+                }
+
+                $edgesOmitted = max(0, count($suppliedEdges) - count($state['edges']));
+
+                if ($edgesOmitted > 0) {
+                    $state['edgesOmitted'] = $edgesOmitted;
+                }
             }
 
             if ($state['confidence'] < $minConfidence) {
@@ -462,6 +661,9 @@ class GraphIndex
             [],
             $transition,
             $maxTransitions,
+            $includeEdges,
+            max(0, $maxEvidencePerEdge),
+            $maxEvidenceKindsPerEdge === null ? null : max(0, $maxEvidenceKindsPerEdge),
             $truncated,
         );
     }
@@ -486,6 +688,9 @@ class GraphIndex
         array $excludedResultIds,
         ?callable $transition,
         ?int $maxTransitions,
+        bool $includeEdges,
+        int $maxEvidencePerEdge,
+        ?int $maxEvidenceKindsPerEdge,
         bool &$truncated,
     ): array {
         $resultsById = [];
@@ -547,6 +752,9 @@ class GraphIndex
                 $direction,
                 $minConfidence,
                 $transition,
+                $includeEdges,
+                $maxEvidencePerEdge,
+                $maxEvidenceKindsPerEdge,
             );
 
             if ($candidate === false) {
@@ -610,6 +818,9 @@ class GraphIndex
                     $direction,
                     $minConfidence,
                     $transition,
+                    $includeEdges,
+                    $maxEvidencePerEdge,
+                    $maxEvidenceKindsPerEdge,
                 ) !== false) {
                     $truncated = true;
 
@@ -809,6 +1020,9 @@ class GraphIndex
         string $direction,
         float $minConfidence,
         ?callable $transition,
+        bool $includeEdges,
+        int $maxEvidencePerEdge,
+        ?int $maxEvidenceKindsPerEdge,
     ): array|false {
         $transitionState = [];
 
@@ -839,9 +1053,19 @@ class GraphIndex
             'path' => [...$state['path'], $neighborId],
             'evidenceKinds' => $this->mergeEvidenceKinds(
                 $state['evidenceKinds'] ?? [],
-                $this->edgeEvidenceKinds($edge),
+                $this->edgeEvidenceKinds($edge, $maxEvidenceKindsPerEdge),
             ),
         ] + $transitionState;
+
+        if ($includeEdges) {
+            $compactEdge = $this->compactTraversalEdge($edge, $maxEvidencePerEdge);
+            $candidate['edges'] = [
+                ...($state['edges'] ?? []),
+                $compactEdge,
+            ];
+            $candidate['edgesOmitted'] = (int) ($state['edgesOmitted'] ?? 0);
+        }
+
         $candidate['evidenceCount'] = count($candidate['evidenceKinds']);
         $stateKey = $this->traversalStateKey($candidate);
         $stateKeyPath = $state['stateKeyPath'] ?? $this->initialStateKeyPath(
@@ -856,6 +1080,84 @@ class GraphIndex
         $candidate['stateKeyPath'] = [...$stateKeyPath, $stateKey];
 
         return $candidate;
+    }
+
+    /**
+     * Keep enough edge provenance for an agent-facing path without copying
+     * unbounded operation metadata into every traversal frontier state.
+     *
+     * @param array<string, mixed> $edge
+     * @return array<string, mixed>
+     */
+    private function compactTraversalEdge(array $edge, int $maxEvidence): array
+    {
+        $evidence = [];
+        $records = is_array($edge['metadata']['evidence'] ?? null)
+            ? $edge['metadata']['evidence']
+            : (is_array($edge['evidence'] ?? null) ? $edge['evidence'] : []);
+        $evidenceTotal = count($records) + max(0, (int) ($edge['evidenceOmitted'] ?? 0));
+
+        // Exported evidence maps are already key-sorted. Consume only the
+        // bounded prefix so a pathological metadata payload cannot multiply
+        // traversal work, and retain only the scalar provenance contract.
+        if ($maxEvidence > 0) {
+            $examined = 0;
+
+            foreach ($records as $record) {
+                $examined++;
+
+                if (! is_array($record)) {
+                    if ($examined >= $maxEvidence * 4) {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                $compact = $this->compactEvidenceRecord($record);
+
+                if ($compact !== []) {
+                    $evidence[] = $compact;
+                }
+
+                if (count($evidence) >= $maxEvidence) {
+                    break;
+                }
+
+                if ($examined >= $maxEvidence * 4) {
+                    break;
+                }
+            }
+        }
+
+        return array_filter([
+            'from' => $edge['from'] ?? null,
+            'to' => $edge['to'] ?? null,
+            'type' => $edge['type'] ?? null,
+            'confidence' => round((float) ($edge['confidence'] ?? 1.0), 4),
+            'evidence' => $maxEvidence > 0 ? $evidence : null,
+            'evidenceOmitted' => $evidenceTotal > count($evidence)
+                ? $evidenceTotal - count($evidence)
+                : null,
+        ], static fn (mixed $value): bool => $value !== null && $value !== []);
+    }
+
+    /** @param array<string, mixed> $record @return array<string, scalar> */
+    private function compactEvidenceRecord(array $record): array
+    {
+        $compact = [];
+
+        foreach (['file', 'line', 'rule', 'source', 'inference', 'syntax'] as $key) {
+            $value = $record[$key] ?? null;
+
+            if (! is_scalar($value)) {
+                continue;
+            }
+
+            $compact[$key] = is_string($value) ? BoundedText::utf8Bytes($value, 512) : $value;
+        }
+
+        return $compact;
     }
 
     /** @param array<string, mixed> $state @return array<int, string> */
@@ -1172,12 +1474,23 @@ class GraphIndex
     }
 
     /** @param array<string, mixed> $edge @return array<int, string> */
-    private function edgeEvidenceKinds(array $edge): array
+    private function edgeEvidenceKinds(array $edge, ?int $maxKinds = null): array
     {
+        if ($maxKinds === 0) {
+            return [];
+        }
+
         $kinds = [];
+        $examined = 0;
 
         foreach ($edge['metadata']['evidence'] ?? [] as $evidence) {
+            $examined++;
+
             if (! is_array($evidence)) {
+                if ($maxKinds !== null && $examined >= $maxKinds) {
+                    break;
+                }
+
                 continue;
             }
 
@@ -1187,6 +1500,10 @@ class GraphIndex
                 ?? $evidence['syntax']
                 ?? 'source_location';
             $kinds[(string) $kind] = (string) $kind;
+
+            if ($maxKinds !== null && $examined >= $maxKinds) {
+                break;
+            }
         }
 
         sort($kinds);
@@ -1272,42 +1589,90 @@ class GraphIndex
             return ['id' => 'column:'.$target, 'candidates' => []];
         }
 
-        $candidates = [];
-
-        foreach ($this->nodesById as $id => $node) {
-            $labelMatches = isset($node['label']) && strcasecmp((string) $node['label'], $target) === 0;
-            $nameMatches = isset($node['metadata']['name']) && strcasecmp((string) $node['metadata']['name'], $target) === 0;
-
-            if ($labelMatches || $nameMatches) {
-                $candidates[] = $id;
-            }
-        }
-
-        $candidates = array_values(array_unique($candidates));
-        sort($candidates);
+        $lookup = strtolower($target);
+        $resolvedCandidates = $this->boundedCandidateUnion([
+            $this->nodeIdsByLabel[$lookup] ?? [],
+            $this->nodeIdsByName[$lookup] ?? [],
+        ], 10);
+        $candidates = $resolvedCandidates['candidates'];
 
         if (count($candidates) === 1) {
             return ['id' => $candidates[0], 'candidates' => []];
         }
 
         if ($candidates !== []) {
-            return ['id' => null, 'candidates' => array_slice($candidates, 0, 10)];
-        }
+            $result = [
+                'id' => null,
+                'candidates' => $candidates,
+            ];
 
-        foreach ($this->nodesById as $id => $node) {
-            if (str_ends_with($id, '\\'.$target) || str_ends_with($id, '\\'.ltrim($target, '\\'))) {
-                $candidates[] = $id;
+            if ($resolvedCandidates['truncated']) {
+                $result['candidatesTruncated'] = true;
             }
+
+            return $result;
         }
 
-        $candidates = array_values(array_unique($candidates));
-        sort($candidates);
+        $candidates = $this->nodeIdsBySuffix[ltrim($target, '\\')] ?? [];
 
         if (count($candidates) === 1) {
             return ['id' => $candidates[0], 'candidates' => []];
         }
 
-        return ['id' => null, 'candidates' => array_slice($candidates, 0, 10)];
+        $result = [
+            'id' => null,
+            'candidates' => array_slice($candidates, 0, 10),
+        ];
+
+        if (count($candidates) > 10) {
+            $result['candidatesTruncated'] = true;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Merge already-sorted candidate indexes while retaining only enough values
+     * to answer uniqueness and return the public ambiguity hint.
+     *
+     * @param array<int, array<int, string>> $lists
+     * @return array{candidates: array<int, string>, truncated: bool}
+     */
+    private function boundedCandidateUnion(array $lists, int $limit): array
+    {
+        $positions = array_fill(0, count($lists), 0);
+        $candidates = [];
+
+        while (true) {
+            $next = null;
+
+            foreach ($lists as $listIndex => $list) {
+                $candidate = $list[$positions[$listIndex]] ?? null;
+
+                if (is_string($candidate) && ($next === null || $candidate < $next)) {
+                    $next = $candidate;
+                }
+            }
+
+            if ($next === null) {
+                return ['candidates' => $candidates, 'truncated' => false];
+            }
+
+            $candidates[] = $next;
+
+            foreach ($lists as $listIndex => $list) {
+                if (($list[$positions[$listIndex]] ?? null) === $next) {
+                    $positions[$listIndex]++;
+                }
+            }
+
+            if (count($candidates) > $limit) {
+                return [
+                    'candidates' => array_slice($candidates, 0, $limit),
+                    'truncated' => true,
+                ];
+            }
+        }
     }
 
     /**

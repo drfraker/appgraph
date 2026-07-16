@@ -214,6 +214,7 @@ PHP);
         $client = 'AppGraph\Tests\GeneratedCalls\Models\Client';
 
         $this->assertGraphHasNode($array, $progressNote.'::billingCodes', 'method');
+        $this->assertSame(35, $this->graphNode($array, $controller.'::update')['endLine']);
         $this->assertGraphHasEdge($array, $controller.'::update', $progressNote.'::billingCodes', 'calls');
         $this->assertGraphHasEdge($array, $controller.'::update', $controller.'::helper', 'calls');
         $this->assertGraphHasEdge($array, $controller.'::update', $baseController.'::inheritedHelper', 'calls');

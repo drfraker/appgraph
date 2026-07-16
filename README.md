@@ -24,7 +24,7 @@ Requires PHP 8.4+, the PDO SQLite extension, and Laravel 12+.
 
 ```bash
 composer config repositories.appgraph vcs https://github.com/drfraker/appgraph
-composer require --dev drfraker/appgraph:^0.1
+composer require --dev drfraker/appgraph:^0.4
 php artisan appgraph:install
 ```
 
@@ -47,10 +47,13 @@ generated artifacts yourself, or `--no-scan` to defer the initial scan.
 To trial an unpublished checkout as a real local customer:
 
 ```bash
-composer config repositories.appgraph path ../autograph
+composer config repositories.appgraph '{"type":"path","url":"../autograph","options":{"symlink":false}}'
 composer require --dev drfraker/appgraph:@dev
 php artisan appgraph:install
 ```
+
+The explicit `symlink: false` mirrors the checkout into `vendor/`; scan consistency
+intentionally rejects symlinked Composer package roots.
 
 ## Scan
 
@@ -84,6 +87,16 @@ the relevant booted framework, environment, container-binding, and Event/Bus reg
 inputs. Freshness checks compare this fingerprint rather than depending only on
 filesystem modification times; older graphs without a manifest continue to use the
 legacy timestamp check.
+
+When Laravel route introspection consumes a regular dependency PHP file in the
+canonical project `vendor/` tree (for example a Livewire controller), AppGraph adds
+only that observed file to the generation manifest after proving the base inputs
+remained unchanged. Its exact parsed bytes must match the final manifest, and later
+dependency edits or removal make the graph stale; AppGraph never hashes the whole
+dependency tree merely because one package route was registered. Automatically
+discovered sources reached through a symlinked project path, or resolving outside the
+project's canonical `vendor/` tree, are rejected. That includes symlinked Composer path
+repositories, whose alias can be retargeted independently of the canonical source file.
 
 With `appgraph.database.source=live`, AppGraph captures one canonical schema snapshot,
 builds database nodes from that exact snapshot, and captures again after analysis. A

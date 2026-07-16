@@ -7,7 +7,9 @@ use AppGraph\Query\StalenessChecker;
 use AppGraph\Scanners\CallScanner;
 use AppGraph\Scanners\DatabaseSchemaScanner;
 use AppGraph\Scanners\FrontendRouteScanner;
+use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\FileFinder;
+use AppGraph\Support\PhpFileFacts;
 use AppGraph\Support\SchemaDumpParser;
 use AppGraph\Support\ScanFingerprint;
 use AppGraph\Support\ScanResultRegistry;
@@ -416,6 +418,648 @@ class ScanCommandTest extends TestCase
         }
     }
 
+    public function test_scan_publishes_and_tracks_a_livewire_shaped_vendor_source_observed_by_route_introspection(): void
+    {
+        $scanRoot = $this->useIsolatedScanRoot();
+        $applicationRoot = $scanRoot['root'];
+        $files = $scanRoot['files'];
+        $fixture = $this->createObservedDependencyControllerFixture(
+            $files,
+            'vendor/livewire/livewire/src/Features/SupportFileUploads',
+            'FilePreviewController.php',
+        );
+        $unobservedPath = $files->absolutePath('vendor/livewire/livewire/src/Unobserved.php');
+        (new Filesystem())->ensureDirectoryExists(dirname($unobservedPath));
+        file_put_contents($unobservedPath, "<?php\n\n// never consumed by a scanner\n");
+        $outputPath = storage_path('appgraph-observed-dependency-test/appgraph.json');
+        $this->disableScanners();
+        config()->set('appgraph.scan.routes', true);
+        Route::get('/appgraph-observed-vendor-'.$fixture['token'], [
+            $fixture['class'],
+            '__invoke',
+        ]);
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])->assertSuccessful();
+
+            $store = app(GraphStore::class);
+            $firstGeneration = $store->current();
+            $this->assertNotNull($firstGeneration);
+            $graph = $store->graph($firstGeneration['id']);
+            $scan = $graph['meta']['scan'];
+
+            $this->assertSame(hash('sha256', $fixture['source']), $scan['files'][$fixture['relative']]);
+            $this->assertSame([$fixture['relative']], $scan['additionalFiles']);
+            $this->assertArrayNotHasKey('vendor/livewire/livewire/src/Unobserved.php', $scan['files']);
+            $this->assertFalse(app(StalenessChecker::class)->check($store->path(), $scan)['stale']);
+
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])->assertSuccessful();
+
+            $this->assertSame($firstGeneration['id'], $store->current()['id']);
+
+            file_put_contents($fixture['path'], $fixture['changedSource']);
+            $changed = app(StalenessChecker::class)->check($store->path(), $scan);
+            $this->assertTrue($changed['stale']);
+            $this->assertSame(1, $changed['changedFiles']);
+            $this->assertContains($fixture['relative'], $changed['samplePaths']);
+
+            unlink($fixture['path']);
+            $removed = app(StalenessChecker::class)->check($store->path(), $scan);
+            $this->assertTrue($removed['stale']);
+            $this->assertSame(1, $removed['removedFiles']);
+            $this->assertContains($fixture['relative'], $removed['samplePaths']);
+        } finally {
+            @unlink($fixture['path']);
+            (new Filesystem())->deleteDirectory($applicationRoot);
+            @unlink($outputPath);
+        }
+    }
+
+    public function test_scan_rejects_a_dependency_php_source_mutated_after_route_introspection(): void
+    {
+        $scanRoot = $this->useIsolatedScanRoot();
+        $fixture = $this->createObservedDependencyControllerFixture($scanRoot['files']);
+        $outputPath = storage_path('appgraph-mutated-dependency-test/appgraph.json');
+        $this->disableScanners();
+        config()->set('appgraph.scan.routes', true);
+        config()->set('appgraph.scan.calls', true);
+        Route::get('/appgraph-mutated-vendor-'.$fixture['token'], [
+            $fixture['class'],
+            '__invoke',
+        ]);
+        app()->instance(CallScanner::class, new class($fixture['path'], $fixture['changedSource']) extends CallScanner
+        {
+            public function __construct(
+                private string $sourcePath,
+                private string $changedSource,
+            ) {
+            }
+
+            public function scan(Graph $graph): Graph
+            {
+                file_put_contents($this->sourcePath, $this->changedSource);
+
+                return $graph;
+            }
+        });
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])
+                ->expectsOutputToContain("AppGraph source [{$fixture['relative']}] did not match the final scan manifest")
+                ->assertFailed();
+
+            $this->assertNull(app(GraphStore::class)->current());
+            $this->assertFileDoesNotExist($outputPath);
+        } finally {
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            @unlink($outputPath);
+        }
+    }
+
+    public function test_scan_rejects_a_dependency_php_source_deleted_after_route_introspection(): void
+    {
+        $scanRoot = $this->useIsolatedScanRoot();
+        $fixture = $this->createObservedDependencyControllerFixture($scanRoot['files']);
+        $outputPath = storage_path('appgraph-deleted-dependency-test/appgraph.json');
+        $this->disableScanners();
+        config()->set('appgraph.scan.routes', true);
+        config()->set('appgraph.scan.calls', true);
+        Route::get('/appgraph-deleted-dependency-'.$fixture['token'], [
+            $fixture['class'],
+            '__invoke',
+        ]);
+        app()->instance(CallScanner::class, new class($fixture['path']) extends CallScanner
+        {
+            public function __construct(private string $sourcePath)
+            {
+            }
+
+            public function scan(Graph $graph): Graph
+            {
+                unlink($this->sourcePath);
+
+                return $graph;
+            }
+        });
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])
+                ->expectsOutputToContain('could not be safely canonicalized inside the project')
+                ->assertFailed();
+
+            $this->assertNull(app(GraphStore::class)->current());
+            $this->assertFileDoesNotExist($outputPath);
+        } finally {
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            @unlink($outputPath);
+        }
+    }
+
+    public function test_scan_does_not_reclassify_a_transient_declared_source_as_a_dependency(): void
+    {
+        $token = bin2hex(random_bytes(6));
+        $sourcePath = app(FileFinder::class)->absolutePath('app/AppGraphTransient'.$token.'.php');
+        $source = "<?php\n\nreturn true;\n";
+        $outputPath = storage_path('appgraph-transient-declared-test/appgraph.json');
+        @unlink($sourcePath);
+        (new Filesystem())->ensureDirectoryExists(dirname($sourcePath));
+        $this->disableScanners();
+        config()->set('appgraph.scan.calls', true);
+        app()->instance(CallScanner::class, new class(
+            app(PhpFileFacts::class),
+            $sourcePath,
+            $source,
+        ) extends CallScanner
+        {
+            public function __construct(
+                private PhpFileFacts $facts,
+                private string $sourcePath,
+                private string $source,
+            ) {
+            }
+
+            public function scan(Graph $graph): Graph
+            {
+                file_put_contents($this->sourcePath, $this->source);
+                $this->facts->statements($this->sourcePath);
+                unlink($this->sourcePath);
+
+                return $graph;
+            }
+        });
+        app()->instance(ScanFingerprint::class, new class(
+            app(FileFinder::class),
+            app(ContainerBindingRegistry::class),
+            $sourcePath,
+            $source,
+        ) extends ScanFingerprint
+        {
+            private int $captures = 0;
+
+            public function __construct(
+                FileFinder $files,
+                ContainerBindingRegistry $containerBindings,
+                private string $sourcePath,
+                private string $source,
+            ) {
+                parent::__construct($files, $containerBindings);
+            }
+
+            public function capture(bool $refreshRuntimeEvidence = true, array $additionalFiles = []): array
+            {
+                $this->captures++;
+                $fingerprint = parent::capture($refreshRuntimeEvidence, $additionalFiles);
+
+                if ($this->captures === 2) {
+                    file_put_contents($this->sourcePath, $this->source);
+                }
+
+                return $fingerprint;
+            }
+        });
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])
+                ->expectsOutputToContain('observed a declared project source that was absent')
+                ->assertFailed();
+
+            $this->assertNull(app(GraphStore::class)->current());
+            $this->assertFileDoesNotExist($outputPath);
+        } finally {
+            @unlink($sourcePath);
+            @unlink($outputPath);
+        }
+    }
+
+    public function test_scan_does_not_reclassify_a_transient_declared_symlink_as_its_vendor_target(): void
+    {
+        $scanRoot = $this->useIsolatedScanRoot();
+        $files = $scanRoot['files'];
+        $token = bin2hex(random_bytes(6));
+        $targetPath = $files->absolutePath('vendor/appgraph-transient-target-'.$token.'.php');
+        $aliasPath = $files->absolutePath('app/AppGraphTransientAlias'.$token.'.php');
+        $outputPath = storage_path('appgraph-transient-declared-symlink-test/appgraph.json');
+        (new Filesystem())->ensureDirectoryExists(dirname($targetPath));
+        (new Filesystem())->ensureDirectoryExists(dirname($aliasPath));
+        file_put_contents($targetPath, "<?php\n\nreturn true;\n");
+
+        if (! @symlink($targetPath, $aliasPath)) {
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            $this->markTestSkipped('Symbolic links are unavailable on this platform.');
+        }
+
+        unlink($aliasPath);
+        $this->disableScanners();
+        config()->set('appgraph.scan.calls', true);
+        app()->instance(CallScanner::class, new class(
+            app(PhpFileFacts::class),
+            $aliasPath,
+            $targetPath,
+        ) extends CallScanner
+        {
+            public function __construct(
+                private PhpFileFacts $facts,
+                private string $aliasPath,
+                private string $targetPath,
+            ) {
+            }
+
+            public function scan(Graph $graph): Graph
+            {
+                symlink($this->targetPath, $this->aliasPath);
+                $this->facts->statements($this->aliasPath);
+                unlink($this->aliasPath);
+
+                return $graph;
+            }
+        });
+        app()->instance(ScanFingerprint::class, new class(
+            $files,
+            app(ContainerBindingRegistry::class),
+            $aliasPath,
+            $targetPath,
+        ) extends ScanFingerprint
+        {
+            private int $captures = 0;
+
+            public function __construct(
+                FileFinder $files,
+                ContainerBindingRegistry $containerBindings,
+                private string $aliasPath,
+                private string $targetPath,
+            ) {
+                parent::__construct($files, $containerBindings);
+            }
+
+            public function capture(bool $refreshRuntimeEvidence = true, array $additionalFiles = []): array
+            {
+                $this->captures++;
+                $fingerprint = parent::capture($refreshRuntimeEvidence, $additionalFiles);
+
+                if ($this->captures === 2) {
+                    symlink($this->targetPath, $this->aliasPath);
+                }
+
+                return $fingerprint;
+            }
+        });
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])
+                ->expectsOutputToContain('observed a declared project source that was absent')
+                ->assertFailed();
+
+            $this->assertNull(app(GraphStore::class)->current());
+            $this->assertFileDoesNotExist($outputPath);
+        } finally {
+            @unlink($aliasPath);
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            @unlink($outputPath);
+        }
+    }
+
+    public function test_scan_rejects_a_base_source_change_during_dependency_manifest_extension(): void
+    {
+        $scanRoot = $this->useIsolatedScanRoot();
+        $files = $scanRoot['files'];
+        $fixture = $this->createObservedDependencyControllerFixture($files);
+        $projectSource = $files->absolutePath('app/AppGraphExtensionRaceFixture.php');
+        $outputPath = storage_path('appgraph-extension-race-test/appgraph.json');
+        (new Filesystem())->ensureDirectoryExists(dirname($projectSource));
+        file_put_contents($projectSource, "<?php\n\n// stable\n");
+        $this->disableScanners();
+        config()->set('appgraph.scan.routes', true);
+        Route::get('/appgraph-extension-race-'.$fixture['token'], [
+            $fixture['class'],
+            '__invoke',
+        ]);
+        app()->instance(ScanFingerprint::class, new class(
+            $files,
+            app(ContainerBindingRegistry::class),
+            $fixture['path'],
+            $projectSource,
+        ) extends ScanFingerprint
+        {
+            private bool $mutated = false;
+
+            public function __construct(
+                FileFinder $files,
+                ContainerBindingRegistry $containerBindings,
+                private string $dependencySource,
+                private string $projectSource,
+            ) {
+                parent::__construct($files, $containerBindings);
+            }
+
+            public function capture(bool $refreshRuntimeEvidence = true, array $additionalFiles = []): array
+            {
+                if (! $this->mutated && in_array($this->dependencySource, $additionalFiles, true)) {
+                    file_put_contents($this->projectSource, "<?php\n\n// changed during extension\n");
+                    $this->mutated = true;
+                }
+
+                return parent::capture($refreshRuntimeEvidence, $additionalFiles);
+            }
+        });
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])
+                ->expectsOutputToContain('source inputs changed while the scan was running')
+                ->assertFailed();
+
+            $this->assertNull(app(GraphStore::class)->current());
+            $this->assertFileDoesNotExist($outputPath);
+        } finally {
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            @unlink($outputPath);
+        }
+    }
+
+    public function test_scan_rejects_a_composer_path_repository_symlink_as_an_observed_dependency(): void
+    {
+        $scanRoot = $this->useIsolatedScanRoot();
+        $files = $scanRoot['files'];
+        $token = bin2hex(random_bytes(6));
+        $targetDirectory = $files->absolutePath('packages/appgraph-path-repository-'.$token.'/src');
+        $targetPath = $targetDirectory.'/PathRepositoryController.php';
+        $aliasDirectory = $files->absolutePath('vendor/appgraph/path-repository-'.$token);
+        $aliasPath = $aliasDirectory.'/src/PathRepositoryController.php';
+        $outputPath = storage_path('appgraph-path-repository-test/appgraph.json');
+        (new Filesystem())->ensureDirectoryExists($targetDirectory);
+        (new Filesystem())->ensureDirectoryExists(dirname($aliasDirectory));
+        file_put_contents($targetPath, "<?php\n\nreturn true;\n");
+
+        if (! @symlink(dirname($targetDirectory), $aliasDirectory)) {
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            $this->markTestSkipped('Symbolic links are unavailable on this platform.');
+        }
+
+        $this->assertSame(realpath($targetPath), realpath($aliasPath));
+        $this->disableScanners();
+        config()->set('appgraph.scan.calls', true);
+        app()->instance(CallScanner::class, new class(app(PhpFileFacts::class), $aliasPath) extends CallScanner
+        {
+            public function __construct(
+                private PhpFileFacts $facts,
+                private string $sourcePath,
+            ) {
+            }
+
+            public function scan(Graph $graph): Graph
+            {
+                $this->facts->statements($this->sourcePath);
+
+                return $graph;
+            }
+        });
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])
+                ->expectsOutputToContain('Composer path-repository symlinks are not supported')
+                ->assertFailed();
+
+            $this->assertNull(app(GraphStore::class)->current());
+            $this->assertFileDoesNotExist($outputPath);
+        } finally {
+            @unlink($aliasDirectory);
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            @unlink($outputPath);
+        }
+    }
+
+    public function test_vendor_bin_symlinks_do_not_block_an_observed_vendor_source(): void
+    {
+        $scanRoot = $this->useIsolatedScanRoot();
+        $files = $scanRoot['files'];
+        $sourcePath = $files->absolutePath('vendor/livewire/livewire/src/FilePreviewController.php');
+        $binaryAlias = $files->absolutePath('vendor/bin/appgraph-fixture');
+        $outputPath = storage_path('appgraph-vendor-bin-symlink-test/appgraph.json');
+        (new Filesystem())->ensureDirectoryExists(dirname($sourcePath));
+        (new Filesystem())->ensureDirectoryExists(dirname($binaryAlias));
+        file_put_contents($sourcePath, "<?php\n\nreturn true;\n");
+
+        if (! @symlink($sourcePath, $binaryAlias)) {
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            $this->markTestSkipped('Symbolic links are unavailable on this platform.');
+        }
+
+        $this->disableScanners();
+        config()->set('appgraph.scan.calls', true);
+        app()->instance(CallScanner::class, new class(app(PhpFileFacts::class), $sourcePath) extends CallScanner
+        {
+            public function __construct(
+                private PhpFileFacts $facts,
+                private string $sourcePath,
+            ) {
+            }
+
+            public function scan(Graph $graph): Graph
+            {
+                $this->facts->statements($this->sourcePath);
+
+                return $graph;
+            }
+        });
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])->assertSuccessful();
+
+            $generation = app(GraphStore::class)->current();
+            $this->assertNotNull($generation);
+            $scan = app(GraphStore::class)->graph($generation['id'])['meta']['scan'];
+            $this->assertSame(
+                ['vendor/livewire/livewire/src/FilePreviewController.php'],
+                $scan['additionalFiles'],
+            );
+        } finally {
+            @unlink($binaryAlias);
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            @unlink($outputPath);
+        }
+    }
+
+    public function test_scan_rejects_an_already_canonical_source_reached_by_a_vendor_package_alias(): void
+    {
+        $scanRoot = $this->useIsolatedScanRoot();
+        $files = $scanRoot['files'];
+        $token = bin2hex(random_bytes(6));
+        $targetDirectory = $files->absolutePath('vendor/appgraph/releases-'.$token.'/v1');
+        $targetPath = $targetDirectory.'/CanonicalController.php';
+        $aliasPath = $files->absolutePath('vendor/appgraph/current-'.$token);
+        $outputPath = storage_path('appgraph-canonical-vendor-alias-test/appgraph.json');
+        (new Filesystem())->ensureDirectoryExists($targetDirectory);
+        file_put_contents($targetPath, "<?php\n\nreturn true;\n");
+
+        if (! @symlink($targetDirectory, $aliasPath)) {
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            $this->markTestSkipped('Symbolic links are unavailable on this platform.');
+        }
+
+        $this->disableScanners();
+        config()->set('appgraph.scan.calls', true);
+        app()->instance(CallScanner::class, new class(app(PhpFileFacts::class), $targetPath) extends CallScanner
+        {
+            public function __construct(
+                private PhpFileFacts $facts,
+                private string $sourcePath,
+            ) {
+            }
+
+            public function scan(Graph $graph): Graph
+            {
+                $this->facts->statements($this->sourcePath);
+
+                return $graph;
+            }
+        });
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])
+                ->expectsOutputToContain('symlinked vendor package path')
+                ->assertFailed();
+
+            $this->assertNull(app(GraphStore::class)->current());
+            $this->assertFileDoesNotExist($outputPath);
+        } finally {
+            @unlink($aliasPath);
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            @unlink($outputPath);
+        }
+    }
+
+    public function test_scan_rejects_a_vendor_package_alias_retargeted_during_analysis(): void
+    {
+        $scanRoot = $this->useIsolatedScanRoot();
+        $files = $scanRoot['files'];
+        $token = bin2hex(random_bytes(6));
+        $firstDirectory = $files->absolutePath('vendor/appgraph/releases-'.$token.'/v1');
+        $secondDirectory = $files->absolutePath('vendor/appgraph/releases-'.$token.'/v2');
+        $sourcePath = $firstDirectory.'/CanonicalController.php';
+        $aliasPath = $files->absolutePath('vendor/appgraph/current-'.$token);
+        $outputPath = storage_path('appgraph-vendor-alias-race-test/appgraph.json');
+        (new Filesystem())->ensureDirectoryExists($firstDirectory);
+        (new Filesystem())->ensureDirectoryExists($secondDirectory);
+        file_put_contents($sourcePath, "<?php\n\nreturn true;\n");
+        file_put_contents($secondDirectory.'/CanonicalController.php', "<?php\n\nreturn false;\n");
+
+        if (! @symlink($firstDirectory, $aliasPath)) {
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            $this->markTestSkipped('Symbolic links are unavailable on this platform.');
+        }
+
+        $this->disableScanners();
+        config()->set('appgraph.scan.calls', true);
+        app()->instance(CallScanner::class, new class(
+            app(PhpFileFacts::class),
+            $sourcePath,
+            $aliasPath,
+            $secondDirectory,
+        ) extends CallScanner
+        {
+            public function __construct(
+                private PhpFileFacts $facts,
+                private string $sourcePath,
+                private string $aliasPath,
+                private string $secondDirectory,
+            ) {
+            }
+
+            public function scan(Graph $graph): Graph
+            {
+                $this->facts->statements($this->sourcePath);
+                unlink($this->aliasPath);
+                symlink($this->secondDirectory, $this->aliasPath);
+
+                return $graph;
+            }
+        });
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])
+                ->expectsOutputToContain('source inputs changed while the scan was running')
+                ->assertFailed();
+
+            $this->assertNull(app(GraphStore::class)->current());
+            $this->assertFileDoesNotExist($outputPath);
+        } finally {
+            @unlink($aliasPath);
+            (new Filesystem())->deleteDirectory($scanRoot['root']);
+            @unlink($outputPath);
+        }
+    }
+
+    public function test_scan_rejects_an_automatically_discovered_source_outside_the_project(): void
+    {
+        $sourcePath = sys_get_temp_dir().'/appgraph-external-source-'.bin2hex(random_bytes(6)).'.php';
+        $outputPath = storage_path('appgraph-external-source-test/appgraph.json');
+        file_put_contents($sourcePath, "<?php\n\nreturn true;\n");
+        $this->disableScanners();
+        config()->set('appgraph.scan.calls', true);
+        app()->instance(CallScanner::class, new class(app(PhpFileFacts::class), $sourcePath) extends CallScanner
+        {
+            public function __construct(
+                private PhpFileFacts $facts,
+                private string $sourcePath,
+            ) {
+            }
+
+            public function scan(Graph $graph): Graph
+            {
+                $this->facts->statements($this->sourcePath);
+
+                return $graph;
+            }
+        });
+
+        try {
+            $this->artisan('appgraph:scan', [
+                '--output' => $outputPath,
+                '--no-overview' => true,
+            ])
+                ->expectsOutputToContain('could not be safely canonicalized inside the project')
+                ->assertFailed();
+
+            $this->assertNull(app(GraphStore::class)->current());
+            $this->assertFileDoesNotExist($outputPath);
+        } finally {
+            @unlink($sourcePath);
+            @unlink($outputPath);
+        }
+    }
+
     public function test_scan_rejects_booted_router_mutation_during_analysis(): void
     {
         $outputPath = storage_path('appgraph-router-mutation-test/appgraph.json');
@@ -777,7 +1421,7 @@ class ScanCommandTest extends TestCase
 
         $graph = json_decode((string) file_get_contents($outputPath), true, flags: JSON_THROW_ON_ERROR);
 
-        $this->assertSame('0.4.0', $graph['meta']['appgraphVersion']);
+        $this->assertSame('0.4.1', $graph['meta']['appgraphVersion']);
         $this->assertSame($graph['meta']['generation']['id'], app(GraphStore::class)->current()['id']);
         $this->assertSame(count($graph['nodes']), app(GraphStore::class)->current()['counts']['nodes']);
         $this->assertSame(count($graph['edges']), app(GraphStore::class)->current()['counts']['edges']);
@@ -836,7 +1480,7 @@ class ScanCommandTest extends TestCase
 
         $overview = json_decode((string) file_get_contents($overviewPath), true, flags: JSON_THROW_ON_ERROR);
 
-        $this->assertSame('0.4.0', $overview['meta']['appgraphVersion']);
+        $this->assertSame('0.4.1', $overview['meta']['appgraphVersion']);
         $this->assertSame([
             'maxDepth' => 5,
             'maxMethods' => 9,
@@ -967,6 +1611,87 @@ class CommandProgressNote extends Model
     protected $table = 'progress_notes';
 }
 PHP);
+    }
+
+    /**
+     * @return array{
+     *     token: string,
+     *     class: class-string,
+     *     directory: string,
+     *     path: string,
+     *     relative: string,
+     *     source: string,
+     *     changedSource: string
+     * }
+     */
+    private function createObservedDependencyControllerFixture(
+        FileFinder $files,
+        ?string $relativeDirectory = null,
+        string $fileName = 'DependencyController.php',
+    ): array
+    {
+        $token = bin2hex(random_bytes(6));
+        $namespace = 'AppGraphVendorFixture\\F'.$token;
+        $className = pathinfo($fileName, PATHINFO_FILENAME);
+        $class = $namespace.'\\'.$className;
+        $relativeDirectory ??= 'vendor/appgraph-scan-fixture-'.$token;
+        $directory = $files->absolutePath($relativeDirectory);
+        $path = $directory.'/'.$fileName;
+        $source = <<<PHP
+<?php
+
+namespace {$namespace};
+
+final class {$className} implements \\Illuminate\\Routing\\Controllers\\HasMiddleware
+{
+    public static array \$middleware = ['web'];
+
+    public static function middleware()
+    {
+        return array_map(
+            static fn (string \$middleware): string => \$middleware,
+            static::\$middleware,
+        );
+    }
+
+    public function __invoke(): string
+    {
+        return 'ok';
+    }
+}
+PHP;
+        $changedSource = $source."\n// changed after route introspection\n";
+        (new Filesystem())->ensureDirectoryExists($directory);
+        file_put_contents($path, $source);
+        require_once $path;
+
+        return [
+            'token' => $token,
+            'class' => $class,
+            'directory' => $directory,
+            'path' => $path,
+            'relative' => $relativeDirectory.'/'.$fileName,
+            'source' => $source,
+            'changedSource' => $changedSource,
+        ];
+    }
+
+    /** @return array{root: string, files: FileFinder, fingerprint: ScanFingerprint} */
+    private function useIsolatedScanRoot(): array
+    {
+        $root = sys_get_temp_dir().'/appgraph-scan-root-'.bin2hex(random_bytes(6));
+        (new Filesystem())->ensureDirectoryExists($root);
+        $files = new FileFinder($root);
+        $fingerprint = new ScanFingerprint($files, app(ContainerBindingRegistry::class));
+        app()->instance(FileFinder::class, $files);
+        app()->instance(ScanFingerprint::class, $fingerprint);
+        app()->instance(StalenessChecker::class, new StalenessChecker($files, $fingerprint));
+
+        return [
+            'root' => $root,
+            'files' => $files,
+            'fingerprint' => $fingerprint,
+        ];
     }
 
     private function disableScanners(): void

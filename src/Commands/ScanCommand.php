@@ -20,6 +20,7 @@ use AppGraph\Scanners\SideEffectScanner;
 use AppGraph\Scanners\TestScanner;
 use AppGraph\Storage\GraphStore;
 use AppGraph\Support\ContainerBindingRegistry;
+use AppGraph\Support\FileFinder;
 use AppGraph\Support\MemoryLimit;
 use AppGraph\Support\PhpFileFacts;
 use AppGraph\Support\ScanFingerprint;
@@ -35,6 +36,23 @@ class ScanCommand extends Command
     private const MAX_EXACT_REFERENCE_CHARACTERS = 4096;
 
     private const MAX_EXACT_REFERENCE_BYTES = 16384;
+
+    private const MAX_DISCOVERED_SOURCE_FILES = 2048;
+
+    private const MAX_DISCOVERED_SOURCE_PATH_BYTES = 16384;
+
+    private const MAX_DISCOVERED_SOURCE_PATH_BYTES_TOTAL = 4194304;
+
+    private const MAX_VENDOR_ALIAS_ENTRIES = 8192;
+
+    private string $scanBasePath;
+
+    private string $scanCanonicalBasePath;
+
+    /**
+     * @var array<string, array{target: ?string, resolved: ?string, directory: bool}>|null
+     */
+    private ?array $vendorPackageSymlinkSnapshot = null;
 
     protected $signature = 'appgraph:scan
         {--output= : JSON output path. Relative paths resolve from the Laravel base path.}
@@ -64,6 +82,7 @@ class ScanCommand extends Command
         PolicyScanner $policyScanner,
         ContainerBindingScanner $containerBindingScanner,
         ContainerBindingRegistry $containerBindings,
+        FileFinder $files,
         PhpFileFacts $phpFileFacts,
         ScanFingerprint $scanFingerprint,
         GraphExporter $exporter,
@@ -73,6 +92,12 @@ class ScanCommand extends Command
         SourceFileObservations $sourceObservations,
     ): int {
         $acquiredLockToken = null;
+        $this->scanBasePath = rtrim(str_replace('\\', '/', $files->basePath()), '/');
+        $canonicalBasePath = realpath($this->scanBasePath);
+        $this->scanCanonicalBasePath = is_string($canonicalBasePath)
+            ? rtrim(str_replace('\\', '/', $canonicalBasePath), '/')
+            : $this->scanBasePath;
+        $this->vendorPackageSymlinkSnapshot = null;
 
         try {
             $resultToken = $this->option('result-token');
@@ -205,6 +230,7 @@ class ScanCommand extends Command
                 }
             }
 
+            $initialVendorPackageSymlinks = $this->captureVendorPackageSymlinkSnapshot();
             $initialFingerprint = $scanFingerprint->capture(
                 refreshRuntimeEvidence: false,
                 additionalFiles: $additionalFingerprintFiles,
@@ -292,21 +318,50 @@ class ScanCommand extends Command
                 ];
             }
 
-            $finalFingerprint = $scanFingerprint->capture(
+            $baseFinalFingerprint = $scanFingerprint->capture(
                 refreshRuntimeEvidence: false,
                 additionalFiles: $additionalFingerprintFiles,
             );
+            $baseFinalVendorPackageSymlinks = $this->captureVendorPackageSymlinkSnapshot();
 
-            if (! hash_equals($initialFingerprint['fingerprint'], $finalFingerprint['fingerprint'])) {
-                throw new RuntimeException(
-                    'AppGraph source inputs changed while the scan was running. No generation was published; run `php artisan appgraph:scan` again.'
+            if (! hash_equals($initialFingerprint['fingerprint'], $baseFinalFingerprint['fingerprint'])
+                || $initialVendorPackageSymlinks !== $baseFinalVendorPackageSymlinks) {
+                $this->throwSourceInputsChanged();
+            }
+
+            $this->vendorPackageSymlinkSnapshot = $baseFinalVendorPackageSymlinks;
+
+            $observedSourceInputs = $this->normalizeObservedSourceInputs(
+                $sourceObservations->hashes(),
+                is_array($baseFinalFingerprint['files'] ?? null) ? $baseFinalFingerprint['files'] : [],
+            );
+            $observedSources = $observedSourceInputs['hashes'];
+            $observedFingerprintFiles = $observedSourceInputs['additionalFiles'];
+            $finalFingerprint = $baseFinalFingerprint;
+
+            if ($observedFingerprintFiles !== []) {
+                $finalFingerprint = $scanFingerprint->capture(
+                    refreshRuntimeEvidence: false,
+                    additionalFiles: array_values(array_unique([
+                        ...$additionalFingerprintFiles,
+                        ...$observedFingerprintFiles,
+                    ])),
+                );
+                $this->assertFingerprintExtensionIsConsistent(
+                    $baseFinalFingerprint,
+                    $finalFingerprint,
+                    $observedFingerprintFiles,
                 );
             }
 
             $this->assertObservedSourcesMatchManifest(
-                $sourceObservations->hashes(),
+                $observedSources,
                 is_array($finalFingerprint['files'] ?? null) ? $finalFingerprint['files'] : [],
             );
+
+            if ($baseFinalVendorPackageSymlinks !== $this->captureVendorPackageSymlinkSnapshot()) {
+                $this->throwSourceInputsChanged();
+            }
 
             if ($liveSchemaEvidence !== null) {
                 $finalFingerprint['databaseSchema'] = $liveSchemaEvidence;
@@ -734,8 +789,9 @@ class ScanCommand extends Command
         return $value !== ''
             && ! str_contains($value, "\0")
             && strlen($value) <= self::MAX_EXACT_REFERENCE_BYTES
-            && mb_strlen($value) <= self::MAX_EXACT_REFERENCE_CHARACTERS
-            && preg_match('//u', $value) === 1;
+            && preg_match('//u', $value) === 1
+            && preg_match('/[\x00-\x1F\x7F]/', $value) !== 1
+            && mb_strlen($value) <= self::MAX_EXACT_REFERENCE_CHARACTERS;
     }
 
     private function boundedDiagnostic(string $value, int $characters, int $bytes): string
@@ -749,31 +805,435 @@ class ScanCommand extends Command
     }
 
     /**
-     * @param array<string, array<int, string>> $observed
+     * @param array<string, array<int, string>> $observed Manifest path to observed hashes
      * @param array<string, string> $manifest
      */
     private function assertObservedSourcesMatchManifest(array $observed, array $manifest): void
     {
-        $base = rtrim(str_replace('\\', '/', base_path()), '/');
+        $manifestIndex = $this->manifestPathIndex($manifest);
 
-        foreach ($observed as $file => $hashes) {
+        foreach ($observed as $manifestPath => $hashes) {
             if (count($hashes) !== 1) {
                 throw new RuntimeException(
                     'AppGraph read a source file at multiple content hashes while scanning. No generation was published; run `php artisan appgraph:scan` again.'
                 );
             }
 
-            $normalized = str_replace('\\', '/', $file);
-            $relative = str_starts_with($normalized, $base.'/')
-                ? substr($normalized, strlen($base) + 1)
-                : $normalized;
-            $manifestHash = $manifest[$relative] ?? null;
+            $manifestKey = $this->manifestPathKey($manifestIndex, $manifestPath);
+            $manifestHash = $manifestKey !== null ? ($manifest[$manifestKey] ?? null) : null;
 
             if (! is_string($manifestHash) || ! hash_equals($manifestHash, $hashes[0])) {
+                $source = $this->isBoundedExactReference($manifestPath)
+                    ? "AppGraph source [{$manifestPath}]"
+                    : 'An AppGraph source with an omitted unsafe or oversized path';
+
                 throw new RuntimeException(
-                    "AppGraph source [{$relative}] did not match the final scan manifest. No generation was published; run `php artisan appgraph:scan` again."
+                    "{$source} did not match the final scan manifest. No generation was published; run `php artisan appgraph:scan` again."
                 );
             }
         }
+    }
+
+    /**
+     * Scanner-discovered dependency sources (for example a Livewire controller)
+     * are not part of the base project manifest. Preserve their exact bytes as
+     * additional generation inputs instead of either rejecting every scan or
+     * trusting composer.lock as a substitute for the source that was parsed.
+     *
+     * @param array<string, array<int, string>> $observed Raw source path to observed hashes
+     * @param array<string, string> $baseManifest
+     * @return array{
+     *     hashes: array<string, array<int, string>>,
+     *     additionalFiles: array<int, string>
+     * }
+     */
+    private function normalizeObservedSourceInputs(array $observed, array $baseManifest): array
+    {
+        /** @var array<string, array<string, true>> $normalizedHashes */
+        $normalizedHashes = [];
+        $additionalFiles = [];
+        $additionalPathBytes = 0;
+        $baseManifestIndex = $this->manifestPathIndex($baseManifest);
+
+        foreach ($observed as $file => $hashes) {
+            $manifestPath = $this->sourceManifestPath($file);
+            $baseManifestPath = $this->manifestPathKey($baseManifestIndex, $manifestPath);
+
+            if ($baseManifestPath === null) {
+                if ($this->isDeclaredInputPath($manifestPath)) {
+                    throw new RuntimeException(
+                        'AppGraph observed a declared project source that was absent from the stable scan manifest. No generation was published; run `php artisan appgraph:scan` again.'
+                    );
+                }
+
+                $observedManifestPath = $manifestPath;
+                [$file, $manifestPath] = $this->canonicalDiscoveredSource($file);
+
+                if ($this->isDeclaredInputPath($manifestPath)) {
+                    throw new RuntimeException(
+                        'AppGraph observed a declared project source that was absent from the stable scan manifest. No generation was published; run `php artisan appgraph:scan` again.'
+                    );
+                }
+
+                if (! $this->manifestPathsEqual($observedManifestPath, $manifestPath)) {
+                    throw new RuntimeException(
+                        'AppGraph cannot safely fingerprint an automatically discovered PHP source through a symlinked project path. Composer path-repository symlinks are not supported. No generation was published.'
+                    );
+                }
+
+                if (! $this->isCanonicalVendorPath($manifestPath)) {
+                    throw new RuntimeException(
+                        'AppGraph cannot safely fingerprint an automatically discovered PHP source outside the canonical project vendor directory. Composer path-repository symlinks are not supported. No generation was published.'
+                    );
+                }
+
+                if ($this->vendorPackageSymlinkSnapshot !== []) {
+                    throw new RuntimeException(
+                        'AppGraph cannot safely fingerprint an automatically discovered PHP source through a symlinked vendor package path. Composer path-repository symlinks are not supported. No generation was published.'
+                    );
+                }
+
+                $baseManifestPath = $this->manifestPathKey($baseManifestIndex, $manifestPath);
+
+                if ($baseManifestPath === null) {
+                    if (! isset($additionalFiles[$manifestPath])) {
+                        $additionalFiles[$manifestPath] = $file;
+                        $additionalPathBytes += strlen($manifestPath);
+                    }
+
+                    if (count($additionalFiles) > self::MAX_DISCOVERED_SOURCE_FILES
+                        || $additionalPathBytes > self::MAX_DISCOVERED_SOURCE_PATH_BYTES_TOTAL) {
+                        throw new RuntimeException(
+                            'AppGraph observed too many additional dependency source paths to fingerprint safely. No generation was published.'
+                        );
+                    }
+                } else {
+                    $manifestPath = $baseManifestPath;
+                }
+            } else {
+                $manifestPath = $baseManifestPath;
+            }
+
+            foreach ($hashes as $hash) {
+                if (is_string($hash)) {
+                    $normalizedHashes[$manifestPath][$hash] = true;
+                }
+            }
+        }
+
+        $normalized = [];
+
+        foreach ($normalizedHashes as $manifestPath => $hashes) {
+            $normalized[$manifestPath] = array_keys($hashes);
+            sort($normalized[$manifestPath]);
+        }
+
+        ksort($normalized);
+        ksort($additionalFiles);
+
+        return [
+            'hashes' => $normalized,
+            'additionalFiles' => array_values($additionalFiles),
+        ];
+    }
+
+    /**
+     * A second capture may add only the scanner-observed files that were absent
+     * from the stable base manifest. All original files and runtime evidence
+     * must remain byte-for-byte identical across the extension capture.
+     *
+     * @param array<string, mixed> $baseline
+     * @param array<string, mixed> $extended
+     * @param array<int, string> $observedFiles
+     */
+    private function assertFingerprintExtensionIsConsistent(
+        array $baseline,
+        array $extended,
+        array $observedFiles,
+    ): void {
+        $baselineAdditional = array_values(array_filter(
+            (array) ($baseline['additionalFiles'] ?? []),
+            'is_string',
+        ));
+        $extendedAdditional = array_values(array_filter(
+            (array) ($extended['additionalFiles'] ?? []),
+            'is_string',
+        ));
+        $expectedAdditional = array_values(array_unique(array_map(
+            fn (string $file): string => $this->sourceManifestPath($file),
+            $observedFiles,
+        )));
+        $actualAdditional = array_values(array_diff($extendedAdditional, $baselineAdditional));
+        sort($baselineAdditional);
+        sort($extendedAdditional);
+        sort($expectedAdditional);
+        sort($actualAdditional);
+
+        $baselineStillPresent = array_values(array_intersect($extendedAdditional, $baselineAdditional));
+        sort($baselineStillPresent);
+
+        if ($baselineStillPresent !== $baselineAdditional || $actualAdditional !== $expectedAdditional) {
+            $this->throwSourceInputsChanged();
+        }
+
+        $baselineFiles = is_array($baseline['files'] ?? null) ? $baseline['files'] : [];
+        $extendedBaseFiles = is_array($extended['files'] ?? null) ? $extended['files'] : [];
+
+        foreach ($actualAdditional as $file) {
+            unset($extendedBaseFiles[$file]);
+        }
+
+        if ($extendedBaseFiles !== $baselineFiles) {
+            $this->throwSourceInputsChanged();
+        }
+
+        $baselineEvidence = $baseline;
+        $extendedEvidence = $extended;
+
+        foreach (['fingerprint', 'staticFingerprint', 'fileCount', 'files', 'additionalFiles'] as $field) {
+            unset($baselineEvidence[$field], $extendedEvidence[$field]);
+        }
+
+        if ($extendedEvidence !== $baselineEvidence) {
+            $this->throwSourceInputsChanged();
+        }
+    }
+
+    private function sourceManifestPath(string $file): string
+    {
+        $normalized = str_replace('\\', '/', $file);
+
+        if (! $this->isAbsolutePath($normalized)) {
+            $normalized = $this->scanBasePath.'/'.ltrim($normalized, '/');
+        }
+
+        $normalized = $this->normalizePathLexically($normalized);
+
+        foreach (array_unique([$this->scanBasePath, $this->scanCanonicalBasePath]) as $base) {
+            if ($this->pathIsInsideDirectory($normalized, $base)) {
+                return substr($normalized, strlen($base) + 1);
+            }
+        }
+
+        return $normalized;
+    }
+
+    /** @return array{0: string, 1: string} Canonical project path and manifest key */
+    private function canonicalDiscoveredSource(string $file): array
+    {
+        if ($file === ''
+            || str_contains($file, "\0")
+            || strlen($file) > self::MAX_DISCOVERED_SOURCE_PATH_BYTES) {
+            $this->throwUnsafeDiscoveredSource();
+        }
+
+        $base = $this->scanBasePath;
+        $candidate = $this->isAbsolutePath($file)
+            ? $file
+            : $base.'/'.ltrim(str_replace('\\', '/', $file), '/');
+        $resolved = realpath($candidate);
+        $resolvedBase = realpath($base);
+
+        if (! is_string($resolved)
+            || ! is_string($resolvedBase)
+            || ! is_file($resolved)
+            || ! is_readable($resolved)) {
+            $this->throwUnsafeDiscoveredSource();
+        }
+
+        $resolved = str_replace('\\', '/', $resolved);
+        $resolvedBase = rtrim(str_replace('\\', '/', $resolvedBase), '/');
+
+        if (! $this->pathIsInsideDirectory($resolved, $resolvedBase)
+            || strtolower(pathinfo($resolved, PATHINFO_EXTENSION)) !== 'php') {
+            $this->throwUnsafeDiscoveredSource();
+        }
+
+        $relative = substr($resolved, strlen($resolvedBase) + 1);
+
+        if ($relative === ''
+            || strlen($relative) > self::MAX_DISCOVERED_SOURCE_PATH_BYTES
+            || str_contains($relative, "\0")
+            || preg_match('//u', $relative) !== 1
+            || preg_match('/[\x00-\x1F\x7F]/', $relative) === 1) {
+            $this->throwUnsafeDiscoveredSource();
+        }
+
+        // Keep persisted paths project-relative even when Laravel's base path is
+        // itself a symlink to the canonical project directory.
+        $projectPath = $base.'/'.$relative;
+
+        return [$projectPath, $relative];
+    }
+
+    private function isDeclaredInputPath(string $manifestPath): bool
+    {
+        $manifestPath = PHP_OS_FAMILY === 'Windows' ? strtolower($manifestPath) : $manifestPath;
+
+        return in_array($manifestPath, [
+            'composer.json',
+            'composer.lock',
+            'bootstrap/app.php',
+            'bootstrap/providers.php',
+            '.env',
+        ], true)
+            || str_starts_with($manifestPath, '.env.')
+            || preg_match('/^(?:app|routes|database\/migrations|tests|config)\//D', $manifestPath) === 1;
+    }
+
+    private function pathIsInsideDirectory(string $path, string $directory): bool
+    {
+        $prefix = rtrim($directory, '/').'/';
+
+        return PHP_OS_FAMILY === 'Windows'
+            ? strncasecmp($path, $prefix, strlen($prefix)) === 0
+            : str_starts_with($path, $prefix);
+    }
+
+    private function isCanonicalVendorPath(string $manifestPath): bool
+    {
+        return str_starts_with(
+            PHP_OS_FAMILY === 'Windows' ? strtolower($manifestPath) : $manifestPath,
+            'vendor/',
+        );
+    }
+
+    private function manifestPathsEqual(string $left, string $right): bool
+    {
+        return PHP_OS_FAMILY === 'Windows'
+            ? strcasecmp($left, $right) === 0
+            : $left === $right;
+    }
+
+    /**
+     * @return array<string, array{target: ?string, resolved: ?string, directory: bool}>
+     */
+    private function captureVendorPackageSymlinkSnapshot(): array
+    {
+        $vendor = $this->scanCanonicalBasePath.'/vendor';
+
+        if (! is_dir($vendor)) {
+            return [];
+        }
+
+        $snapshot = [];
+        $inspected = 0;
+
+        foreach ($this->directoryEntries($vendor) as $namespacePath) {
+            $this->collectVendorSymlink($namespacePath, $snapshot, $inspected);
+
+            if (is_link($namespacePath) || ! is_dir($namespacePath)) {
+                continue;
+            }
+
+            if (basename($namespacePath) === 'bin') {
+                continue;
+            }
+
+            foreach ($this->directoryEntries($namespacePath) as $packagePath) {
+                $this->collectVendorSymlink($packagePath, $snapshot, $inspected);
+            }
+        }
+
+        ksort($snapshot);
+
+        return $snapshot;
+    }
+
+    /** @return array<int, string> */
+    private function directoryEntries(string $directory): array
+    {
+        $entries = @scandir($directory);
+
+        if (! is_array($entries)) {
+            throw new RuntimeException(
+                'AppGraph could not safely inspect the project vendor package paths for symlink aliases. No generation was published.'
+            );
+        }
+
+        $paths = [];
+
+        foreach ($entries as $entry) {
+            if ($entry !== '.' && $entry !== '..') {
+                $paths[] = $directory.'/'.$entry;
+            }
+        }
+
+        return $paths;
+    }
+
+    /**
+     * @param array<string, array{target: ?string, resolved: ?string, directory: bool}> $snapshot
+     */
+    private function collectVendorSymlink(string $path, array &$snapshot, int &$inspected): void
+    {
+        $inspected++;
+
+        if ($inspected > self::MAX_VENDOR_ALIAS_ENTRIES) {
+            throw new RuntimeException(
+                'AppGraph found too many project vendor package paths to inspect safely for symlink aliases. No generation was published.'
+            );
+        }
+
+        if (! is_link($path)) {
+            return;
+        }
+
+        $target = readlink($path);
+        $resolved = realpath($path);
+        $target = is_string($target) ? str_replace('\\', '/', $target) : null;
+        $resolved = is_string($resolved) ? str_replace('\\', '/', $resolved) : null;
+        $snapshot[$this->sourceManifestPath($path)] = [
+            'target' => $target,
+            'resolved' => $resolved,
+            'directory' => is_string($resolved) && is_dir($resolved),
+        ];
+    }
+
+    /**
+     * @param array<string, string> $manifest
+     * @return array<string, string> Case-normalized path to exact manifest key
+     */
+    private function manifestPathIndex(array $manifest): array
+    {
+        $index = [];
+
+        foreach (array_keys($manifest) as $path) {
+            if (! is_string($path)) {
+                continue;
+            }
+
+            $identity = PHP_OS_FAMILY === 'Windows' ? strtolower($path) : $path;
+
+            if (isset($index[$identity]) && $index[$identity] !== $path) {
+                $this->throwSourceInputsChanged();
+            }
+
+            $index[$identity] = $path;
+        }
+
+        return $index;
+    }
+
+    /** @param array<string, string> $manifestIndex */
+    private function manifestPathKey(array $manifestIndex, string $path): ?string
+    {
+        $identity = PHP_OS_FAMILY === 'Windows' ? strtolower($path) : $path;
+
+        return $manifestIndex[$identity] ?? null;
+    }
+
+    private function throwUnsafeDiscoveredSource(): never
+    {
+        throw new RuntimeException(
+            'AppGraph consumed a dependency source that could not be safely canonicalized inside the project. No generation was published.'
+        );
+    }
+
+    private function throwSourceInputsChanged(): never
+    {
+        throw new RuntimeException(
+            'AppGraph source inputs changed while the scan was running. No generation was published; run `php artisan appgraph:scan` again.'
+        );
     }
 }

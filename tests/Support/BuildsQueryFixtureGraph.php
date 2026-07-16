@@ -22,7 +22,7 @@ trait BuildsQueryFixtureGraph
                 'generatedAt' => '2026-06-09T00:00:00.000000Z',
                 'appName' => 'Query Fixture App',
                 'laravelVersion' => '12.0.0',
-                'appgraphVersion' => '0.4.0',
+                'appgraphVersion' => '0.4.1',
             ],
             'nodes' => [
                 ['id' => 'route:PUT:/notes/{note}', 'type' => 'route', 'label' => 'PUT /notes/{note}', 'metadata' => ['name' => 'notes.update']],

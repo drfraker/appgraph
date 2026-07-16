@@ -81,7 +81,9 @@ class StalenessCheckerTest extends TestCase
         $dump = $dumpDirectory.'/testing-default.sql';
         mkdir($dumpDirectory, 0775, true);
         file_put_contents($dump, 'CREATE TABLE notes (id INTEGER);');
-        $recorded = $fingerprint->capture(additionalFiles: [$dump]);
+        $recorded = $fingerprint->capture(additionalFiles: [
+            'generated-outside-search-paths/testing-default.sql',
+        ]);
 
         $this->assertSame(
             ['generated-outside-search-paths/testing-default.sql'],

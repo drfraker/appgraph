@@ -11,7 +11,7 @@ use AppGraph\AppGraph;
  */
 class ScanFingerprint
 {
-    public const VERSION = 3;
+    public const VERSION = 4;
 
     private static ?string $runtimeEvidenceSession = null;
 
@@ -46,11 +46,16 @@ class ScanFingerprint
         $normalizedAdditionalFiles = [];
 
         foreach ($additionalFiles as $path) {
-            if (! is_string($path) || $path === '' || ! is_file($path)) {
+            if (! is_string($path) || $path === '' || str_contains($path, "\0")) {
                 continue;
             }
 
             $absolute = str_replace('\\', '/', $this->files->absolutePath($path));
+
+            if (! is_file($absolute)) {
+                continue;
+            }
+
             $normalizedAdditionalFiles[] = $absolute;
             $additionalFileKeys[] = $this->files->relativePath($absolute) ?? $absolute;
         }

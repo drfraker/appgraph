@@ -5,8 +5,17 @@ namespace AppGraph;
 use AppGraph\Commands\InstallCommand;
 use AppGraph\Commands\QueryCommand;
 use AppGraph\Commands\ScanCommand;
+use AppGraph\Query\StalenessChecker;
+use AppGraph\Storage\GraphStore;
 use AppGraph\Support\ContainerBindingRegistry;
+use AppGraph\Support\FileFinder;
+use AppGraph\Support\FreshScanRunner;
 use AppGraph\Support\PhpFileFacts;
+use AppGraph\Support\ScanFingerprint;
+use AppGraph\Support\ScanLock;
+use AppGraph\Support\ScanResultRegistry;
+use AppGraph\Support\ScanRunner;
+use AppGraph\Support\SourceFileObservations;
 use Illuminate\Support\ServiceProvider;
 use Laravel\Mcp\Facades\Mcp;
 use Throwable;
@@ -32,6 +41,20 @@ class AppGraphServiceProvider extends ServiceProvider
                 $namespace,
             );
         });
+        $this->app->singleton(FileFinder::class, static fn (): FileFinder => new FileFinder());
+        $this->app->singleton(ScanFingerprint::class, function ($app): ScanFingerprint {
+            return new ScanFingerprint(
+                $app->make(FileFinder::class),
+                $app->make(ContainerBindingRegistry::class),
+            );
+        });
+        $this->app->singleton(StalenessChecker::class, function ($app): StalenessChecker {
+            return new StalenessChecker(
+                $app->make(FileFinder::class),
+                $app->make(ScanFingerprint::class),
+            );
+        });
+        $this->app->singleton(SourceFileObservations::class);
         $this->app->singleton(PhpFileFacts::class, function ($app): PhpFileFacts {
             $persistent = (bool) $app['config']->get('appgraph.php_facts.persistent_cache', true);
             $configuredPath = $app['config']->get(
@@ -46,8 +69,35 @@ class AppGraphServiceProvider extends ServiceProvider
                     : $app->storagePath($configuredPath);
             }
 
-            return new PhpFileFacts(cacheDirectory: $cacheDirectory);
+            return new PhpFileFacts(
+                cacheDirectory: $cacheDirectory,
+                sourceObservations: $app->make(SourceFileObservations::class),
+            );
         });
+        $this->app->singleton(GraphStore::class, function ($app): GraphStore {
+            $configuredPath = $app['config']->get('appgraph.store.path', 'appgraph/appgraph.sqlite');
+            $path = is_string($configuredPath) && trim($configuredPath) !== ''
+                ? trim($configuredPath)
+                : 'appgraph/appgraph.sqlite';
+            $path = $this->isAbsolutePath($path) ? $path : $app->storagePath($path);
+
+            return new GraphStore(
+                path: $path,
+                retainedGenerations: (int) $app['config']->get('appgraph.store.retained_generations', 10),
+                busyTimeoutMs: (int) $app['config']->get('appgraph.store.busy_timeout_ms', 5000),
+                enableFts: (bool) $app['config']->get('appgraph.store.fts', true),
+            );
+        });
+        $this->app->singleton(ScanLock::class, function ($app): ScanLock {
+            $store = $app->make(GraphStore::class);
+
+            return new ScanLock(
+                dirname($store->path()).'/.scan.lock',
+                (int) $app['config']->get('appgraph.store.lock_timeout_ms', 30000),
+            );
+        });
+        $this->app->singleton(ScanResultRegistry::class);
+        $this->app->singleton(ScanRunner::class, FreshScanRunner::class);
     }
 
     public function boot(): void

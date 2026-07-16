@@ -68,6 +68,8 @@ final class PhpFileFacts
     /** @var array<string, int> */
     private array $counters = self::EMPTY_COUNTERS;
 
+    private SourceFileObservations $sourceObservations;
+
     /**
      * @param array{preserveOriginalNames?: bool, replaceNodes?: bool} $resolverOptions
      */
@@ -76,6 +78,7 @@ final class PhpFileFacts
         ?Parser $parser = null,
         array $resolverOptions = self::DEFAULT_RESOLVER_OPTIONS,
         ?string $parserIdentity = null,
+        ?SourceFileObservations $sourceObservations = null,
     ) {
         $unknownOptions = array_diff(array_keys($resolverOptions), array_keys(self::DEFAULT_RESOLVER_OPTIONS));
 
@@ -126,6 +129,7 @@ final class PhpFileFacts
             $this->identity,
             JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR,
         ));
+        $this->sourceObservations = $sourceObservations ?? new SourceFileObservations();
     }
 
     /**
@@ -143,7 +147,7 @@ final class PhpFileFacts
             throw new RuntimeException("Unable to read PHP source file [{$file}].");
         }
 
-        $sourceHash = hash('sha256', $source);
+        $sourceHash = $this->sourceObservations->record($file, $source);
         $key = hash('sha256', $this->identityHash."\0".$sourceHash);
         $fileIdentity = realpath($file) ?: $file;
         $previousKey = $this->fileKeys[$fileIdentity] ?? null;
@@ -201,6 +205,13 @@ final class PhpFileFacts
     public function resetStats(): void
     {
         $this->counters = self::EMPTY_COUNTERS;
+        $this->sourceObservations->reset();
+    }
+
+    /** @return array<string, array<int, string>> */
+    public function observedSourceHashes(): array
+    {
+        return $this->sourceObservations->hashes();
     }
 
     /** @return array<string, mixed> */

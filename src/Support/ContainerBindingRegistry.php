@@ -8,6 +8,10 @@ use Illuminate\Container\Attributes\Scoped;
 use Illuminate\Container\Attributes\Singleton;
 use Illuminate\Container\Container;
 use Illuminate\Events\Dispatcher as LaravelEventDispatcher;
+use Illuminate\Routing\CompiledRouteCollection as LaravelCompiledRouteCollection;
+use Illuminate\Routing\Route as LaravelRoute;
+use Illuminate\Routing\RouteCollection as LaravelRouteCollection;
+use Illuminate\Routing\Router as LaravelRouter;
 use ReflectionClass;
 use ReflectionFunction;
 use ReflectionIntersectionType;
@@ -241,9 +245,177 @@ class ContainerBindingRegistry
     public function executionRegistryFingerprint(): string
     {
         return hash('sha256', json_encode([
+            'router' => $this->routeRegistryIdentity(),
             'events' => $this->eventRegistryIdentity(),
             'bus' => $this->busRegistryIdentity(),
         ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+    }
+
+    /** @return array<string, mixed> */
+    private function routeRegistryIdentity(): array
+    {
+        $router = $this->existingInstance('router')
+            ?? $this->existingInstance(LaravelRouter::class);
+
+        // Calling framework accessors on an application-defined Router subclass
+        // could execute overridden code. Keep that state explicit but inert.
+        if (! $router instanceof LaravelRouter || $router::class !== LaravelRouter::class) {
+            return [
+                'state' => $router === null ? 'unavailable' : 'unverified',
+                'class' => $router !== null ? $router::class : null,
+            ];
+        }
+
+        try {
+            $collection = $router->getRoutes();
+            $priority = (new ReflectionClass(LaravelRouter::class))
+                ->getProperty('middlewarePriority')
+                ->getValue($router);
+            $middleware = [
+                'aliases' => $this->registryValueDigest($router->getMiddleware()),
+                'groups' => $this->registryValueDigest($router->getMiddlewareGroups()),
+                'priority' => $this->registryValueDigest($priority),
+            ];
+
+            // Router::setRoutes() accepts RouteCollection subclasses. Do not
+            // call an application override while computing a read-only
+            // fingerprint; only Laravel's two concrete collection types are
+            // safe to enumerate.
+            if (! in_array($collection::class, [
+                LaravelRouteCollection::class,
+                LaravelCompiledRouteCollection::class,
+            ], true)) {
+                return [
+                    'state' => 'partially_available',
+                    'class' => $router::class,
+                    'collectionClass' => $collection::class,
+                    'collectionState' => 'unverified',
+                    'middleware' => $middleware,
+                ];
+            }
+
+            $routes = $collection->getRoutes();
+            $routeHash = hash_init('sha256');
+            hash_update($routeHash, "appgraph-router-routes-v1\0");
+            $unverifiedRoutes = 0;
+
+            foreach ($routes as $position => $route) {
+                if (! $route instanceof LaravelRoute || $route::class !== LaravelRoute::class) {
+                    $unverifiedRoutes++;
+                    $identity = [
+                        'position' => $position,
+                        'state' => 'unverified',
+                        'class' => is_object($route) ? $route::class : get_debug_type($route),
+                    ];
+                } else {
+                    $methods = array_values(array_filter(
+                        array_map('strtoupper', $route->methods()),
+                        static fn (string $method): bool => $method !== 'HEAD',
+                    ));
+                    $identity = [
+                        'position' => $position,
+                        'methods' => $methods,
+                        'uri' => $route->uri(),
+                        'name' => $route->getName(),
+                        'actionName' => $route->getActionName(),
+                        // getAction() returns Laravel's raw array without
+                        // resolving, invoking, or unserializing its values.
+                        'action' => $this->registryValueDigest($route->getAction()),
+                        'middleware' => $this->registryValueDigest($route->middleware()),
+                        'excludedMiddleware' => $this->registryValueDigest($route->excludedMiddleware()),
+                        'computedMiddleware' => $route->computedMiddleware === null
+                            ? null
+                            : $this->registryValueDigest($route->computedMiddleware),
+                    ];
+                }
+
+                hash_update($routeHash, $this->registryValueDigest($identity));
+            }
+
+            return [
+                'state' => 'available',
+                'class' => $router::class,
+                'collectionClass' => $collection::class,
+                'routeCount' => count($routes),
+                'unverifiedRoutes' => $unverifiedRoutes,
+                'routes' => hash_final($routeHash),
+                'middleware' => $middleware,
+            ];
+        } catch (Throwable) {
+            return ['state' => 'unreadable', 'class' => $router::class];
+        }
+    }
+
+    /**
+     * Produce a deterministic, constant-size digest without serializing or
+     * invoking closures and objects from the application. Associative map order
+     * is normalized; list order remains significant for routes and middleware.
+     */
+    private function registryValueDigest(mixed $value, int $depth = 0): string
+    {
+        $hash = hash_init('sha256');
+
+        if ($depth > 16) {
+            hash_update($hash, 'depth-limit:'.get_debug_type($value));
+
+            return hash_final($hash);
+        }
+
+        if ($value === null) {
+            hash_update($hash, 'null');
+        } elseif (is_bool($value)) {
+            hash_update($hash, $value ? 'bool:1' : 'bool:0');
+        } elseif (is_int($value)) {
+            hash_update($hash, 'int:'.(string) $value);
+        } elseif (is_float($value)) {
+            hash_update($hash, 'float:'.pack('E', $value));
+        } elseif (is_string($value)) {
+            hash_update($hash, 'string:'.strlen($value).':'.$value);
+        } elseif ($value instanceof Closure) {
+            try {
+                $reflection = new ReflectionFunction($value);
+                $identity = [
+                    'kind' => 'closure',
+                    'file' => $reflection->getFileName() ?: null,
+                    'start' => $reflection->getStartLine() ?: null,
+                    'end' => $reflection->getEndLine() ?: null,
+                    'scope' => $reflection->getClosureScopeClass()?->getName(),
+                    'static' => $reflection->isStatic(),
+                ];
+            } catch (Throwable) {
+                $identity = ['kind' => 'closure', 'state' => 'unreadable'];
+            }
+
+            hash_update($hash, 'closure:'.$this->registryValueDigest($identity, $depth + 1));
+        } elseif (is_array($value)) {
+            $list = array_is_list($value);
+            $keys = array_keys($value);
+
+            if (! $list) {
+                usort($keys, static fn (int|string $left, int|string $right): int => [
+                    get_debug_type($left),
+                    (string) $left,
+                ] <=> [
+                    get_debug_type($right),
+                    (string) $right,
+                ]);
+            }
+
+            hash_update($hash, ($list ? 'list:' : 'map:').count($keys).':');
+
+            foreach ($keys as $key) {
+                hash_update($hash, $this->registryValueDigest($key, $depth + 1));
+                hash_update($hash, $this->registryValueDigest($value[$key], $depth + 1));
+            }
+        } elseif (is_object($value)) {
+            hash_update($hash, 'object:'.$value::class);
+        } elseif (is_resource($value)) {
+            hash_update($hash, 'resource:'.get_resource_type($value));
+        } else {
+            hash_update($hash, 'type:'.get_debug_type($value));
+        }
+
+        return hash_final($hash);
     }
 
     /** @return array<string, mixed> */
@@ -1113,7 +1285,15 @@ class ContainerBindingRegistry
     /** @param array<string, mixed> $record */
     private function affectsGraphFingerprint(array $record): bool
     {
-        if (isset($record['aliasTarget']) || $this->isApplicationRelevant($record)) {
+        // Alias topology is hashed independently from the raw, sorted alias
+        // registry. Derived alias records can change merely because a target
+        // singleton was resolved between scans, so including them twice would
+        // make the source fingerprint process-history dependent.
+        if (isset($record['aliasTarget'])) {
+            return false;
+        }
+
+        if ($this->isApplicationRelevant($record)) {
             return true;
         }
 
@@ -1124,18 +1304,41 @@ class ContainerBindingRegistry
         }
 
         if (isset($this->explicitDefaultDeclared[$this->canonical($abstract)])) {
-            return true;
+            if (! str_contains($abstract, '\\')) {
+                return true;
+            }
+
+            $concrete = ltrim((string) ($record['concrete'] ?? ''), '\\');
+
+            // Package/framework services are commonly materialized lazily as
+            // different commands run in the same process. They are not
+            // application architecture unless an application class appears
+            // in the binding (handled above). Keep explicit third-party
+            // integration bindings and user string keys, while excluding this
+            // process-history noise from freshness identity.
+            return ! $this->isInfrastructureClass($abstract)
+                || ($concrete !== '' && ! $this->isInfrastructureClass($concrete));
         }
 
-        if (! str_contains($abstract, '\\')) {
-            return true;
+        // Remaining instance-only observations are populated opportunistically
+        // as a long-lived process handles commands (for example Laravel's
+        // `date` service). Application-relevant and explicitly declared
+        // bindings already returned above, so none of this fallback is stable
+        // scan identity.
+        return false;
+    }
+
+    private function isInfrastructureClass(string $class): bool
+    {
+        $class = ltrim($class, '\\');
+
+        foreach (['Illuminate\\', 'Laravel\\', 'Symfony\\', 'Psr\\', 'AppGraph\\'] as $prefix) {
+            if (str_starts_with($class, $prefix)) {
+                return true;
+            }
         }
 
-        // Framework instances are populated opportunistically as a process
-        // boots. Excluding instance-only framework observations keeps a stable
-        // fingerprint while explicit registrations remain represented above.
-        return ! str_starts_with($abstract, 'Illuminate\\')
-            && ! str_starts_with($abstract, 'Symfony\\');
+        return false;
     }
 
     /** @param array<string, mixed> $binding @return array<string, mixed> */
@@ -1149,11 +1352,6 @@ class ContainerBindingRegistry
             'shared' => $binding['shared'] ?? null,
             'lifetime' => $binding['lifetime'] ?? null,
             'effectiveLifetime' => $binding['effectiveLifetime'] ?? null,
-            'certainty' => $binding['certainty'] ?? null,
-            'inference' => $binding['inference'] ?? null,
-            'terminalInference' => $binding['terminalInference'] ?? null,
-            'confidence' => $binding['confidence'] ?? null,
-            'resolutionPath' => $binding['resolutionPath'] ?? null,
             'aliasTarget' => $binding['aliasTarget'] ?? null,
             'aliasDirectTarget' => $binding['aliasDirectTarget'] ?? null,
         ], static fn (mixed $value): bool => $value !== null);

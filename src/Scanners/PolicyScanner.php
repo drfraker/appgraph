@@ -19,11 +19,22 @@ class PolicyScanner
 {
     use InteractsWithPhpAst;
 
+    private const AUTHORIZES_REQUESTS = 'Illuminate\Foundation\Auth\Access\AuthorizesRequests';
+
+    private const GATE_FACADE = 'Illuminate\Support\Facades\Gate';
+
+    private const GATE_CONTRACT = 'Illuminate\Contracts\Auth\Access\Gate';
+
+    private const GATE_IMPLEMENTATION = 'Illuminate\Auth\Access\Gate';
+
     /** @var array<string, array<string, mixed>> */
     private array $classes = [];
 
     /** @var array<string, array<string, array<string, mixed>>> */
     private array $methods = [];
+
+    /** @var array<string, array<int, string>> */
+    private array $traits = [];
 
     /** @var array<string, string> */
     private array $policiesByModel = [];
@@ -52,6 +63,7 @@ class PolicyScanner
     {
         $this->classes = [];
         $this->methods = [];
+        $this->traits = [];
         $this->policiesByModel = [];
         $this->modelsByShortName = [];
         $files = $this->files->findPhpFiles(['app', 'routes']);
@@ -86,6 +98,11 @@ class PolicyScanner
                 continue;
             }
 
+            if ($statement instanceof Stmt\Trait_ && ($trait = $this->className($statement)) !== null) {
+                $this->traits[$trait] = $this->usedTraits($statement);
+                continue;
+            }
+
             if (! $statement instanceof Stmt\Class_ || $statement->name === null || ($class = $this->className($statement)) === null) {
                 continue;
             }
@@ -95,6 +112,7 @@ class PolicyScanner
                 'line' => $statement->getStartLine(),
                 'endLine' => $statement->getEndLine(),
                 'extends' => $this->resolvedName($statement->extends),
+                'traits' => $this->usedTraits($statement),
                 'policy' => str_starts_with($file, 'app/Policies/') || str_contains('\\'.$class, '\\Policies\\'),
                 'model' => str_starts_with($file, 'app/Models/') || str_contains('\\'.$class, '\\Models\\'),
             ];
@@ -201,7 +219,8 @@ class PolicyScanner
         if (($node instanceof Expr\MethodCall || $node instanceof Expr\StaticCall) && $node->name instanceof Identifier) {
             $operation = $node->name->toString();
 
-            if (in_array($operation, ['authorize', 'authorizeForUser', 'allows', 'can', 'cannot', 'check', 'denies', 'inspect'], true)) {
+            if (in_array($operation, ['authorize', 'authorizeForUser', 'allows', 'can', 'cannot', 'check', 'denies', 'inspect'], true)
+                && $this->isLaravelAuthorizationCall($node, $operation, $context)) {
                 $abilityPosition = $operation === 'authorizeForUser' ? 1 : 0;
                 $targetPosition = $operation === 'authorizeForUser' ? 2 : 1;
                 $abilityArg = $node->args[$abilityPosition] ?? null;
@@ -228,6 +247,122 @@ class PolicyScanner
                 }
             }
         }
+    }
+
+    /**
+     * @param array{class: string, method: string, localTypes: array<string, array{class: string, confidence: float, inference: string}>} $context
+     */
+    private function isLaravelAuthorizationCall(
+        Expr\MethodCall|Expr\StaticCall $call,
+        string $operation,
+        array $context,
+    ): bool {
+        if ($call instanceof Expr\StaticCall) {
+            return $this->resolveStaticClass($call->class, $context['class']) === self::GATE_FACADE;
+        }
+
+        if ($call->var instanceof Expr\Variable && $call->var->name === 'this') {
+            return in_array($operation, ['authorize', 'authorizeForUser'], true)
+                && $this->classUsesAuthorizesRequests($context['class']);
+        }
+
+        return $this->isGateReceiver($call->var, $context);
+    }
+
+    /**
+     * @param array{class: string, method: string, localTypes: array<string, array{class: string, confidence: float, inference: string}>} $context
+     */
+    private function isGateReceiver(Expr $expression, array $context): bool
+    {
+        if ($expression instanceof Expr\Variable && is_string($expression->name)) {
+            return in_array(
+                $context['localTypes'][$expression->name]['class'] ?? null,
+                [self::GATE_CONTRACT, self::GATE_IMPLEMENTATION],
+                true,
+            );
+        }
+
+        if ($expression instanceof Expr\StaticCall) {
+            return $expression->name instanceof Identifier
+                && $expression->name->toString() === 'forUser'
+                && $this->resolveStaticClass($expression->class, $context['class']) === self::GATE_FACADE;
+        }
+
+        return $expression instanceof Expr\MethodCall
+            && $expression->name instanceof Identifier
+            && $expression->name->toString() === 'forUser'
+            && $this->isGateReceiver($expression->var, $context);
+    }
+
+    private function classUsesAuthorizesRequests(string $class, array $visited = []): bool
+    {
+        $class = ltrim($class, '\\');
+
+        if (isset($visited[strtolower($class)])) {
+            return false;
+        }
+
+        $visited[strtolower($class)] = true;
+        $record = $this->classes[$class] ?? null;
+
+        if ($record === null) {
+            return false;
+        }
+
+        foreach ($record['traits'] ?? [] as $trait) {
+            if ($this->traitUsesAuthorizesRequests($trait)) {
+                return true;
+            }
+        }
+
+        $parent = $record['extends'] ?? null;
+
+        return is_string($parent) && $this->classUsesAuthorizesRequests($parent, $visited);
+    }
+
+    private function traitUsesAuthorizesRequests(string $trait, array $visited = []): bool
+    {
+        $trait = ltrim($trait, '\\');
+
+        if ($trait === self::AUTHORIZES_REQUESTS) {
+            return true;
+        }
+
+        if (isset($visited[strtolower($trait)])) {
+            return false;
+        }
+
+        $visited[strtolower($trait)] = true;
+
+        foreach ($this->traits[$trait] ?? [] as $nested) {
+            if ($this->traitUsesAuthorizesRequests($nested, $visited)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** @return array<int, string> */
+    private function usedTraits(Stmt\Class_|Stmt\Trait_ $class): array
+    {
+        $traits = [];
+
+        foreach ($class->stmts as $statement) {
+            if (! $statement instanceof Stmt\TraitUse) {
+                continue;
+            }
+
+            foreach ($statement->traits as $trait) {
+                $resolved = $this->resolvedName($trait);
+
+                if ($resolved !== null) {
+                    $traits[] = $resolved;
+                }
+            }
+        }
+
+        return array_values(array_unique($traits));
     }
 
     /** @param array{class: string, method: string, localTypes: array<string, array{class: string, confidence: float, inference: string}>} $context */

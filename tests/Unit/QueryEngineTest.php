@@ -53,6 +53,138 @@ class QueryEngineTest extends TestCase
         );
     }
 
+    public function test_overview_surfaces_deterministic_bounded_scanner_warnings_without_shortening_evidence(): void
+    {
+        $exactClass = 'App\\Warnings\\'.str_repeat('ExactClassSegment\\', 50).'Subject';
+        $exactPath = 'app/'.str_repeat('exact-path-segment/', 50).'Subject.php';
+        $oversizedClass = 'App\\Warnings\\'.str_repeat('OversizedClassSegment\\', 500).'Subject';
+        $longMessage = str_repeat('Long diagnostic prose 🙂 ', 200);
+        $warnings = [
+            [
+                'scanner' => 'alpha',
+                'reason' => 'exact-evidence',
+                'class' => $exactClass,
+                'file' => $exactPath,
+                'message' => $longMessage,
+                ...array_combine(
+                    array_map(static fn (int $index): string => sprintf('extra-%02d', $index), range(1, 30)),
+                    range(1, 30),
+                ),
+            ],
+            [
+                'scanner' => 'alpha',
+                'reason' => 'oversized-evidence',
+                'class' => $oversizedClass,
+                'message' => 'Evidence that cannot fit must be omitted atomically.',
+            ],
+        ];
+
+        foreach (range(1, 38) as $index) {
+            $warnings[] = [
+                'scanner' => 'zeta',
+                'reason' => sprintf('warning-%02d', $index),
+                'file' => sprintf('app/Warnings/Warning%02d.php', $index),
+                'message' => $longMessage,
+            ];
+        }
+
+        $graph = $this->queryFixtureGraph();
+        $graph['meta']['warnings'] = $warnings;
+        $forward = (new QueryEngine(GraphIndex::fromArray($graph)))->overview();
+        $graph['meta']['warnings'] = array_reverse($warnings);
+        $reversed = (new QueryEngine(GraphIndex::fromArray($graph)))->overview();
+        $summary = $forward['scannerWarnings'];
+
+        $this->assertSame($summary, $reversed['scannerWarnings']);
+        $this->assertSame(40, $summary['total']);
+        $this->assertSame([
+            ['scanner' => 'alpha', 'count' => 2],
+            ['scanner' => 'zeta', 'count' => 38],
+        ], $summary['byScanner']);
+        $this->assertSame($summary['bounds']['maxSamples'], $summary['returnedSamples']);
+        $this->assertSame(40 - $summary['returnedSamples'], $summary['omittedSamples']);
+        $this->assertTrue($summary['samplesTruncated']);
+        $this->assertTrue($summary['fieldsTruncated']);
+        $this->assertTrue($summary['messagesTruncated']);
+        $this->assertTrue($summary['truncated']);
+        $this->assertTrue($forward['truncated']);
+        $this->assertArrayNotHasKey('responseTruncated', $forward);
+
+        $exactSample = collect($summary['samples'])->first(
+            static fn (array $sample): bool => ($sample['fields']['reason'] ?? null) === 'exact-evidence',
+        );
+        $oversizedSample = collect($summary['samples'])->first(
+            static fn (array $sample): bool => ($sample['fields']['reason'] ?? null) === 'oversized-evidence',
+        );
+
+        $this->assertSame($exactClass, $exactSample['fields']['class']);
+        $this->assertSame($exactPath, $exactSample['fields']['file']);
+        $this->assertGreaterThan(0, $exactSample['omittedFields']);
+        $this->assertTrue($exactSample['messageTruncated']);
+        $this->assertLessThanOrEqual($summary['bounds']['maxMessageBytes'], strlen($exactSample['message']));
+        $this->assertArrayNotHasKey('class', $oversizedSample['fields']);
+        $this->assertGreaterThan(0, $oversizedSample['omittedFields']);
+        $this->assertLessThanOrEqual(
+            \AppGraph\Support\AgentPayloadLimiter::MAX_BYTES,
+            strlen(json_encode($forward, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE)),
+        );
+    }
+
+    public function test_context_for_task_surfaces_complete_scanner_warning_counts_and_samples(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $graph['meta']['warnings'] = [
+            [
+                'scanner' => 'events',
+                'reason' => 'listener_binding_target_unknown',
+                'class' => 'App\\Listeners\\SendNotification',
+                'file' => 'app/Listeners/SendNotification.php',
+                'message' => 'The listener target could not be proven.',
+            ],
+            [
+                'scanner' => 'calls',
+                'reason' => 'receiver_type_unknown',
+                'class' => 'App\\Services\\NoteService',
+                'file' => 'app/Services/NoteService.php',
+                'message' => 'The receiver type could not be resolved.',
+            ],
+        ];
+
+        $context = (new QueryEngine(GraphIndex::fromArray($graph)))->contextForTask(
+            'Update the note workflow safely',
+            ['notes.update'],
+        );
+        $summary = $context['scannerWarnings'];
+
+        $this->assertSame(2, $summary['total']);
+        $this->assertSame([
+            ['scanner' => 'calls', 'count' => 1],
+            ['scanner' => 'events', 'count' => 1],
+        ], $summary['byScanner']);
+        $this->assertSame(2, $summary['returnedSamples']);
+        $this->assertSame(0, $summary['omittedSamples']);
+        $this->assertSame(0, $summary['omittedFields']);
+        $this->assertFalse($summary['truncated']);
+        $this->assertSame(
+            ['calls', 'events'],
+            array_column(array_column($summary['samples'], 'fields'), 'scanner'),
+        );
+    }
+
+    public function test_public_array_indexes_cannot_claim_an_immutable_generation(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $graph['meta']['generation'] = ['id' => '99', 'current' => true];
+
+        $overview = (new QueryEngine(GraphIndex::fromArray($graph)))->overview();
+
+        $this->assertArrayNotHasKey('generation', $overview);
+        $this->assertSame(
+            'legacy_json_without_immutable_generation',
+            $overview['generationUnavailable']['reason'],
+        );
+    }
+
     public function test_writes_to_resolves_tables_models_and_columns(): void
     {
         $engine = $this->engine();
@@ -72,6 +204,75 @@ class QueryEngineTest extends TestCase
         $this->assertSame('title', $byColumn['field']);
         $this->assertSame('possible', $byColumn['results'][0]['match']);
         $this->assertSame(['create', 'save'], $byColumn['results'][0]['possibleOps']);
+    }
+
+    public function test_data_access_details_are_bounded_per_row_with_explicit_truncation(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $operations = [];
+
+        for ($index = 0; $index < 100; $index++) {
+            $operations[(string) $index] = [
+                'operation' => sprintf('operation-%03d', $index),
+                'fields' => [sprintf('field-%03d', $index), 'title'],
+                'fieldCoverage' => 'complete',
+            ];
+        }
+
+        foreach ($graph['edges'] as &$edge) {
+            if ($edge['from'] === 'App\Services\NoteService::save'
+                && $edge['to'] === 'table:notes'
+                && $edge['type'] === 'writes') {
+                $edge['metadata']['operations'] = $operations;
+            }
+        }
+        unset($edge);
+
+        $engine = new QueryEngine(GraphIndex::fromArray($graph));
+        $table = $engine->writesTo('notes');
+        $column = $engine->writesTo('notes.title');
+
+        $this->assertTrue($table['truncated']);
+        $this->assertTrue($table['results'][0]['detailsTruncated']);
+        $this->assertCount(32, $table['results'][0]['ops']);
+        $this->assertCount(64, $table['results'][0]['fields']);
+        $this->assertTrue($column['truncated']);
+        $this->assertTrue($column['results'][0]['detailsTruncated']);
+        $this->assertCount(32, $column['results'][0]['ops']);
+        $this->assertLessThanOrEqual(64, count($column['results'][0]['fields']));
+    }
+
+    public function test_malformed_operation_evidence_is_possible_and_explicitly_truncated(): void
+    {
+        $graph = $this->queryFixtureGraph();
+
+        foreach ($graph['edges'] as &$edge) {
+            if ($edge['from'] === 'App\Services\NoteService::save'
+                && $edge['to'] === 'table:notes'
+                && $edge['type'] === 'writes') {
+                $edge['metadata']['operations'] = [
+                    123,
+                    [
+                        'operation' => 'update',
+                        'fields' => [null],
+                        'fieldCoverage' => 'complete',
+                    ],
+                ];
+            }
+        }
+        unset($edge);
+
+        $engine = new QueryEngine(GraphIndex::fromArray($graph));
+        $table = $engine->writesTo('notes');
+        $column = $engine->writesTo('notes.title');
+
+        $this->assertTrue($table['truncated']);
+        $this->assertTrue($table['results'][0]['detailsTruncated']);
+        $this->assertTrue($column['truncated']);
+        $this->assertSame('possible', $column['results'][0]['match']);
+        $this->assertTrue($column['results'][0]['detailsTruncated']);
+        $this->assertSame(1, $column['counts']['possible']);
+        $this->assertSame(0, $column['counts']['excluded']);
     }
 
     public function test_reads_from_lists_reader_methods(): void
@@ -1313,6 +1514,34 @@ class QueryEngineTest extends TestCase
         $this->assertSame('PUT /notes/{note}', $impact['routes'][0]['label']);
     }
 
+    public function test_impact_reexpands_a_node_reached_later_with_stronger_confidence(): void
+    {
+        $graph = [
+            'meta' => ['generatedAt' => '2026-07-15T00:00:00.000000Z'],
+            'nodes' => [
+                ['id' => 'table:target', 'type' => 'table', 'label' => 'target'],
+                ['id' => 'App\\AWeak::run', 'type' => 'method', 'label' => 'AWeak::run'],
+                ['id' => 'App\\ZStrong::run', 'type' => 'method', 'label' => 'ZStrong::run'],
+                ['id' => 'App\\Caller::run', 'type' => 'method', 'label' => 'Caller::run'],
+            ],
+            'edges' => [
+                ['from' => 'App\\AWeak::run', 'to' => 'table:target', 'type' => 'reads', 'confidence' => 0.5],
+                ['from' => 'App\\ZStrong::run', 'to' => 'table:target', 'type' => 'reads', 'confidence' => 0.9],
+                ['from' => 'App\\Caller::run', 'to' => 'App\\AWeak::run', 'type' => 'calls', 'confidence' => 1.0],
+                ['from' => 'App\\Caller::run', 'to' => 'App\\ZStrong::run', 'type' => 'calls', 'confidence' => 1.0],
+            ],
+        ];
+        $impact = (new QueryEngine(GraphIndex::fromArray($graph)))->impactOf('table:target');
+        $methods = array_column($impact['methods'], null, 'id');
+
+        $this->assertSame(0.9, $methods['App\\Caller::run']['confidence']);
+        $this->assertSame(2, $methods['App\\Caller::run']['depth']);
+        $this->assertSame(
+            ['App\\AWeak::run', 'App\\ZStrong::run', 'App\\Caller::run'],
+            array_column($impact['methods'], 'id'),
+        );
+    }
+
     public function test_routes_touching_filters_impact_to_routes(): void
     {
         $routes = $this->engine()->routesTouching('App\Models\Note');
@@ -1349,6 +1578,61 @@ class QueryEngineTest extends TestCase
 
         $full = $engine->node('App\Models\Note', full: true);
         $this->assertSame('notes', $full['node']['metadata']['table']);
+    }
+
+    public function test_extended_relationships_are_counted_and_full_node_queries_expose_exact_declarations(): void
+    {
+        $project = 'App\\Models\\Project';
+        $deployment = 'App\\Models\\Deployment';
+        $unknown = 'unknown:relationship:App\\Models\\Project::subject';
+        $declaration = [
+            'relationshipMethod' => 'deployments',
+            'declaredOn' => $project,
+            'call' => 'hasManyThrough',
+        ];
+        $engine = new QueryEngine(GraphIndex::fromArray([
+            'meta' => [],
+            'nodes' => [
+                ['id' => $project, 'type' => 'model', 'label' => 'Project'],
+                ['id' => $deployment, 'type' => 'model', 'label' => 'Deployment'],
+                ['id' => $unknown, 'type' => 'unknown', 'label' => 'subject'],
+            ],
+            'edges' => [
+                [
+                    'from' => $project,
+                    'to' => $deployment,
+                    'type' => 'has_many_through',
+                    'confidence' => 0.75,
+                    'metadata' => [
+                        'relationshipMethods' => ['deployments'],
+                        'relationshipDeclarations' => [$project.'::deployments' => $declaration],
+                    ],
+                ],
+                [
+                    'from' => $project,
+                    'to' => $unknown,
+                    'type' => 'morph_to',
+                    'confidence' => 0.45,
+                    'metadata' => ['relationshipMethods' => ['subject']],
+                ],
+            ],
+        ]));
+
+        $models = array_column($engine->models()['results'], null, 'id');
+        $this->assertSame(2, $models[$project]['relationships']);
+
+        $lean = array_column($engine->node($project)['out'], null, 'type');
+        $this->assertArrayNotHasKey('metadata', $lean['has_many_through']);
+
+        $full = array_column($engine->node($project, full: true)['out'], null, 'type');
+        $this->assertSame(
+            [$project.'::deployments' => $declaration],
+            $full['has_many_through']['metadata']['relationshipDeclarations'],
+        );
+        $this->assertSame(
+            ['subject'],
+            $full['morph_to']['metadata']['relationshipMethods'],
+        );
     }
 
     public function test_search_returns_compact_rows(): void

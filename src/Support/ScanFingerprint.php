@@ -11,7 +11,9 @@ use AppGraph\AppGraph;
  */
 class ScanFingerprint
 {
-    public const VERSION = 2;
+    public const VERSION = 3;
+
+    private static ?string $runtimeEvidenceSession = null;
 
     public function __construct(
         private FileFinder $files,
@@ -24,21 +26,40 @@ class ScanFingerprint
      *     version: int,
      *     algorithm: string,
      *     fingerprint: string,
+     *     staticFingerprint: string,
      *     fileCount: int,
      *     files: array<string, string>,
+     *     additionalFiles?: array<int, string>,
      *     configuration: string,
      *     containerBindings?: string,
      *     laravelExecutionRegistry?: string,
+     *     runtimeEvidenceSession?: string,
      *     appgraphVersion: string,
      *     laravelVersion?: string,
      *     applicationEnvironment?: string
      * }
      */
-    public function capture(bool $refreshRuntimeEvidence = true): array
+    public function capture(bool $refreshRuntimeEvidence = true, array $additionalFiles = []): array
     {
         $files = [];
+        $additionalFileKeys = [];
+        $normalizedAdditionalFiles = [];
 
-        foreach ($this->inputFiles() as $file) {
+        foreach ($additionalFiles as $path) {
+            if (! is_string($path) || $path === '' || ! is_file($path)) {
+                continue;
+            }
+
+            $absolute = str_replace('\\', '/', $this->files->absolutePath($path));
+            $normalizedAdditionalFiles[] = $absolute;
+            $additionalFileKeys[] = $this->files->relativePath($absolute) ?? $absolute;
+        }
+
+        $normalizedAdditionalFiles = array_values(array_unique($normalizedAdditionalFiles));
+        $additionalFileKeys = array_values(array_unique($additionalFileKeys));
+        sort($additionalFileKeys);
+
+        foreach ($this->inputFiles($normalizedAdditionalFiles) as $file) {
             $hash = hash_file('sha256', $file);
 
             if (is_string($hash)) {
@@ -53,40 +74,65 @@ class ScanFingerprint
         $laravelExecutionRegistry = $this->containerBindings?->executionRegistryFingerprint();
         $frameworkVersion = $this->frameworkVersion();
         $applicationEnvironment = $this->applicationEnvironment();
-        $identity = array_filter([
+        $staticIdentity = array_filter([
             'manifestVersion' => self::VERSION,
             'appgraphVersion' => AppGraph::VERSION,
             'laravelVersion' => $frameworkVersion,
+            'files' => $files,
+        ], static fn (mixed $value): bool => $value !== null);
+        $identity = array_filter([
+            ...$staticIdentity,
             'applicationEnvironment' => $applicationEnvironment,
             'configuration' => $configuration,
             'containerBindings' => $containerBindings,
             'laravelExecutionRegistry' => $laravelExecutionRegistry,
-            'files' => $files,
         ], static fn (mixed $value): bool => $value !== null);
+        $runtimeEvidenceSession = $this->containerBindings !== null
+            ? $this->runtimeEvidenceSession()
+            : null;
 
         return array_filter([
             'version' => self::VERSION,
             'algorithm' => 'sha256',
             'fingerprint' => hash('sha256', $this->stableJson($identity)),
+            'staticFingerprint' => hash('sha256', $this->stableJson($staticIdentity)),
             'fileCount' => count($files),
             'files' => $files,
+            'additionalFiles' => $additionalFileKeys,
             'configuration' => $configuration,
             'containerBindings' => $containerBindings,
             'laravelExecutionRegistry' => $laravelExecutionRegistry,
+            'runtimeEvidenceSession' => $runtimeEvidenceSession,
             'appgraphVersion' => AppGraph::VERSION,
             'laravelVersion' => $frameworkVersion,
             'applicationEnvironment' => $applicationEnvironment,
         ], static fn (mixed $value): bool => $value !== null);
     }
 
-    /** @return array<int, string> */
-    private function inputFiles(): array
+    private function runtimeEvidenceSession(): string
+    {
+        return self::$runtimeEvidenceSession ??= bin2hex(random_bytes(16));
+    }
+
+    /**
+     * @param array<int, string> $additionalFiles Exact scanner-produced inputs
+     *     that cannot be expanded from configuration alone (for example a
+     *     templated per-connection schema dump path).
+     * @return array<int, string>
+     */
+    private function inputFiles(array $additionalFiles = []): array
     {
         $paths = [
-            ...$this->files->findPhpFiles(['app', 'routes', 'database/migrations', 'tests']),
+            ...$this->files->findPhpFiles(['app', 'routes', 'database/migrations', 'tests', 'config']),
             ...$this->files->findFiles(['resources', 'src'], ['js', 'jsx', 'ts', 'tsx', 'vue']),
             ...$this->files->findFiles('database/schema', ['sql']),
         ];
+
+        foreach ($additionalFiles as $path) {
+            if (is_string($path) && $path !== '' && is_file($path)) {
+                $paths[] = str_replace('\\', '/', $this->files->absolutePath($path));
+            }
+        }
 
         foreach ($this->configuredSchemaPaths() as $path) {
             if (is_dir($path)) {
@@ -96,7 +142,16 @@ class ScanFingerprint
             }
         }
 
-        foreach (['composer.json', 'composer.lock', 'bootstrap/app.php', 'bootstrap/providers.php', 'config/appgraph.php'] as $path) {
+        $environmentFile = $this->applicationEnvironment();
+
+        foreach (array_filter([
+            'composer.json',
+            'composer.lock',
+            'bootstrap/app.php',
+            'bootstrap/providers.php',
+            '.env',
+            is_string($environmentFile) && $environmentFile !== '' ? '.env.'.$environmentFile : null,
+        ]) as $path) {
             $absolute = $this->files->absolutePath($path);
 
             if (is_file($absolute)) {
@@ -135,7 +190,7 @@ class ScanFingerprint
 
     private function configurationHash(): string
     {
-        $configuration = $this->configurationIsAvailable() ? config('appgraph', []) : [];
+        $configuration = $this->configurationIsAvailable() ? config()->all() : [];
 
         return hash('sha256', $this->stableJson($this->normalize($configuration)));
     }

@@ -3,6 +3,7 @@
 namespace AppGraph\Tests\Unit;
 
 use AppGraph\Graph\Graph;
+use AppGraph\Graph\Node;
 use AppGraph\Scanners\DataFlowScanner;
 use AppGraph\Support\FileFinder;
 use AppGraph\Tests\TestCase;
@@ -10,6 +11,45 @@ use Illuminate\Filesystem\Filesystem;
 
 class DataFlowScannerTest extends TestCase
 {
+    public function test_data_flow_edges_are_possible_when_database_scope_is_ambiguous(): void
+    {
+        file_put_contents($this->fixturePath.'/app/Http/Controllers/AmbiguousController.php', <<<'PHP'
+<?php
+
+namespace AppGraph\Tests\AmbiguousDatabaseFlows;
+
+use Illuminate\Support\Facades\DB;
+
+class AmbiguousController
+{
+    public function index(): void
+    {
+        DB::table('users')->get();
+    }
+}
+PHP);
+        $graph = new Graph();
+        $graph->addNode(Node::make('table:users', 'table', 'users', [
+            'metadata' => [
+                'identityAmbiguous' => true,
+                'schemaIdentities' => ['central' => [], 'tenant' => []],
+            ],
+        ]));
+
+        (new DataFlowScanner(new FileFinder($this->fixturePath)))->scan($graph);
+        $edge = $this->graphEdge(
+            $graph->toArray(),
+            'AppGraph\Tests\AmbiguousDatabaseFlows\AmbiguousController::index',
+            'table:users',
+            'reads',
+        );
+
+        $this->assertSame(0.5, $edge['confidence']);
+        $this->assertSame('possible', $edge['metadata']['matchCertainty']);
+        $this->assertSame('database_scope_unresolved', $edge['metadata']['ambiguity']);
+        $this->assertSame(2, $edge['metadata']['schemaIdentityCount']);
+    }
+
     private string $fixturePath;
 
     protected function setUp(): void

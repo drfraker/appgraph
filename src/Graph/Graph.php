@@ -114,6 +114,18 @@ class Graph
     }
 
     /**
+     * Replace metadata when an authoritative persisted generation is reused.
+     * Node and edge content is already identical at that point; retaining fresh
+     * scan warnings or timestamps would make a mirror disagree with its id.
+     *
+     * @param array<string, mixed> $values
+     */
+    public function replaceMeta(array $values): void
+    {
+        $this->meta = $values;
+    }
+
+    /**
      * @param array<string, mixed> $warning
      */
     public function addWarning(array $warning): void

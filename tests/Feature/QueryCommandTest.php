@@ -3,6 +3,7 @@
 namespace AppGraph\Tests\Feature;
 
 use AppGraph\Graph\GraphExporter;
+use AppGraph\Storage\GraphStore;
 use AppGraph\Tests\Support\BuildsQueryFixtureGraph;
 use AppGraph\Tests\TestCase;
 use Illuminate\Support\Facades\Artisan;
@@ -94,6 +95,26 @@ class QueryCommandTest extends TestCase
         );
     }
 
+    public function test_json_generation_metadata_is_never_exposed_as_a_verification_baseline(): void
+    {
+        $graph = $this->queryFixtureGraph();
+        $graph['meta']['generation'] = ['id' => '1', 'current' => true];
+        (new GraphExporter())->exportData($graph, $this->graphPath);
+
+        $payload = $this->runQuery([
+            'query' => 'context-for-task',
+            'target' => 'Update the note workflow safely',
+            '--context-target' => ['notes.update'],
+        ]);
+
+        $this->assertArrayNotHasKey('generation', $payload);
+        $this->assertSame(
+            'legacy_json_without_immutable_generation',
+            $payload['generationUnavailable']['reason'],
+        );
+        $this->assertArrayNotHasKey('baselineGeneration', $payload['verification']);
+    }
+
     public function test_context_for_task_cli_preserves_valid_utf8_at_bounded_label_and_evidence_boundaries(): void
     {
         $boundaryText = str_repeat('x', 510).'🙂tail';
@@ -177,7 +198,7 @@ class QueryCommandTest extends TestCase
         $invalidLists = [
             ['--context-target' => array_fill(0, 11, 'notes.update')],
             ['--context-target' => ['notes.update', ' notes.update ']],
-            ['--context-target' => [str_repeat('x', 513)]],
+            ['--context-target' => [str_repeat('x', 4097)]],
             ['--changed-file' => array_map(static fn (int $i): string => "app/File{$i}.php", range(1, 51))],
             ['--changed-file' => ['app/Note.php', ' app/Note.php ']],
             ['--changed-file' => [str_repeat('x', 1025)]],
@@ -214,6 +235,16 @@ class QueryCommandTest extends TestCase
 
     public function test_limit_and_min_confidence_options_are_applied(): void
     {
+        $node = $this->runQuery([
+            'query' => 'node',
+            'target' => 'NoteService::save',
+            '--limit' => '1',
+        ]);
+
+        $this->assertCount(1, $node['out']);
+        $this->assertCount(1, $node['in']);
+        $this->assertTrue($node['truncated']);
+
         $payload = $this->runQuery([
             'query' => 'callers-of',
             'target' => 'NoteService::save',
@@ -268,6 +299,229 @@ class QueryCommandTest extends TestCase
         $this->assertStringContainsString('requires a nonblank task description', $payload['error']);
     }
 
+    public function test_generation_queries_list_diff_and_verify_explicit_snapshots(): void
+    {
+        $store = app(GraphStore::class);
+        $beforeData = $this->queryFixtureGraph();
+        $beforeData['meta']['scan'] = [
+            'fingerprint' => 'before',
+            'configuration' => 'same-config',
+            'applicationEnvironment' => 'testing',
+            'files' => ['app/Services/NoteService.php' => hash('sha256', 'before')],
+        ];
+        $before = $store->publish($this->graphObject($beforeData))['generation']['id'];
+        $afterData = $beforeData;
+        $afterData['meta']['scan']['fingerprint'] = 'after';
+        $afterData['meta']['scan']['files']['app/Services/NoteService.php'] = hash('sha256', 'after');
+        $afterData['nodes'][] = [
+            'id' => 'App\Services\NoteService::audit',
+            'type' => 'method',
+            'label' => 'NoteService::audit',
+            'file' => 'app/Services/NoteService.php',
+            'line' => 50,
+        ];
+        $afterData['edges'][] = [
+            'from' => 'App\Services\NoteService::save',
+            'to' => 'App\Services\NoteService::audit',
+            'type' => 'calls',
+            'confidence' => 1.0,
+        ];
+        $after = $store->publish($this->graphObject($afterData))['generation']['id'];
+
+        $generations = $this->runStoreQuery(['query' => 'generations']);
+        $this->assertSame($after, $generations['currentGeneration']);
+        $this->assertSame([$after, $before], array_column($generations['generations'], 'id'));
+
+        $diff = $this->runStoreQuery([
+            'query' => 'diff',
+            '--from-generation' => $before,
+            '--to-generation' => $after,
+        ]);
+        $this->assertSame('diff', $diff['query']);
+        $this->assertSame(2, $diff['counts']['overall']['added']);
+
+        $verification = $this->runStoreQuery([
+            'query' => 'verify-change',
+            '--from-generation' => $before,
+            '--to-generation' => $after,
+            '--context-target' => ['App\Services\NoteService::save'],
+            '--changed-file' => ['app/Services/NoteService.php'],
+        ]);
+        $this->assertSame('verify-change', $verification['query']);
+        $this->assertSame('changed', $verification['sourceCoverage']['requestedFiles'][0]['manifestStatus']);
+        $this->assertGreaterThan(0, $verification['targetScope']['changesInScope']['total']);
+    }
+
+    public function test_default_search_uses_the_generation_store_and_explicit_input_stays_json_only(): void
+    {
+        $data = $this->queryFixtureGraph();
+        $data['meta']['scan'] = ['fingerprint' => 'search', 'files' => []];
+        $generation = app(GraphStore::class)->publish($this->graphObject($data))['generation']['id'];
+        $stored = $this->runStoreQuery([
+            'query' => 'search',
+            'target' => 'NoteService',
+            '--type' => 'method',
+        ]);
+        $json = $this->runQuery([
+            'query' => 'search',
+            'target' => 'NoteService',
+            '--type' => 'method',
+        ]);
+
+        $this->assertSame($generation, $stored['generation']['id']);
+        $this->assertContains($stored['searchBackend'], ['trigram', 'fallback']);
+        $this->assertSame(
+            array_column($json['results'], 'id'),
+            array_column($stored['results'], 'id'),
+        );
+        $this->assertArrayNotHasKey('generation', $json);
+    }
+
+    public function test_default_queries_use_authoritative_sqlite_without_a_json_mirror(): void
+    {
+        $data = $this->queryFixtureGraph();
+        $data['meta']['scan'] = ['fingerprint' => 'sqlite-cli', 'files' => []];
+        $generation = app(GraphStore::class)->publish($this->graphObject($data))['generation']['id'];
+        @unlink($this->graphPath);
+
+        $overview = $this->runStoreQuery(['query' => 'overview']);
+        $search = $this->runStoreQuery([
+            'query' => 'search',
+            'target' => 'NoteService',
+            '--type' => 'method',
+        ]);
+
+        $this->assertSame($generation, $overview['generation']['id']);
+        $this->assertSame(12, $overview['counts']['nodes']);
+        $this->assertSame($generation, $search['generation']['id']);
+        $this->assertSame(
+            ['App\Services\NoteService::helper', 'App\Services\NoteService::save'],
+            array_column($search['results'], 'id'),
+        );
+        $this->assertFileDoesNotExist($this->graphPath);
+    }
+
+    public function test_search_query_rejects_unbounded_or_nonliteral_inputs_for_store_and_json(): void
+    {
+        foreach ([
+            ['target' => '   '],
+            ['target' => "note\0service"],
+            ['target' => str_repeat('x', 513)],
+            ['target' => str_repeat('🙂', 513)],
+            ['target' => 'note', '--type' => '   '],
+            ['target' => 'note', '--type' => "method\0suffix"],
+            ['target' => 'note', '--type' => str_repeat('x', 129)],
+            ['target' => 'note', '--limit' => '0'],
+            ['target' => 'note', '--limit' => '201'],
+            ['target' => 'note', '--limit' => '1.5'],
+        ] as $arguments) {
+            $payload = $this->runQuery(['query' => 'search', ...$arguments], expectedExitCode: 1);
+            $this->assertArrayHasKey('error', $payload);
+
+            $payload = $this->runStoreQuery(['query' => 'search', ...$arguments], expectedExitCode: 1);
+            $this->assertArrayHasKey('error', $payload);
+        }
+    }
+
+    public function test_traversal_query_rejects_unbounded_numeric_options(): void
+    {
+        foreach ([
+            ['--limit' => '0'],
+            ['--limit' => '201'],
+            ['--limit' => '1.5'],
+            ['--depth' => '0'],
+            ['--depth' => '7'],
+            ['--depth' => '1.5'],
+            ['--min-confidence' => '-0.01'],
+            ['--min-confidence' => '1.01'],
+            ['--min-confidence' => 'nope'],
+        ] as $option) {
+            $payload = $this->runQuery([
+                'query' => 'flow-from',
+                'target' => 'notes.update',
+                ...$option,
+            ], expectedExitCode: 1);
+
+            $this->assertStringContainsString('between', $payload['error']);
+        }
+    }
+
+    public function test_historical_queries_reject_json_input_and_require_explicit_baselines(): void
+    {
+        $missingBaseline = $this->runStoreQuery(['query' => 'diff'], expectedExitCode: 1);
+        $this->assertStringContainsString('--from-generation', $missingBaseline['error']);
+
+        $jsonHistory = $this->runStoreQuery([
+            'query' => 'generations',
+            '--input' => $this->graphPath,
+        ], expectedExitCode: 1);
+        $this->assertStringContainsString('cannot use --input JSON', $jsonHistory['error']);
+
+        $irrelevant = $this->runStoreQuery([
+            'query' => 'overview',
+            '--from-generation' => '1',
+        ], expectedExitCode: 1);
+        $this->assertStringContainsString('not valid for the [overview]', $irrelevant['error']);
+
+        $data = $this->queryFixtureGraph();
+        $data['meta']['scan'] = ['fingerprint' => 'numeric-contracts', 'files' => []];
+        $generation = app(GraphStore::class)->publish($this->graphObject($data))['generation']['id'];
+
+        foreach (['previous', 'current', '0', '01', str_repeat('9', 20)] as $invalid) {
+            $diff = $this->runStoreQuery([
+                'query' => 'diff',
+                '--from-generation' => $invalid,
+            ], expectedExitCode: 1);
+            $this->assertStringContainsString('positive numeric generation id', $diff['error']);
+
+            $verify = $this->runStoreQuery([
+                'query' => 'verify-change',
+                '--from-generation' => $invalid,
+            ], expectedExitCode: 1);
+            $this->assertStringContainsString('positive numeric generation id', $verify['error']);
+
+            $page = $this->runStoreQuery([
+                'query' => 'generations',
+                '--before-generation' => $invalid,
+            ], expectedExitCode: 1);
+            $this->assertStringContainsString('positive numeric generation id', $page['error']);
+        }
+
+        $invalidComparison = $this->runStoreQuery([
+            'query' => 'verify-change',
+            '--from-generation' => $generation,
+            '--to-generation' => 'previous',
+        ], expectedExitCode: 1);
+        $this->assertStringContainsString('positive numeric generation id', $invalidComparison['error']);
+    }
+
+    public function test_query_specific_options_are_never_silently_ignored(): void
+    {
+        foreach ([
+            ['--context-target' => ['notes.update']],
+            ['--changed-file' => ['app/Note.php']],
+            ['--token-budget' => '1024'],
+            ['--type' => 'method'],
+            ['--full' => true],
+            ['--depth' => '2'],
+            ['--min-confidence' => '0.5'],
+            ['--limit' => '10'],
+        ] as $option) {
+            $payload = $this->runQuery([
+                'query' => 'overview',
+                ...$option,
+            ], expectedExitCode: 1);
+
+            $this->assertStringContainsString('not valid for the [overview]', $payload['error']);
+        }
+
+        $target = $this->runQuery([
+            'query' => 'overview',
+            'target' => 'notes.update',
+        ], expectedExitCode: 1);
+        $this->assertStringContainsString('does not accept a target', $target['error']);
+    }
+
     /**
      * @param array<string, mixed> $arguments
      * @return array<string, mixed>
@@ -276,6 +530,15 @@ class QueryCommandTest extends TestCase
     {
         $arguments['--input'] ??= $this->graphPath;
 
+        $exitCode = Artisan::call('appgraph:query', $arguments);
+        $this->assertSame($expectedExitCode, $exitCode);
+
+        return json_decode(trim(Artisan::output()), true, flags: JSON_THROW_ON_ERROR);
+    }
+
+    /** @param array<string, mixed> $arguments @return array<string, mixed> */
+    private function runStoreQuery(array $arguments, int $expectedExitCode = 0): array
+    {
         $exitCode = Artisan::call('appgraph:query', $arguments);
         $this->assertSame($expectedExitCode, $exitCode);
 

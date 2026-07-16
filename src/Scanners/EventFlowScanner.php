@@ -40,6 +40,7 @@ class EventFlowScanner
     private const BUS_FACADE = 'Illuminate\Support\Facades\Bus';
     private const QUEUE_CONNECTION_ATTRIBUTE = 'Illuminate\Queue\Attributes\Connection';
     private const QUEUE_NAME_ATTRIBUTE = 'Illuminate\Queue\Attributes\Queue';
+    private const ELOQUENT_MODEL = 'Illuminate\Database\Eloquent\Model';
 
     /**
      * PendingDispatch methods that Laravel delegates directly to the job.
@@ -92,6 +93,12 @@ class EventFlowScanner
     private array $interfaces = [];
 
     /** @var array<string, true> */
+    private array $knownModels = [];
+
+    /** @var array<string, array{file: string|null, line: int}> */
+    private array $functions = [];
+
+    /** @var array<string, true> */
     private array $dispatchedJobs = [];
 
     /** @var array<string, true> */
@@ -132,12 +139,20 @@ class EventFlowScanner
         $this->classes = [];
         $this->methods = [];
         $this->interfaces = [];
+        $this->knownModels = [];
+        $this->functions = [];
         $this->dispatchedJobs = [];
         $this->registeredListeners = [];
         $this->declaredListenerRegistrations = [];
         $this->jobHandlerMaps = [];
         $this->bootedListenerRegistrations = $this->snapshotBootedListenerRegistrations();
         $this->bootedBusHandlers = $this->snapshotBootedBusHandlers();
+
+        foreach ($graph->nodes() as $node) {
+            if ($node->type === 'model') {
+                $this->knownModels[ltrim($node->id, '\\')] = true;
+            }
+        }
 
         $graph->addMeta([
             'analysis' => [
@@ -206,6 +221,18 @@ class EventFlowScanner
         foreach ($statements as $statement) {
             if ($statement instanceof Stmt\Namespace_) {
                 $this->indexStatements($statement->stmts, $relativeFile);
+                continue;
+            }
+
+            if ($statement instanceof Stmt\Function_) {
+                $name = $statement->namespacedName instanceof Name
+                    ? $statement->namespacedName->toString()
+                    : $statement->name->toString();
+                $this->functions[strtolower(ltrim($name, '\\'))] = [
+                    'file' => $relativeFile,
+                    'line' => $statement->getStartLine(),
+                ];
+
                 continue;
             }
 
@@ -862,6 +889,10 @@ class EventFlowScanner
     private function addObservedByAttributes(Graph $graph): void
     {
         foreach ($this->classes as $model => $record) {
+            if (! $this->isProvenEloquentModel($model)) {
+                continue;
+            }
+
             foreach ($record['observedBy'] as $observer) {
                 $this->addObserves($graph, $observer, $model, 1.0, 'attribute');
             }
@@ -990,6 +1021,10 @@ class EventFlowScanner
         }
 
         if ($operation === 'observe') {
+            if (! $this->isProvenEloquentModel($class)) {
+                return;
+            }
+
             foreach ($this->classNamesFromExpr($call->args[0]->value ?? new Expr\Array_([])) as $observer) {
                 $this->addObserves($graph, $observer, $class, 0.9, 'observe_call');
             }
@@ -1080,7 +1115,11 @@ class EventFlowScanner
      */
     private function inspectFuncCall(Graph $graph, Expr\FuncCall $call, array $context): void
     {
-        $function = strtolower($this->resolvedName($call->name) ?? '');
+        $function = $this->laravelEventHelper($graph, $call, $context);
+
+        if ($function === null) {
+            return;
+        }
 
         if (in_array($function, ['event', 'broadcast'], true)) {
             $event = $this->eventClassFromArg($call->args[0]->value ?? null);
@@ -1103,6 +1142,107 @@ class EventFlowScanner
                 }
             }
         }
+    }
+
+    /**
+     * @param array{class: string, method: string} $context
+     */
+    private function laravelEventHelper(Graph $graph, Expr\FuncCall $call, array $context): ?string
+    {
+        if (! $call->name instanceof Name) {
+            return null;
+        }
+
+        $helpers = ['event', 'broadcast', 'dispatch'];
+        $resolved = $call->name->getAttribute('resolvedName');
+
+        if ($resolved instanceof Name) {
+            $function = strtolower(ltrim($resolved->toString(), '\\'));
+
+            if (! in_array($function, $helpers, true)) {
+                return null;
+            }
+
+            if (isset($this->functions[$function])) {
+                $this->addShadowedHelperWarning($graph, $context, $function, $call);
+
+                return null;
+            }
+
+            return $function;
+        }
+
+        $function = strtolower($call->name->toString());
+
+        if ($call->name->isFullyQualified()) {
+            if (! in_array($function, $helpers, true)) {
+                return null;
+            }
+
+            if (isset($this->functions[$function])) {
+                $this->addShadowedHelperWarning($graph, $context, $function, $call);
+
+                return null;
+            }
+
+            return $function;
+        }
+
+        if (str_contains($function, '\\') || ! in_array($function, $helpers, true)) {
+            return null;
+        }
+
+        $namespace = $this->namespaceFromClass($context['class']);
+        $localFunction = strtolower(($namespace === null ? '' : $namespace.'\\').$function);
+
+        if (isset($this->functions[$localFunction])) {
+            $this->addShadowedHelperWarning($graph, $context, $localFunction, $call);
+
+            return null;
+        }
+
+        return $function;
+    }
+
+    /** @param array{class: string, method: string} $context */
+    private function addShadowedHelperWarning(
+        Graph $graph,
+        array $context,
+        string $function,
+        Expr\FuncCall $call,
+    ): void {
+        $declaration = $this->functions[$function] ?? [];
+        $graph->addWarning(array_filter([
+            'scanner' => $this->scannerName(),
+            'reason' => 'laravel_event_helper_shadowed',
+            'function' => $function,
+            'caller' => $context['class'].'::'.$context['method'],
+            'file' => $this->classes[$context['class']]['file'] ?? null,
+            'line' => $call->getStartLine(),
+            'declarationFile' => $declaration['file'] ?? null,
+            'declarationLine' => $declaration['line'] ?? null,
+            'message' => 'A project function shadows this Laravel helper name, so the call was not treated as framework dispatch.',
+        ], static fn (mixed $value): bool => $value !== null));
+    }
+
+    private function isProvenEloquentModel(string $class, array $visited = []): bool
+    {
+        $class = ltrim($class, '\\');
+
+        if ($class === self::ELOQUENT_MODEL || isset($this->knownModels[$class])) {
+            return true;
+        }
+
+        $key = strtolower($class);
+
+        if (isset($visited[$key])) {
+            return false;
+        }
+
+        $visited[$key] = true;
+        $parent = $this->classes[$class]['extends'] ?? null;
+
+        return is_string($parent) && $this->isProvenEloquentModel($parent, $visited);
     }
 
     /**

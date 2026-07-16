@@ -2,6 +2,10 @@
 
 namespace AppGraph\Tests\Support;
 
+use AppGraph\Graph\Edge;
+use AppGraph\Graph\Graph;
+use AppGraph\Graph\Node;
+
 trait BuildsQueryFixtureGraph
 {
     /**
@@ -58,5 +62,34 @@ trait BuildsQueryFixtureGraph
                 ['from' => 'table:notes', 'to' => 'column:notes.title', 'type' => 'has_column', 'confidence' => 1.0],
             ],
         ];
+    }
+
+    /** @param array<string, mixed> $data */
+    protected function graphObject(array $data): Graph
+    {
+        $graph = new Graph(is_array($data['meta'] ?? null) ? $data['meta'] : []);
+
+        foreach ($data['nodes'] ?? [] as $node) {
+            $attributes = $node;
+            unset($attributes['id'], $attributes['type'], $attributes['label']);
+            $graph->addNode(Node::make(
+                (string) $node['id'],
+                (string) $node['type'],
+                (string) ($node['label'] ?? $node['id']),
+                $attributes,
+            ));
+        }
+
+        foreach ($data['edges'] ?? [] as $edge) {
+            $graph->addEdge(new Edge(
+                (string) $edge['from'],
+                (string) $edge['to'],
+                (string) $edge['type'],
+                (float) ($edge['confidence'] ?? 1.0),
+                is_array($edge['metadata'] ?? null) ? $edge['metadata'] : [],
+            ));
+        }
+
+        return $graph;
     }
 }

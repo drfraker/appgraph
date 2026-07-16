@@ -2,7 +2,9 @@
 
 namespace AppGraph\Query;
 
+use AppGraph\Support\AgentPayloadLimiter;
 use AppGraph\Support\BoundedText;
+use AppGraph\Support\ProjectPathNormalizer;
 use InvalidArgumentException;
 
 final class TaskContextPlanner
@@ -31,7 +33,11 @@ final class TaskContextPlanner
 
     private const MAX_CHANGED_FILE_CANDIDATES = 1024;
 
-    private const MAX_NODE_ID_BYTES = 2048;
+    private const MAX_NODE_ID_BYTES = 16384;
+
+    private const MAX_EXACT_REFERENCE_CHARACTERS = 4096;
+
+    private const MAX_EXACT_REFERENCE_BYTES = 16384;
 
     private const MAX_DEPTH = 6;
 
@@ -82,7 +88,9 @@ final class TaskContextPlanner
         'observes',
         'belongs_to',
         'has_one',
+        'has_one_through',
         'has_many',
+        'has_many_through',
         'belongs_to_many',
         'morph_to',
         'morph_one',
@@ -112,7 +120,9 @@ final class TaskContextPlanner
         'uses_table',
         'belongs_to',
         'has_one',
+        'has_one_through',
         'has_many',
+        'has_many_through',
         'belongs_to_many',
         'morph_to',
         'morph_one',
@@ -163,6 +173,8 @@ final class TaskContextPlanner
 
     private string $basePath;
 
+    private ProjectPathNormalizer $projectPaths;
+
     public function __construct(
         private GraphIndex $index,
         string $basePath,
@@ -178,6 +190,7 @@ final class TaskContextPlanner
 
         $normalizedBasePath = rtrim(str_replace('\\', '/', $resolvedBasePath), '/');
         $this->basePath = $normalizedBasePath === '' ? '/' : $normalizedBasePath;
+        $this->projectPaths = new ProjectPathNormalizer($this->basePath);
         $this->execution = $execution ?? new LaravelExecutionSemantics($index);
         $this->fieldAccess = $fieldAccess ?? new FieldAccessClassifier;
         $this->sourceSpans = $sourceSpans ?? new SourceSpanPlanner($this->basePath);
@@ -352,7 +365,7 @@ final class TaskContextPlanner
             throw new InvalidArgumentException('Task context minimum confidence must be between 0 and 1.');
         }
 
-        $targets = $this->validatedStringList($targets, 'targets', self::MAX_TARGETS, 512);
+        $targets = $this->validatedStringList($targets, 'targets', self::MAX_TARGETS, 4096);
         $changedFiles = $this->validatedStringList($changedFiles, 'changed files', self::MAX_CHANGED_FILES, 1024);
 
         return [$task, $targets, $changedFiles];
@@ -373,7 +386,12 @@ final class TaskContextPlanner
         foreach ($values as $value) {
             $characters = is_string($value) ? preg_match_all('/./us', trim($value), $matches) : false;
 
-            if (! is_string($value) || trim($value) === '' || $characters === false || $characters > $maxCharacters) {
+            if (! is_string($value)
+                || trim($value) === ''
+                || str_contains($value, "\0")
+                || $characters === false
+                || $characters > $maxCharacters
+                || strlen($value) > $maxCharacters * 4) {
                 throw new InvalidArgumentException("Task context {$label} must contain nonblank strings no longer than {$maxCharacters} characters.");
             }
 
@@ -1030,7 +1048,9 @@ final class TaskContextPlanner
         $relationships = [
             'belongs_to',
             'has_one',
+            'has_one_through',
             'has_many',
+            'has_many_through',
             'belongs_to_many',
             'morph_to',
             'morph_one',
@@ -1260,12 +1280,23 @@ final class TaskContextPlanner
 
                     if ($classification['truncated']) {
                         $omitted['field_metadata_limit']++;
-                        $uncertainties[] = [
+                        $from = (string) ($edge['from'] ?? '');
+                        $uncertainty = [
                             'reason' => 'column_field_metadata_limit',
                             'column' => $node['id'],
-                            'from' => BoundedText::utf8Bytes((string) ($edge['from'] ?? ''), self::MAX_NODE_ID_BYTES),
                             'message' => 'Field metadata was bounded; this access remains a possible match.',
                         ];
+
+                        if ($this->isBoundedExactReference($from)) {
+                            $uncertainty['from'] = $from;
+                        } else {
+                            $omitted['node_text_limit']++;
+                            $uncertainty['fromOmitted'] = true;
+                            $uncertainty['fromBytes'] = strlen($from);
+                            $uncertainty['fromCharacters'] = mb_strlen($from);
+                        }
+
+                        $uncertainties[] = $uncertainty;
                     }
 
                     if ($classification['match'] === 'excluded') {
@@ -1715,7 +1746,25 @@ final class TaskContextPlanner
             $compact = [];
 
             foreach (['file', 'line', 'rule', 'source', 'inference', 'syntax'] as $key) {
-                $value = $record[$key] ?? null;
+                if (! array_key_exists($key, $record)) {
+                    continue;
+                }
+
+                $value = $record[$key];
+
+                if (AgentPayloadLimiter::isExactStringKey($key)) {
+                    if (! is_string($value) || ! $this->isBoundedExactReference($value)) {
+                        // A provenance record is atomic. If its exact source
+                        // cannot be returned intact, omit the record and let
+                        // evidenceOmitted/evidenceTruncated report the gap.
+                        $compact = [];
+                        break;
+                    }
+
+                    $compact[$key] = $value;
+
+                    continue;
+                }
 
                 if (is_scalar($value)) {
                     $compact[$key] = is_string($value) ? BoundedText::utf8Bytes($value, 512) : $value;
@@ -2095,10 +2144,19 @@ final class TaskContextPlanner
 
                     if ($sourceFile === null) {
                         $omitted['evidence_source']++;
-                        $uncertainties[] = [
+                        $uncertainty = [
                             'reason' => 'edge_evidence_source_outside_project',
-                            'file' => BoundedText::utf8Bytes($file, 1024),
                         ];
+
+                        if ($this->isBoundedExactReference($file)) {
+                            $uncertainty['file'] = $file;
+                        } else {
+                            $uncertainty['fileOmitted'] = true;
+                            $uncertainty['fileBytes'] = strlen($file);
+                            $uncertainty['fileCharacters'] = mb_strlen($file);
+                        }
+
+                        $uncertainties[] = $uncertainty;
                         continue;
                     }
 
@@ -2588,6 +2646,15 @@ final class TaskContextPlanner
             && preg_match('//u', $type) === 1;
     }
 
+    private function isBoundedExactReference(string $value): bool
+    {
+        return $value !== ''
+            && ! str_contains($value, "\0")
+            && strlen($value) <= self::MAX_EXACT_REFERENCE_BYTES
+            && mb_strlen($value) <= self::MAX_EXACT_REFERENCE_CHARACTERS
+            && preg_match('//u', $value) === 1;
+    }
+
     /** @param array<string, mixed> $node */
     private function nodeTextExceedsLimit(array $node): bool
     {
@@ -2645,64 +2712,7 @@ final class TaskContextPlanner
 
     private function normalizeProjectFile(string $file): ?string
     {
-        if ($file === '' || str_contains($file, "\0")) {
-            return null;
-        }
-
-        $file = str_replace('\\', '/', trim($file));
-        $absolute = str_starts_with($file, '/') || preg_match('/^[A-Z]:\//i', $file) === 1;
-
-        if ($absolute) {
-            $resolved = realpath($file);
-            $candidate = str_replace('\\', '/', $resolved !== false ? $resolved : $file);
-
-            if (! $this->pathInsideBase($candidate)) {
-                return null;
-            }
-
-            return ltrim(substr($candidate, strlen($this->basePath)), '/');
-        }
-
-        $segments = [];
-
-        foreach (explode('/', $file) as $segment) {
-            if ($segment === '' || $segment === '.') {
-                continue;
-            }
-
-            if ($segment === '..') {
-                if ($segments === []) {
-                    return null;
-                }
-
-                array_pop($segments);
-                continue;
-            }
-
-            $segments[] = $segment;
-        }
-
-        if ($segments === []) {
-            return null;
-        }
-
-        $relative = implode('/', $segments);
-        $resolved = realpath($this->basePath.'/'.$relative);
-
-        if ($resolved !== false && ! $this->pathInsideBase(str_replace('\\', '/', $resolved))) {
-            return null;
-        }
-
-        return $relative;
-    }
-
-    private function pathInsideBase(string $path): bool
-    {
-        if ($this->basePath === '/') {
-            return str_starts_with($path, '/');
-        }
-
-        return $path === $this->basePath || str_starts_with($path, $this->basePath.'/');
+        return $this->projectPaths->normalize($file);
     }
 
     /** @return array<string, int> */

@@ -604,6 +604,16 @@ class DataFlowScanner
         }
 
         $callerId = $context['class'].'::'.$context['method'];
+        $existingTable = $graph->node('table:'.$table);
+
+        if (($existingTable?->metadata['identityAmbiguous'] ?? false) === true) {
+            $confidence = min($confidence, 0.5);
+            $metadata['matchCertainty'] = 'possible';
+            $metadata['ambiguity'] = 'database_scope_unresolved';
+            $metadata['schemaIdentityCount'] = count(
+                (array) ($existingTable->metadata['schemaIdentities'] ?? []),
+            );
+        }
 
         if (isset($this->methods[$context['class']][$context['method']])) {
             $graph->addNode($this->methodNode($context['class'], $context['method'], $this->methods[$context['class']][$context['method']]));
@@ -642,6 +652,9 @@ class DataFlowScanner
         $graph->addEdge(new Edge($callerId, 'table:'.$table, $type, $confidence, array_filter([
             'inference' => $metadata['inference'] ?? null,
             'targetRole' => $metadata['targetRole'] ?? null,
+            'matchCertainty' => $metadata['matchCertainty'] ?? null,
+            'ambiguity' => $metadata['ambiguity'] ?? null,
+            'schemaIdentityCount' => $metadata['schemaIdentityCount'] ?? null,
             'operations' => [
                 $operationKey => $operation,
             ],
@@ -1930,10 +1943,8 @@ class DataFlowScanner
             return false;
         }
 
-        return $class === 'DB'
-            || $class === 'Illuminate\Support\Facades\DB'
-            || $class === 'Illuminate\Database\DatabaseManager'
-            || class_basename($class) === 'DB';
+        return $class === 'Illuminate\Support\Facades\DB'
+            || $class === 'Illuminate\Database\DatabaseManager';
     }
 
     private function stringArg(?Arg $arg): ?string

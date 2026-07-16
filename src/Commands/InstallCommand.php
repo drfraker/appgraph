@@ -210,20 +210,57 @@ class InstallCommand extends Command
     {
         $path = $this->configuredPath('gitignore-path', '.gitignore');
         $contents = $files->exists($path) ? (string) $files->get($path) : '';
-        $output = storage_path(config('appgraph.output_path', 'appgraph/appgraph.json'));
-        $relativeOutput = $this->relativePath($output);
+        $storePath = config('appgraph.store.path', 'appgraph/appgraph.sqlite');
+        $storePath = is_string($storePath) && $storePath !== ''
+            ? ($this->isAbsolutePath($storePath) ? $storePath : storage_path($storePath))
+            : storage_path('appgraph/appgraph.sqlite');
+        $generatedPaths = [
+            storage_path(config('appgraph.output_path', 'appgraph/appgraph.json')),
+            $storePath,
+        ];
+        $patterns = [];
 
-        if ($relativeOutput === $output) {
-            $this->components->warn('AppGraph output is outside the project; .gitignore was left unchanged.');
+        foreach ($generatedPaths as $generatedPath) {
+            $relative = $this->relativePath($generatedPath);
+
+            if ($relative === $generatedPath) {
+                continue;
+            }
+
+            $directory = trim(str_replace('\\', '/', dirname($relative)), './');
+
+            if ($directory !== '') {
+                $patterns['/'.$directory.'/'] = true;
+
+                continue;
+            }
+
+            // dirname('appgraph.sqlite') is ".". Turning that into "//"
+            // neither identifies the file nor ignores SQLite's adjacent
+            // artifacts, so root-level generated files need exact patterns.
+            $filename = basename(str_replace('\\', '/', $relative));
+            $patterns['/'.$filename] = true;
+
+            if ($generatedPath === $storePath) {
+                foreach (['-wal', '-shm', '-journal'] as $suffix) {
+                    $patterns['/'.$filename.$suffix] = true;
+                }
+
+                $patterns['/.scan.lock'] = true;
+            }
+        }
+
+        if ($patterns === []) {
+            $this->components->warn('AppGraph generated files are outside the project; .gitignore was left unchanged.');
 
             return;
         }
 
-        $directory = trim(str_replace('\\', '/', dirname($relativeOutput)), './');
-        $pattern = '/'.$directory.'/';
+        $patterns = array_keys($patterns);
+        sort($patterns);
         $block = implode(PHP_EOL, [
             self::GITIGNORE_BLOCK_START,
-            $pattern,
+            ...$patterns,
             self::GITIGNORE_BLOCK_END,
         ]);
 
@@ -357,5 +394,10 @@ class InstallCommand extends Command
         }
 
         return base_path($path);
+    }
+
+    private function isAbsolutePath(string $path): bool
+    {
+        return str_starts_with($path, '/') || preg_match('/^[A-Z]:[\/\\\\]/i', $path) === 1;
     }
 }

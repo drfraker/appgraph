@@ -36,6 +36,33 @@ class LaravelIntrospection
         return $uri === '/' ? '/' : '/'.ltrim($uri, '/');
     }
 
+    public function routeDomain(Route $route): ?string
+    {
+        $domain = $route->getDomain();
+
+        if (! is_string($domain) || trim($domain) === '') {
+            return null;
+        }
+
+        $domain = preg_replace('#^https?://#i', '', trim($domain)) ?? trim($domain);
+        $parts = preg_split('/(\{[^}]+\})/', $domain, -1, PREG_SPLIT_DELIM_CAPTURE);
+
+        if (! is_array($parts)) {
+            return rtrim(strtolower($domain), '.');
+        }
+
+        $normalized = implode('', array_map(
+            static fn (string $part): string => str_starts_with($part, '{')
+                ? $part
+                : strtolower($part),
+            $parts,
+        ));
+
+        $normalized = rtrim($normalized, '.');
+
+        return $normalized !== '' ? $normalized : null;
+    }
+
     /**
      * @return array{class: string, method: string}|null
      */

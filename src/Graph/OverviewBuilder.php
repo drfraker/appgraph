@@ -35,7 +35,14 @@ class OverviewBuilder
         'belongs_to',
         'belongs_to_many',
         'has_many',
+        'has_many_through',
         'has_one',
+        'has_one_through',
+        'morphed_by_many',
+        'morph_many',
+        'morph_one',
+        'morph_to',
+        'morph_to_many',
     ];
 
     public function __construct(
@@ -115,12 +122,32 @@ class OverviewBuilder
                     break;
             }
 
-            if (in_array($edge->type, self::RELATIONSHIP_EDGE_TYPES, true) && ! str_starts_with($edge->to, 'unknown:')) {
-                $relationships[] = [
+            if (in_array($edge->type, self::RELATIONSHIP_EDGE_TYPES, true)) {
+                $targetUnknown = str_starts_with($edge->to, 'unknown:');
+
+                if ($targetUnknown && $edge->type !== 'morph_to') {
+                    continue;
+                }
+
+                $methods = $edge->metadata['relationshipMethods'] ?? [];
+
+                if (! is_array($methods)) {
+                    $methods = [];
+                }
+
+                $methods = array_values(array_unique(array_filter(
+                    $methods,
+                    static fn (mixed $method): bool => is_string($method) && $method !== '',
+                )));
+                sort($methods);
+
+                $relationships[] = array_filter([
                     'from' => $edge->from,
                     'to' => $edge->to,
                     'type' => $edge->type,
-                ];
+                    'methods' => $methods,
+                    'targetUnknown' => $targetUnknown ?: null,
+                ], static fn (mixed $value): bool => $value !== null && $value !== []);
             }
         }
 
@@ -271,6 +298,7 @@ class OverviewBuilder
                 'generatedAt' => $meta['generatedAt'] ?? null,
                 'laravelVersion' => $meta['laravelVersion'] ?? null,
                 'appgraphVersion' => $meta['appgraphVersion'] ?? null,
+                'generation' => $meta['generation'] ?? null,
                 'routeTraversal' => [
                     'maxDepth' => $this->routeDepth,
                     'maxMethods' => $this->routeMethodLimit,

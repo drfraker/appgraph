@@ -3,6 +3,7 @@
 namespace AppGraph\Query;
 
 use AppGraph\Graph\OverviewBuilder;
+use AppGraph\Support\AgentPayloadLimiter;
 use Illuminate\Container\Container;
 
 class QueryEngine
@@ -26,6 +27,16 @@ class QueryEngine
     ];
 
     private const DEFAULT_MAX_RELATED_FACTS = 10000;
+
+    private const MAX_DETAIL_OPERATIONS = 32;
+
+    private const MAX_DETAIL_FIELDS = 64;
+
+    private const MAX_DETAIL_SOURCE_OPERATIONS = 256;
+
+    private const MAX_DETAIL_SOURCE_FIELDS = 1024;
+
+    private const MAX_DETAIL_VALUE_BYTES = 1024;
 
     private LaravelExecutionSemantics $executionSemantics;
 
@@ -56,6 +67,7 @@ class QueryEngine
     public function overview(): array
     {
         $meta = $this->index->meta();
+        $scannerWarnings = ScannerWarningSummary::fromMeta($meta);
 
         $payload = [
             'meta' => array_filter([
@@ -69,6 +81,7 @@ class QueryEngine
                 'byNodeType' => $this->index->countsByNodeType(),
                 'byEdgeType' => $this->index->countsByEdgeType(),
             ],
+            'scannerWarnings' => $scannerWarnings,
         ];
 
         $analysis = $meta['analysis'] ?? [];
@@ -98,7 +111,7 @@ class QueryEngine
             }
         }
 
-        return $this->envelope('overview', null, $payload);
+        return $this->envelope('overview', null, $payload, $scannerWarnings['truncated']);
     }
 
     /**
@@ -126,12 +139,19 @@ class QueryEngine
             $depth,
             $minConfidence,
         );
-        $truncated = (bool) $payload['truncated'];
+        $meta = $this->index->meta();
+        $scannerWarnings = ScannerWarningSummary::fromMeta($meta);
+        $payload['scannerWarnings'] = $scannerWarnings;
+        $generation = $meta['generation'] ?? null;
+
+        if (is_array($generation) && is_string($generation['id'] ?? null)) {
+            $payload['verification']['baselineGeneration'] = $generation;
+        }
+        $truncated = (bool) $payload['truncated'] || $scannerWarnings['truncated'];
         unset($payload['truncated']);
         $sourcePath = $this->index->sourcePath();
 
         if ($this->staleness !== null && $sourcePath !== null) {
-            $meta = $this->index->meta();
             $staleness = $this->staleness->check(
                 $sourcePath,
                 is_array($meta['scan'] ?? null) ? $meta['scan'] : null,
@@ -158,8 +178,8 @@ class QueryEngine
         }
 
         $truncated = false;
-        $out = $this->boundedEdgeList($this->index->edgesFrom($id), 'to', $limit, $truncated);
-        $in = $this->boundedEdgeList($this->index->edgesTo($id), 'from', $limit, $truncated);
+        $out = $this->boundedEdgeList($this->index->edgesFrom($id), 'to', $limit, $truncated, $full);
+        $in = $this->boundedEdgeList($this->index->edgesTo($id), 'from', $limit, $truncated, $full);
 
         return $this->envelope('node', $target, array_filter([
             'node' => $node,
@@ -295,6 +315,7 @@ class QueryEngine
         $truncated = $routeActionSelectionTruncated;
         $executionTraversalTruncated = false;
         $executionMetadataTruncated = false;
+        $dataAccessDetailsTruncated = false;
         $actionReservationTruncated = false;
         $remainingTransitions = $maxTransitions;
         $methodSeeds = [[
@@ -482,14 +503,19 @@ class QueryEngine
 
             if (in_array($edge['type'], ['reads', 'writes'], true)) {
                 $key = $hit['id'].'|'.$edge['type'].'|'.$edge['to'];
+                $details = $includeDataAccessDetails
+                    ? $this->boundedEdgeDetails($edge)
+                    : ['ops' => [], 'fields' => [], 'truncated' => false];
+                $dataAccessDetailsTruncated = $dataAccessDetailsTruncated || $details['truncated'];
                 $dataAccess[$key] = array_filter([
                     'table' => str_starts_with($edge['to'], 'table:') ? substr($edge['to'], 6) : $edge['to'],
                     'access' => $edge['type'] === 'reads' ? 'read' : 'write',
                     'method' => $hit['id'],
                     'depth' => $hit['depth'],
                     'confidence' => $edgeConfidence,
-                    'ops' => $includeDataAccessDetails ? ($this->edgeOperations($edge) ?: null) : null,
-                    'fields' => $includeDataAccessDetails ? ($this->edgeFields($edge) ?: null) : null,
+                    'ops' => $includeDataAccessDetails ? ($details['ops'] ?: null) : null,
+                    'fields' => $includeDataAccessDetails ? ($details['fields'] ?: null) : null,
+                    'detailsTruncated' => $details['truncated'] ?: null,
                 ], static fn ($value): bool => $value !== null);
                 continue;
             }
@@ -729,10 +755,15 @@ class QueryEngine
             $truncated = true;
         }
 
+        if ($dataAccessDetailsTruncated) {
+            $truncated = true;
+        }
+
         $truncation = array_filter([
             'routeActionSelection' => $routeActionSelectionTruncated ?: null,
             'executionTraversal' => $executionTraversalTruncated ?: null,
             'executionMetadata' => $executionMetadataTruncated ?: null,
+            'dataAccessDetails' => $dataAccessDetailsTruncated ?: null,
             'actionReservation' => $actionReservationTruncated ?: null,
             'relatedFacts' => $relatedFactsTruncated ? [
                 'maxRelatedFacts' => $maxRelatedFacts,
@@ -851,24 +882,17 @@ class QueryEngine
 
         foreach ($this->index->edgesTo($tableId, [$edgeType]) as $edge) {
             $fromNode = $this->index->node($edge['from']);
-
-            $ops = [];
-
-            foreach ($edge['metadata']['operations'] ?? [] as $operation) {
-                if (isset($operation['operation'])) {
-                    $ops[$operation['operation']] = $operation['operation'];
-                }
-            }
-
-            sort($ops);
+            $details = $this->boundedEdgeDetails($edge);
+            $truncated = $truncated || $details['truncated'];
 
             $results[] = array_filter([
                 'id' => $edge['from'],
                 'file' => $fromNode['file'] ?? null,
                 'line' => $fromNode['line'] ?? null,
                 'confidence' => $edge['confidence'] ?? null,
-                'ops' => array_values($ops) ?: null,
-                'fields' => $this->edgeFields($edge) ?: null,
+                'ops' => $details['ops'] ?: null,
+                'fields' => $details['fields'] ?: null,
+                'detailsTruncated' => $details['truncated'] ?: null,
             ], static fn ($value): bool => $value !== null);
         }
 
@@ -895,11 +919,15 @@ class QueryEngine
         int $limit,
     ): array {
         $matches = ['proven' => [], 'possible' => [], 'excluded' => []];
+        $truncated = false;
 
         $tableName = str_starts_with($tableId, 'table:') ? substr($tableId, 6) : $tableId;
 
         foreach ($this->index->edgesTo($tableId, [$edgeType]) as $edge) {
-            $classified = $this->fieldAccessClassifier->classify($edge, $field, $tableName);
+            $classified = $this->boundedClassification(
+                $this->fieldAccessClassifier->classifyForTask($edge, $field, $tableName),
+            );
+            $truncated = $truncated || $classified['detailsTruncated'];
             $fromNode = $this->index->node($edge['from']);
             $row = array_filter([
                 'id' => $edge['from'],
@@ -912,6 +940,7 @@ class QueryEngine
                 'provenOps' => $classified['provenOps'] ?: null,
                 'possibleOps' => $classified['possibleOps'] ?: null,
                 'excludedOps' => $classified['excludedOps'] ?: null,
+                'detailsTruncated' => $classified['detailsTruncated'] ?: null,
             ], static fn (mixed $value): bool => $value !== null);
             $matches[$classified['match']][] = $row;
         }
@@ -922,7 +951,6 @@ class QueryEngine
         unset($group);
 
         $counts = array_map('count', $matches);
-        $truncated = false;
 
         foreach ($matches as &$group) {
             if (count($group) > $limit) {
@@ -981,11 +1009,19 @@ class QueryEngine
     {
         $seed = $this->resolve($target);
         $groups = ['methods' => [], 'models' => [], 'formRequests' => [], 'routes' => []];
-        $visited = [$seed => true];
+        /** @var array<string, array<int, float>> $states */
+        $states = [$seed => [0 => 1.0]];
         $queue = [[$seed, 0, 1.0]];
+        $truncated = false;
 
         while ($queue !== []) {
             [$currentId, $depth, $confidence] = array_shift($queue);
+
+            // A stronger/shallower state may have dominated this queued state
+            // after it was enqueued. Do not expand stale work.
+            if (($states[$currentId][$depth] ?? null) !== $confidence) {
+                continue;
+            }
 
             if ($depth >= $maxDepth) {
                 continue;
@@ -1011,43 +1047,70 @@ class QueryEngine
 
             foreach ($this->index->edgesTo($currentId, $edgeTypes) as $edge) {
                 $fromId = $edge['from'];
-
-                if (isset($visited[$fromId])) {
-                    continue;
-                }
-
                 $pathConfidence = round($confidence * (float) ($edge['confidence'] ?? 1.0), 4);
+                $candidateDepth = $depth + 1;
 
                 if ($pathConfidence < $minConfidence) {
                     continue;
                 }
 
-                $visited[$fromId] = true;
+                $dominated = false;
+
+                foreach ($states[$fromId] ?? [] as $seenDepth => $seenConfidence) {
+                    if ($seenDepth <= $candidateDepth && $seenConfidence >= $pathConfidence) {
+                        $dominated = true;
+                        break;
+                    }
+                }
+
+                if ($dominated) {
+                    continue;
+                }
+
+                // Keep the Pareto frontier of depth/confidence states. A
+                // later stronger path must be re-expanded, while a shallower
+                // weaker path may still matter because it has more hops left.
+                foreach ($states[$fromId] ?? [] as $seenDepth => $seenConfidence) {
+                    if ($seenDepth >= $candidateDepth && $seenConfidence <= $pathConfidence) {
+                        unset($states[$fromId][$seenDepth]);
+                    }
+                }
+
+                $states[$fromId][$candidateDepth] = $pathConfidence;
+                ksort($states[$fromId]);
                 $fromNode = $this->index->node($fromId);
+                $group = match ($fromNode['type'] ?? null) {
+                    'method' => 'methods',
+                    'model' => 'models',
+                    'form_request' => 'formRequests',
+                    'route' => 'routes',
+                    default => null,
+                };
+                $row = null;
 
                 switch ($fromNode['type'] ?? null) {
                     case 'method':
-                        $groups['methods'][] = array_filter([
+                        $row = array_filter([
                             'id' => $fromId,
-                            'depth' => $depth + 1,
+                            'depth' => $candidateDepth,
                             'confidence' => $pathConfidence,
                             'file' => $fromNode['file'] ?? null,
                             'line' => $fromNode['line'] ?? null,
                         ], static fn ($value): bool => $value !== null);
                         break;
                     case 'model':
-                        $groups['models'][] = array_filter([
+                        $row = array_filter([
                             'id' => $fromId,
-                            'depth' => $depth + 1,
+                            'depth' => $candidateDepth,
                             'confidence' => $pathConfidence,
                             'file' => $fromNode['file'] ?? null,
                             'line' => $fromNode['line'] ?? null,
                         ], static fn ($value): bool => $value !== null);
                         break;
                     case 'form_request':
-                        $groups['formRequests'][] = array_filter([
+                        $row = array_filter([
                             'id' => $fromId,
-                            'depth' => $depth + 1,
+                            'depth' => $candidateDepth,
                             'confidence' => $pathConfidence,
                             'file' => $fromNode['file'] ?? null,
                             'line' => $fromNode['line'] ?? null,
@@ -1055,23 +1118,33 @@ class QueryEngine
                         break;
                     case 'route':
                         $action = $this->index->edgesFrom($fromId, ['routes_to'])[0]['to'] ?? null;
-                        $groups['routes'][] = array_filter([
+                        $row = array_filter([
                             'id' => $fromId,
                             'label' => $fromNode['label'] ?? null,
                             'action' => $action,
                             'confidence' => $pathConfidence,
-                            'depth' => $depth + 1,
+                            'depth' => $candidateDepth,
                         ], static fn ($value): bool => $value !== null);
                         break;
                 }
 
-                $queue[] = [$fromId, $depth + 1, $pathConfidence];
+                if ($group !== null && $row !== null) {
+                    $existing = $groups[$group][$fromId] ?? null;
+
+                    if ($existing === null
+                        || $pathConfidence > (float) $existing['confidence']
+                        || ($pathConfidence === (float) $existing['confidence']
+                            && $candidateDepth < (int) $existing['depth'])) {
+                        $groups[$group][$fromId] = $row;
+                    }
+                }
+
+                $queue[] = [$fromId, $candidateDepth, $pathConfidence];
             }
         }
 
-        $truncated = false;
-
         foreach ($groups as $key => $group) {
+            $group = array_values($group);
             usort($group, static fn (array $a, array $b): int => [$a['depth'], $a['id']] <=> [$b['depth'], $b['id']]);
 
             if (count($group) > $limit) {
@@ -1243,42 +1316,140 @@ class QueryEngine
 
     /**
      * @param array<string, mixed> $edge
-     * @return array<int, string>
+     * @return array{ops: array<int, string>, fields: array<int, string>, truncated: bool}
      */
-    private function edgeOperations(array $edge): array
+    private function boundedEdgeDetails(array $edge): array
     {
+        $rawOperations = is_array($edge['metadata']['operations'] ?? null)
+            ? $edge['metadata']['operations']
+            : [];
         $operations = [];
-
-        foreach ($edge['metadata']['operations'] ?? [] as $operation) {
-            if (is_array($operation) && isset($operation['operation'])) {
-                $operations[(string) $operation['operation']] = (string) $operation['operation'];
-            }
-        }
-
-        sort($operations);
-
-        return array_values($operations);
-    }
-
-    /**
-     * @param array<string, mixed> $edge
-     * @return array<int, string>
-     */
-    private function edgeFields(array $edge): array
-    {
         $fields = [];
+        $truncated = count($rawOperations) > self::MAX_DETAIL_SOURCE_OPERATIONS;
+        $examinedOperations = 0;
+        $examinedFields = 0;
 
-        foreach ($edge['metadata']['operations'] ?? [] as $operation) {
-            foreach ($operation['fields'] ?? [] as $field) {
-                if (is_string($field)) {
+        foreach ($rawOperations as $operation) {
+            if ($examinedOperations >= self::MAX_DETAIL_SOURCE_OPERATIONS) {
+                break;
+            }
+
+            $examinedOperations++;
+
+            if (! is_array($operation)) {
+                $truncated = true;
+
+                continue;
+            }
+
+            $name = $operation['operation'] ?? null;
+
+            if (is_scalar($name) && $name !== null) {
+                $name = (string) $name;
+
+                if ($name !== '' && strlen($name) <= self::MAX_DETAIL_VALUE_BYTES) {
+                    if (count($operations) < self::MAX_DETAIL_OPERATIONS || isset($operations[$name])) {
+                        $operations[$name] = $name;
+                    } else {
+                        $truncated = true;
+                    }
+                } elseif ($name !== '') {
+                    $truncated = true;
+                }
+            }
+
+            $rawFields = is_array($operation['fields'] ?? null) ? $operation['fields'] : [];
+
+            if (count($rawFields) > self::MAX_DETAIL_SOURCE_FIELDS - $examinedFields) {
+                $truncated = true;
+            }
+
+            foreach ($rawFields as $field) {
+                if ($examinedFields >= self::MAX_DETAIL_SOURCE_FIELDS) {
+                    break 2;
+                }
+
+                $examinedFields++;
+
+                if (! is_string($field) || $field === '') {
+                    $truncated = true;
+
+                    continue;
+                }
+
+                if (strlen($field) > self::MAX_DETAIL_VALUE_BYTES) {
+                    $truncated = true;
+
+                    continue;
+                }
+
+                if (count($fields) < self::MAX_DETAIL_FIELDS || isset($fields[$field])) {
                     $fields[$field] = $field;
+                } else {
+                    $truncated = true;
                 }
             }
         }
 
-        sort($fields);
+        ksort($operations);
+        ksort($fields);
 
-        return array_values($fields);
+        return [
+            'ops' => array_values($operations),
+            'fields' => array_values($fields),
+            'truncated' => $truncated,
+        ];
+    }
+
+    /**
+     * @param array{match: string, ops: array<int, string>, fields: array<int, string>, provenOps: array<int, string>, possibleOps: array<int, string>, excludedOps: array<int, string>, truncated: bool} $classified
+     * @return array{match: string, ops: array<int, string>, fields: array<int, string>, provenOps: array<int, string>, possibleOps: array<int, string>, excludedOps: array<int, string>, detailsTruncated: bool}
+     */
+    private function boundedClassification(array $classified): array
+    {
+        $truncated = $classified['truncated'];
+
+        foreach (['ops', 'provenOps', 'possibleOps', 'excludedOps'] as $field) {
+            $classified[$field] = $this->boundedDetailStrings(
+                $classified[$field],
+                self::MAX_DETAIL_OPERATIONS,
+                $truncated,
+            );
+        }
+
+        $classified['fields'] = $this->boundedDetailStrings(
+            $classified['fields'],
+            self::MAX_DETAIL_FIELDS,
+            $truncated,
+        );
+        unset($classified['truncated']);
+        $classified['detailsTruncated'] = $truncated;
+
+        return $classified;
+    }
+
+    /** @param array<int, string> $values @return array<int, string> */
+    private function boundedDetailStrings(array $values, int $limit, bool &$truncated): array
+    {
+        $bounded = [];
+
+        foreach ($values as $value) {
+            if (count($bounded) >= $limit) {
+                $truncated = true;
+
+                break;
+            }
+
+            if (strlen($value) > self::MAX_DETAIL_VALUE_BYTES) {
+                $truncated = true;
+
+                continue;
+            }
+
+            $bounded[] = $value;
+        }
+
+        return $bounded;
     }
 
     /**
@@ -1325,14 +1496,23 @@ class QueryEngine
      * @param array<int, array<string, mixed>> $edges
      * @return array<int, array<string, mixed>>
      */
-    private function boundedEdgeList(array $edges, string $endpoint, int $limit, bool &$truncated): array
+    private function boundedEdgeList(
+        array $edges,
+        string $endpoint,
+        int $limit,
+        bool &$truncated,
+        bool $full = false,
+    ): array
     {
         $results = array_map(
-            static fn (array $edge): array => [
+            static fn (array $edge): array => array_filter([
                 $endpoint => $edge[$endpoint],
                 'type' => $edge['type'],
                 'confidence' => $edge['confidence'] ?? 1.0,
-            ],
+                'metadata' => $full && is_array($edge['metadata'] ?? null)
+                    ? $edge['metadata']
+                    : null,
+            ], static fn (mixed $value): bool => $value !== null && $value !== []),
             $edges
         );
 
@@ -1358,7 +1538,19 @@ class QueryEngine
             $envelope['target'] = $target;
         }
 
-        $generatedAt = $this->index->meta()['generatedAt'] ?? null;
+        $meta = $this->index->meta();
+        $generation = $meta['generation'] ?? null;
+
+        if (is_array($generation) && is_string($generation['id'] ?? null)) {
+            $envelope['generation'] = $generation;
+        } else {
+            $envelope['generationUnavailable'] = [
+                'reason' => 'legacy_json_without_immutable_generation',
+                'message' => 'Run `php artisan appgraph:scan` before editing to capture a verifiable SQLite baseline.',
+            ];
+        }
+
+        $generatedAt = $meta['generatedAt'] ?? null;
 
         if (is_string($generatedAt)) {
             $envelope['generatedAt'] = $generatedAt;
@@ -1375,6 +1567,6 @@ class QueryEngine
             $envelope['truncated'] = true;
         }
 
-        return $envelope;
+        return AgentPayloadLimiter::limit($envelope);
     }
 }

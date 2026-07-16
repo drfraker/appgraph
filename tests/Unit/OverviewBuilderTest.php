@@ -86,6 +86,41 @@ class OverviewBuilderTest extends TestCase
         );
     }
 
+    public function test_it_exposes_extended_relationship_methods_without_inventing_morph_targets(): void
+    {
+        $graph = new Graph();
+        $source = 'App\\Models\\Project';
+        $target = 'App\\Models\\Deployment';
+        $unknown = 'unknown:relationship:App\\Models\\Activity::subject';
+        $graph->addNode(Node::make($source, 'model', 'Project'));
+        $graph->addNode(Node::make($target, 'model', 'Deployment'));
+        $graph->addNode(Node::make($unknown, 'unknown', 'subject'));
+        $graph->addEdge(new Edge($source, $target, 'has_many_through', 0.75, [
+            'relationshipMethods' => ['deployments'],
+        ]));
+        $graph->addEdge(new Edge('App\\Models\\Activity', $unknown, 'morph_to', 0.45, [
+            'relationshipMethods' => ['subject'],
+        ]));
+
+        $relationships = (new OverviewBuilder())->build($graph)['relationships'];
+
+        $this->assertSame([
+            [
+                'from' => 'App\\Models\\Activity',
+                'to' => $unknown,
+                'type' => 'morph_to',
+                'methods' => ['subject'],
+                'targetUnknown' => true,
+            ],
+            [
+                'from' => $source,
+                'to' => $target,
+                'type' => 'has_many_through',
+                'methods' => ['deployments'],
+            ],
+        ], $relationships);
+    }
+
     public function test_route_summaries_cross_calls_and_active_event_and_job_handlers(): void
     {
         $overview = (new OverviewBuilder())->build($this->causalRouteGraph());

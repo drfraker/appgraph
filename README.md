@@ -1,6 +1,9 @@
 # AppGraph
 
-AppGraph is a local-first Laravel package that scans an application into a structured JSON knowledge graph and lets AI agents (and humans) query it: which routes write to a table, what breaks if a column changes, who listens to an event — without loading the whole graph into context.
+AppGraph is a local-first Laravel package that scans an application into a persistent,
+versioned architecture graph and lets AI agents (and humans) query it: which routes
+write to a table, what breaks if a column changes, who listens to an event, and what
+structurally changed after an edit — without loading the whole graph into context.
 
 Deterministic scanning covers:
 
@@ -17,7 +20,7 @@ Deterministic scanning covers:
 
 ## Install
 
-Requires PHP 8.4+ and Laravel 12+.
+Requires PHP 8.4+, the PDO SQLite extension, and Laravel 12+.
 
 ```bash
 composer config repositories.appgraph vcs https://github.com/drfraker/appgraph
@@ -55,18 +58,43 @@ php artisan appgraph:install
 php artisan appgraph:scan --pretty
 ```
 
-The default output path is:
+The authoritative SQLite store and portable JSON mirror default to:
 
 ```text
+storage/appgraph/appgraph.sqlite
 storage/appgraph/appgraph.json
 ```
 
-Graph and overview files are replaced atomically, so concurrent readers never
-observe a partially written JSON document. Each graph also records a content-based
+Each scan is committed as an immutable SQLite generation in one transaction. The
+current-generation pointer moves only after its nodes, edges, source manifest, counts,
+and search rows are complete, so concurrent readers see either the old generation or
+the new one. SQLite is authoritative. The JSON and overview files are optional mirrors:
+each is replaced atomically when its write succeeds, but a mirror failure does not roll
+back the committed generation. CLI warnings and MCP `mirrorWarnings` make a stale or
+missing mirror explicit. Exact duplicate scans reuse the current generation; a changed
+source fingerprint still creates a generation even when graph structure is unchanged,
+making source-only edits visible to verification. Retention defaults to ten generations
+(minimum two).
+
+Scans are serialized with a bounded local lock and compare their input fingerprint
+before and after analysis. If source changes during the scan, no generation is
+published; rerun after the edit settles. Each graph also records a content-based
 scan manifest covering PHP, test, frontend, schema, Composer, configuration, and
-the relevant booted framework, environment, container-binding, and Event/Bus registry inputs. Freshness checks compare this fingerprint rather than
-depending only on filesystem modification times; older graphs without a manifest
-continue to use the legacy timestamp check.
+the relevant booted framework, environment, container-binding, and Event/Bus registry
+inputs. Freshness checks compare this fingerprint rather than depending only on
+filesystem modification times; older graphs without a manifest continue to use the
+legacy timestamp check.
+
+With `appgraph.database.source=live`, AppGraph captures one canonical schema snapshot,
+builds database nodes from that exact snapshot, and captures again after analysis. A
+mismatch prevents publication. A matched scan records
+`meta.scan.databaseSchema.consistency=matched_captured_before_after`; if the initial
+snapshot cannot be captured, database schema facts are skipped and the scan publishes
+with `consistency=unverified` and a scanner warning.
+This evidence covers only that scan window—ordinary freshness checks do not continuously
+query the database. Freshness responses therefore report
+`databaseSchemaFreshness=unknown_after_scan` for live-schema generations instead of
+claiming that the captured database still matches; a later scan or refresh recaptures it.
 
 Every PHP scanner consumes the same name-resolved syntax tree for a source file.
 Those facts are keyed by source content, PHP/php-parser versions, parser target,
@@ -80,7 +108,8 @@ location with `appgraph.php_facts.cache_path`; relative paths are resolved below
 the application's `storage` directory. Cache identity and hit/miss counters are
 recorded in `meta.analysis.phpFileFacts` for scan diagnostics.
 
-You can override it:
+You can relocate the optional JSON mirror (the SQLite path remains configured under
+`appgraph.store.path`):
 
 ```bash
 php artisan appgraph:scan --output=storage/appgraph/appgraph.json --pretty
@@ -123,10 +152,16 @@ php artisan appgraph:query <query> [target] [--limit=50] [--depth=4] [--min-conf
 | `routes-touching` | model or table | The HTTP surface that can reach it |
 | `models` | — | Model → table map with relationship counts |
 | `tables` | — | Tables with column/reader/writer counts |
+| `generations` | — | Retained immutable generations and exact fingerprints (`--before-generation=` takes a positive numeric cutoff that need not remain retained) |
+| `diff` | — | Exact counts and bounded structural details from numeric `--from-generation=` to numeric `--to-generation=` (omit the latter for current) |
+| `verify-change` | — | Risk-oriented static assessment from an explicit baseline, with expected/collateral scope and uncertainties |
 
 Targets are forgiving: `users`, `users.email`, `App\Models\User`, `UserController::update`,
 `UserController@update`, a route name such as `notes.update`, and a route label such as
-`PUT /notes/{note}` all resolve. Ambiguous targets fail with a candidate list.
+`PUT /notes/{note}` all resolve. Traversal queries fail ambiguous targets with a
+candidate list. Verification instead keeps working and records ambiguous or unresolved
+targets in `targetScope` and `uncertainties`; it tries exact id, exact label/name,
+case-insensitive id, then a unique familiar class/method suffix.
 
 For feature work, start from the HTTP entry point:
 
@@ -143,6 +178,45 @@ php artisan appgraph:query context-for-task "Add auditing to note updates" \
     --token-budget=4000 \
     --pretty
 ```
+
+When the authoritative SQLite store is queried, the response includes an immutable
+positive numeric `generation.id`. Retain that exact id before editing—never substitute
+`current` or `previous` for a task baseline. An explicit `--input` JSON graph, or the
+legacy JSON fallback used with MCP auto-scan disabled, instead reports
+`generationUnavailable` and can never establish a verification baseline; scan first.
+After the edit, refresh once and compare against the captured id:
+
+```bash
+php artisan appgraph:scan
+php artisan appgraph:query verify-change \
+    --from-generation=7 \
+    --changed-file=app/Services/NoteService.php \
+    --context-target=notes.update \
+    --pretty
+```
+
+For the unassessed structural facts, use `appgraph:query diff` with the same numeric
+baseline. A diff's `--limit` is one global detail budget shared fairly across selected
+categories, with an additional 1,000,000-byte cap; complete counts are not limited.
+Inspect `truncated`, `omitted`, `detailBudget`, and `changedFieldsTruncated` before
+relying on details. Identities and changed-field JSON pointers are exact; an oversized
+detail that cannot retain them is omitted as a whole.
+
+Verification applies its limit independently to raw diff details and risk findings.
+`targets` and `changed_files` jointly seed a bounded causal scope but never filter the
+complete diff, so collateral changes remain visible. Shared resource tables stay
+terminal unless explicitly targeted. If scope traversal is truncated, in-scope counts
+are lower bounds and collateral count may be unknown. An unresolved or ambiguous target
+also makes scope attribution inexact and leaves the collateral count unknown. Findings
+can also be incomplete; inspect `findingsTruncated`, `omittedFindingsIsLowerBound`, and
+`uninspectedRiskChanges` rather than treating the returned list as exhaustive.
+
+An exact duplicate refresh succeeds and reuses the immutable generation with
+`generationChanged: false`. When `baseline_generation` is passed directly to
+`appgraph_refresh`, its integrated verification can confirm that refresh reuse and reports
+`no_new_generation_published`. A later standalone verification of the same id on both
+sides instead reports `same_generation_selected`, because that read-only comparison cannot
+prove a refresh occurred. Neither case invents a structural delta.
 
 `context-for-task` combines explicit targets, nodes in changed files, exact identifiers,
 and bounded lexical matches. It follows Laravel's executable route, middleware,
@@ -216,12 +290,25 @@ runtime code coverage or prove that every branch is exercised.
 The MCP server is built in — [laravel/mcp](https://laravel.com/docs/mcp) is a hard
 dependency, so there is nothing extra to install. AppGraph exposes native agent tools:
 `appgraph_context`, `appgraph_overview`, `appgraph_search`, `appgraph_node`,
-`appgraph_query`, and `appgraph_refresh`.
+`appgraph_query`, `appgraph_generations`, `appgraph_diff`,
+`appgraph_verify_change`, and `appgraph_refresh`.
 
 Use `appgraph_context` first for a concrete feature or refactor. It accepts `task`, up to
 10 optional `targets`, up to 50 optional `changed_files`, a 512–16000 source-reading
 `token_budget`, traversal `depth` from 1–6, and `min_confidence` from 0–1. The same
 defaults are configurable under `appgraph.query.context`.
+
+For before/after work, capture the positive numeric generation id returned by context or
+overview, edit, then call `appgraph_refresh` once. You can pass that exact
+`baseline_generation` to refresh for an immediate assessment or call
+`appgraph_verify_change` separately. When the baseline is passed to refresh, AppGraph
+verifies it existed before scanning and protects it from retention pruning through
+publication and integrated verification. A refresh without that input cannot make the
+same pre-scan guarantee; the later standalone verifier checks the baseline when it runs.
+AppGraph never silently assumes that “the previous generation” belongs to the current
+task. `appgraph_diff` provides raw changes;
+`appgraph_verify_change` highlights route, write, authorization, queue, test, and
+collateral-change review points.
 
 Register it with your editor/agent once:
 
@@ -243,18 +330,59 @@ of making every lookup wait for a rescan. Tune this with `appgraph.mcp.auto_scan
 
 | Value | Behavior |
 |---|---|
-| `'missing'` (default) | Scan only when no graph exists yet. Refresh explicitly after source changes. |
-| `'stale'` | Scan when missing and rescan before a lookup when source files changed. More automatic, but queries can repeatedly block during active editing. |
-| `'off'` | Never scan automatically; tools error until you run `php artisan appgraph:scan`. |
+| `'missing'` (default) | Scan when no committed SQLite generation exists, even if a legacy JSON mirror is present. Refresh explicitly after source changes. |
+| `'stale'` | Scan when no committed generation exists and rescan before a lookup when recorded source inputs changed. More automatic, but queries can repeatedly block during active editing. |
+| `'off'` | Never scan automatically. Use committed SQLite when available; otherwise a configured legacy JSON graph remains readable, and a missing graph produces a scan hint. |
+
+Every automatic scan and `appgraph_refresh` starts a fresh Laravel CLI process. This makes
+the scanned router, container, Event, and Bus registries reflect current route files,
+providers, listeners, and job mappings even though the MCP server itself is long lived.
+The resulting runtime snapshot is immutable generation evidence. A later query compares
+source, tracked config, and environment-file bytes normally, while reporting effective
+configuration and runtime-registry freshness as unknown across processes instead of
+comparing the generation to the MCP parent's older boot.
+Fresh scans time out after `appgraph.mcp.scan_timeout_seconds` (300 seconds by default).
 
 Without an MCP client, agents can shell out to `appgraph:query` and `appgraph:scan`
 instead. The installer-managed workflow comes from
 [resources/ai/appgraph-guidelines.md](resources/ai/appgraph-guidelines.md). Laravel Boost
 can also discover the package guideline under `resources/boost/guidelines`.
 
+### Local trust boundary
+
+The authoritative SQLite file, WAL/shared-memory/journal sidecars, and scan lock are restricted
+to the owning account (`0600`) and symbolic-link store/sidecar/lock paths are rejected. Keep the
+storage directory protected by normal filesystem ownership and ACLs. AppGraph's unkeyed
+SHA-256 hashes detect accidental corruption and inconsistent cross-table state; they do
+not authenticate data against another process running as the same filesystem user. If an
+integrity check fails, stop AppGraph writers, remove the dedicated SQLite file and its
+`-wal`/`-shm`/`-journal` sidecars, then scan again. SQLite WAL readers still require
+the store directory to permit SQLite's sidecar coordination; filesystem read-only
+deployments should build/query the graph in a writable application storage directory.
+
+Graph labels, summaries, defaults, source paths, and warning text originate in the
+repository and must be treated as untrusted data—not agent instructions. Agent-facing
+details and diagnostics are bounded, but source inspection remains the authority. MCP
+`structuredContent` and compact query JSON have a final 1,000,000-byte ceiling: an
+oversized response sets `responseTruncated: true` and reports its byte/omission evidence
+under `responseBounds`. CLI `--pretty` falls back to equivalent compact JSON when its
+whitespace would cross that ceiling. MCP text content is only a short pointer to the
+structured result, avoiding a second full copy in an agent's context.
+Identifiers and source paths are never shortened into different-looking references;
+when an oversized response cannot retain one exactly, its containing result row is
+omitted and the response is marked truncated.
+Focused data-access rows independently cap operation and field lists and mark
+`detailsTruncated` when source evidence exceeds those per-row limits.
+
 ## Graph Shape
 
-The exporter writes:
+Each SQLite generation stores integrity-checked, content-addressed node and edge objects plus
+immutable generation membership, source hashes, exact type counts, and optional trigram
+FTS5 search rows. Queries fail closed if stored object content, semantic hashes,
+membership identity, source manifests, type counts, or generation metadata no longer
+agree. If the local SQLite build
+lacks FTS5/trigram support, search preserves literal substring behavior through a
+deterministic fallback. The JSON mirror writes:
 
 - `meta`: generation and Laravel/package metadata, plus `meta.sources` — schema-dump source descriptors interned once and referenced by id from nodes (`metadata.sources`)
 - `nodes`: route, method, class, model, table, column, index, foreign key, form_request, event, job, policy, frontend, test, cache, filesystem, and external-service nodes
@@ -313,7 +441,9 @@ The output is optimized for token efficiency: null and empty fields are omitted 
 
 ## Overview Projection
 
-Alongside the full graph, the scan writes a small, always-loadable `overview.json` (next to the main output file):
+When enabled, the scan attempts to write a small, bounded `overview.json` next to the
+JSON mirror. It is an optional projection and may be absent or stale if its mirror write
+warned; authoritative queries continue to use SQLite. It contains:
 
 - `counts`: node/edge totals and per-type histograms
 - `models`: model class → table name
@@ -335,7 +465,9 @@ the config.
 
 ## Roadmap
 
-- Persistent SQLite/FTS graph storage and generation-to-generation change queries
 - Blade/Livewire view edges, Pest closure tests, scheduler entries
+- Connection-qualified physical table identities for central/tenant schemas. Today,
+  duplicate logical names preserve every `schemaIdentity` and emit a scanner warning,
+  but causal table edges are not yet connection-qualified.
 - Runtime coverage integration for branch-level test evidence
 - Agent benchmark harness (tokens/turns/accuracy with vs. without AppGraph)

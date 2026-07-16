@@ -20,6 +20,12 @@ class SideEffectScanner
 {
     use InteractsWithPhpAst;
 
+    private const CACHE_FACADE = 'Illuminate\Support\Facades\Cache';
+
+    private const HTTP_FACADE = 'Illuminate\Support\Facades\Http';
+
+    private const STORAGE_FACADE = 'Illuminate\Support\Facades\Storage';
+
     /** @var array<string, array<string, mixed>> */
     private array $classes = [];
 
@@ -183,9 +189,7 @@ class SideEffectScanner
      */
     private function inspectCall(Graph $graph, Expr\StaticCall|Expr\MethodCall $call, string $operation, ?string $root, array $context): void
     {
-        $facade = class_basename((string) $root);
-
-        if ($facade === 'Cache') {
+        if ($root === self::CACHE_FACADE) {
             $key = $operation === 'flush' ? '*' : $this->literalArg($call->args[0] ?? null);
 
             if (in_array($operation, $this->cacheReads, true)) {
@@ -199,7 +203,7 @@ class SideEffectScanner
             return;
         }
 
-        if ($facade === 'Storage') {
+        if ($root === self::STORAGE_FACADE) {
             $path = $this->literalArg($call->args[0] ?? null);
 
             if (in_array($operation, $this->filesystemReads, true)) {
@@ -213,7 +217,7 @@ class SideEffectScanner
             return;
         }
 
-        if ($facade === 'Http' && in_array($operation, $this->httpCalls, true)) {
+        if ($root === self::HTTP_FACADE && in_array($operation, $this->httpCalls, true)) {
             $argumentIndex = $operation === 'send' ? 1 : 0;
             $url = $this->literalArg($call->args[$argumentIndex] ?? null);
             $this->addEffect($graph, $context, 'external_service', 'http', $url, 'calls_external', $operation, $call->getStartLine());

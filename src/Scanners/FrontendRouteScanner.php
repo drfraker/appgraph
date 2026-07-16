@@ -5,12 +5,21 @@ namespace AppGraph\Scanners;
 use AppGraph\Graph\Edge;
 use AppGraph\Graph\Graph;
 use AppGraph\Graph\Node;
+use AppGraph\Scanners\Concerns\MatchesRouteTargets;
 use AppGraph\Support\FileFinder;
+use AppGraph\Support\SourceFileObservations;
 
 class FrontendRouteScanner
 {
-    public function __construct(private FileFinder $files)
-    {
+    use MatchesRouteTargets;
+
+    private SourceFileObservations $sourceObservations;
+
+    public function __construct(
+        private FileFinder $files,
+        ?SourceFileObservations $sourceObservations = null,
+    ) {
+        $this->sourceObservations = $sourceObservations ?? new SourceFileObservations();
     }
 
     public function scan(Graph $graph): Graph
@@ -30,6 +39,9 @@ class FrontendRouteScanner
                     'id' => $node->id,
                     'uri' => '/'.ltrim($node->metadata['uri'], '/'),
                     'methods' => array_map('strtoupper', $node->metadata['methods'] ?? []),
+                    'domain' => is_string($node->metadata['domain'] ?? null)
+                        ? $node->metadata['domain']
+                        : null,
                 ];
             }
         }
@@ -42,6 +54,8 @@ class FrontendRouteScanner
             if ($source === false) {
                 continue;
             }
+
+            $this->sourceObservations->record($file, $source);
 
             $relative = $this->files->relativePath($file) ?? $file;
             $matches = [];
@@ -66,6 +80,7 @@ class FrontendRouteScanner
                         'routeName' => $routeName,
                         'line' => $line,
                         'syntax' => 'named_route_helper',
+                        'matchCertainty' => 'exact',
                     ]));
                 }
             }
@@ -77,22 +92,30 @@ class FrontendRouteScanner
                 $method = strtoupper($axiosMatches[1][$index][0]);
                 $line = substr_count(substr($source, 0, $offset), "\n") + 1;
 
-                foreach ($routes as $route) {
-                    if (! in_array($method, $route['methods'], true) || ! $this->uriMatches($route['uri'], $uri)) {
-                        continue;
-                    }
-
+                foreach ($this->literalRouteMatches($routes, $method, $uri) as $match) {
+                    $route = $match['route'];
                     $nodeId = 'frontend:'.$relative;
                     $graph->addNode(Node::make($nodeId, 'frontend', basename($relative), [
                         'file' => $relative,
                         'line' => 1,
                     ]));
-                    $graph->addEdge(new Edge($nodeId, $route['id'], 'consumes_route', 0.9, [
-                        'httpMethod' => $method,
-                        'uri' => $uri,
-                        'line' => $line,
-                        'syntax' => 'axios_literal_url',
-                    ]));
+                    $graph->addEdge(new Edge(
+                        $nodeId,
+                        $route['id'],
+                        'consumes_route',
+                        $match['certainty'] === 'exact' ? 0.9 : 0.55,
+                        array_filter([
+                            'httpMethod' => $method,
+                            'uri' => $uri,
+                            'requestedHost' => $match['requestedHost'],
+                            'routeDomain' => $route['domain'],
+                            'matchCertainty' => $match['certainty'],
+                            'ambiguity' => $match['ambiguity'],
+                            'candidateCount' => $match['candidateCount'],
+                            'line' => $line,
+                            'syntax' => 'axios_literal_url',
+                        ], static fn (mixed $value): bool => $value !== null),
+                    ));
                 }
             }
         }
@@ -109,19 +132,5 @@ class FrontendRouteScanner
         }
 
         return $graph;
-    }
-
-    private function uriMatches(string $routeUri, string $requestedUri): bool
-    {
-        $path = parse_url($requestedUri, PHP_URL_PATH);
-
-        if (! is_string($path)) {
-            return false;
-        }
-
-        $quoted = preg_quote('/'.ltrim($routeUri, '/'), '~');
-        $pattern = preg_replace('~\\\\\{[^}]+\\\\\}~', '[^/]+', $quoted);
-
-        return is_string($pattern) && preg_match('~^'.$pattern.'/?$~', '/'.ltrim($path, '/')) === 1;
     }
 }

@@ -5,6 +5,19 @@ return [
 
     'memory_limit' => '1024M',
 
+    'store' => [
+        /*
+         * SQLite is the authoritative local graph store. The JSON export is an
+         * optional portable mirror, replaced atomically when its write succeeds,
+         * and is still accepted by explicit --input queries.
+         */
+        'path' => 'appgraph/appgraph.sqlite',
+        'retained_generations' => 10,
+        'busy_timeout_ms' => 5000,
+        'lock_timeout_ms' => 30000,
+        'fts' => true,
+    ],
+
     'php_facts' => [
         /*
          * Name-resolved PHP ASTs are shared by every PHP scanner in memory and,
@@ -18,7 +31,9 @@ return [
     'database' => [
         /*
          * "dump" uses Laravel's schema dump implementation, then parses the SQL file.
-         * "live" uses Laravel's Schema Builder introspection.
+         * "live" uses Laravel's Schema Builder introspection and fingerprints
+         * the schema before/after scanning. A mismatch blocks publication;
+         * consistency evidence covers only that scan window.
          */
         'source' => 'dump',
 
@@ -88,16 +103,20 @@ return [
          */
         'enabled' => true,
 
+        // Fresh-process scans are bounded so a broken application bootstrap or
+        // scanner cannot leave an agent request waiting indefinitely.
+        'scan_timeout_seconds' => 300,
+
         /*
-         * Keep the graph fresh automatically when an MCP tool is queried:
+         * Keep the authoritative SQLite generation fresh when an MCP tool is queried:
          *
-         *   'stale'   - scan when the graph file is missing, and rescan when any
-         *               source file changed since the last scan (always-current;
+         *   'stale'   - scan when no committed generation exists, and rescan
+         *               when recorded source inputs changed (always-current;
          *               queries may block repeatedly during an editing session).
-         *   'missing' - scan only when no graph file exists yet (fastest; never
-         *               blocks once a graph is present).
-         *   'off'     - never scan automatically; queries error until you run
-         *               `php artisan appgraph:scan` yourself.
+         *   'missing' - scan only when no committed generation exists (fastest;
+         *               legacy JSON alone does not satisfy automatic modes).
+         *   'off'     - never scan automatically; use SQLite when available or
+         *               fall back to configured legacy JSON when it exists.
          */
         // Build once on first use. Agents can call appgraph_refresh after a
         // meaningful batch of edits without making every query trigger a full scan.
@@ -106,10 +125,10 @@ return [
 
     'overview' => [
         /*
-         * Also write a small, always-loadable "overview" projection (counts, model→table
-         * map, model relationships, and bounded route workflow summaries) alongside the
-         * full graph. It is bounded in size so an agent can read it into context to orient
-         * itself before querying the full graph.
+         * Attempt a small optional "overview" mirror (counts, model→table map,
+         * model relationships, and bounded route workflow summaries) alongside
+         * the JSON mirror. It is atomic when successful, but a failed mirror
+         * write does not roll back the authoritative SQLite generation.
          */
         'enabled' => true,
 

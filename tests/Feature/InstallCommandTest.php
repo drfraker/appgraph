@@ -154,6 +154,48 @@ class InstallCommandTest extends TestCase
         $this->assertSame(1, substr_count($contents, '# <<< appgraph generated files <<<'));
     }
 
+    public function test_it_ignores_distinct_json_and_sqlite_store_directories(): void
+    {
+        config()->set('appgraph.store.path', 'architecture-store/appgraph.sqlite');
+
+        $this->artisan('appgraph:install', [
+            '--client' => ['claude'],
+            '--path' => $this->configPath,
+            '--no-guidelines' => true,
+            '--gitignore-path' => $this->gitignorePath,
+            '--no-scan' => true,
+            '--force' => true,
+        ])->assertSuccessful();
+
+        $contents = (string) file_get_contents($this->gitignorePath);
+
+        $this->assertStringContainsString('/storage/appgraph/', $contents);
+        $this->assertStringContainsString('/storage/architecture-store/', $contents);
+    }
+
+    public function test_it_exactly_ignores_an_absolute_store_in_the_project_root(): void
+    {
+        config()->set('appgraph.store.path', base_path('root-appgraph.sqlite'));
+
+        $this->artisan('appgraph:install', [
+            '--client' => ['claude'],
+            '--path' => $this->configPath,
+            '--no-guidelines' => true,
+            '--gitignore-path' => $this->gitignorePath,
+            '--no-scan' => true,
+            '--force' => true,
+        ])->assertSuccessful();
+
+        $contents = (string) file_get_contents($this->gitignorePath);
+
+        $this->assertStringContainsString('/root-appgraph.sqlite'.PHP_EOL, $contents);
+        $this->assertStringContainsString('/root-appgraph.sqlite-wal'.PHP_EOL, $contents);
+        $this->assertStringContainsString('/root-appgraph.sqlite-shm'.PHP_EOL, $contents);
+        $this->assertStringContainsString('/root-appgraph.sqlite-journal'.PHP_EOL, $contents);
+        $this->assertStringContainsString('/.scan.lock'.PHP_EOL, $contents);
+        $this->assertStringNotContainsString(PHP_EOL.'//'.PHP_EOL, $contents);
+    }
+
     /**
      * @param array<string, mixed> $overrides
      * @return array<string, mixed>

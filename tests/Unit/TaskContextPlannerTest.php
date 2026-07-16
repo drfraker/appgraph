@@ -3,6 +3,7 @@
 namespace AppGraph\Tests\Unit;
 
 use AppGraph\Query\GraphIndex;
+use AppGraph\Query\FieldAccessClassifier;
 use AppGraph\Query\TaskContextPlanner;
 use AppGraph\Tests\Support\BuildsQueryFixtureGraph;
 use Illuminate\Filesystem\Filesystem;
@@ -399,6 +400,124 @@ class TaskContextPlannerTest extends TestCase
         $this->assertTrue($result['truncated']);
         $this->assertCount(3, $path['edges'][0]['evidence']);
         $this->assertTrue($path['edges'][0]['evidenceTruncated']);
+    }
+
+    public function test_manual_context_edges_preserve_exact_evidence_files_or_report_atomic_omission(): void
+    {
+        $exactFile = str_repeat('nested/', 100).'schema.php';
+        $oversizedFile = str_repeat('x', 4097);
+        $graph = [
+            'nodes' => [
+                ['id' => 'table:notes', 'type' => 'table', 'label' => 'notes'],
+                ['id' => 'column:notes.title', 'type' => 'column', 'label' => 'notes.title'],
+                ['id' => 'App\\Services\\NoteWriter::save', 'type' => 'method', 'label' => 'NoteWriter::save'],
+            ],
+            'edges' => [
+                [
+                    'from' => 'table:notes',
+                    'to' => 'column:notes.title',
+                    'type' => 'has_column',
+                    'metadata' => ['evidence' => [
+                        ['file' => $exactFile, 'line' => 2, 'rule' => 'schema_column'],
+                        ['file' => $oversizedFile, 'line' => 3, 'rule' => 'invalid_source'],
+                    ]],
+                ],
+                [
+                    'from' => 'App\\Services\\NoteWriter::save',
+                    'to' => 'table:notes',
+                    'type' => 'writes',
+                    'metadata' => ['operations' => [[
+                        'operation' => 'update',
+                        'fields' => ['title'],
+                    ]]],
+                ],
+            ],
+        ];
+
+        $result = $this->planner($graph)->plan('Inspect the note title', ['column:notes.title']);
+        $path = $this->firstPathContaining($result['paths'], 'App\\Services\\NoteWriter::save');
+        $ownerEdge = $path['edges'][0];
+
+        $this->assertSame($exactFile, $ownerEdge['evidence'][0]['file']);
+        $this->assertCount(1, $ownerEdge['evidence']);
+        $this->assertTrue($ownerEdge['evidenceTruncated']);
+        $this->assertSame(1, $result['omitted']['evidence_limit']);
+    }
+
+    public function test_outside_project_evidence_uncertainty_preserves_the_exact_file_reference(): void
+    {
+        $route = 'route:GET:/notes';
+        $controller = 'App\\Http\\Controllers\\NoteController::index';
+        $outside = sys_get_temp_dir().'/'.str_repeat('outside/', 150).'routes.php';
+        $graph = [
+            'nodes' => [
+                ['id' => $route, 'type' => 'route', 'label' => 'GET /notes', 'metadata' => ['name' => 'notes.index']],
+                ['id' => $controller, 'type' => 'method', 'label' => 'NoteController::index'],
+            ],
+            'edges' => [[
+                'from' => $route,
+                'to' => $controller,
+                'type' => 'routes_to',
+                'metadata' => ['evidence' => [[
+                    'file' => $outside,
+                    'line' => 3,
+                    'rule' => 'route_action',
+                ]]],
+            ]],
+        ];
+
+        $result = $this->planner($graph)->plan('Inspect selected route', ['notes.index']);
+        $uncertainty = collect($result['uncertainties'])->firstWhere(
+            'reason',
+            'edge_evidence_source_outside_project',
+        );
+
+        $this->assertIsArray($uncertainty);
+        $this->assertSame($outside, $uncertainty['file']);
+        $this->assertGreaterThan(1024, strlen($uncertainty['file']));
+    }
+
+    public function test_column_metadata_uncertainty_omits_an_oversized_source_id_atomically(): void
+    {
+        $source = 'App\\'.str_repeat('VeryLongSource', 1300).'::write';
+        $operations = [];
+
+        for ($index = 0; $index <= FieldAccessClassifier::TASK_MAX_OPERATIONS; $index++) {
+            $operations[] = [
+                'operation' => 'update',
+                'fields' => ['other'],
+                'fieldCoverage' => 'complete',
+            ];
+        }
+
+        $graph = [
+            'nodes' => [
+                ['id' => 'table:notes', 'type' => 'table', 'label' => 'notes'],
+                ['id' => 'column:notes.title', 'type' => 'column', 'label' => 'notes.title'],
+                ['id' => $source, 'type' => 'method', 'label' => 'oversized source'],
+            ],
+            'edges' => [
+                ['from' => 'table:notes', 'to' => 'column:notes.title', 'type' => 'has_column'],
+                [
+                    'from' => $source,
+                    'to' => 'table:notes',
+                    'type' => 'writes',
+                    'metadata' => ['operations' => $operations],
+                ],
+            ],
+        ];
+
+        $result = $this->planner($graph)->plan('Inspect title writes', ['column:notes.title']);
+        $uncertainty = collect($result['uncertainties'])->firstWhere(
+            'reason',
+            'column_field_metadata_limit',
+        );
+
+        $this->assertIsArray($uncertainty);
+        $this->assertArrayNotHasKey('from', $uncertainty);
+        $this->assertTrue($uncertainty['fromOmitted']);
+        $this->assertSame(strlen($source), $uncertainty['fromBytes']);
+        $this->assertGreaterThan(0, $result['omitted']['node_text_limit']);
     }
 
     public function test_in_project_absolute_edge_evidence_is_normalized_into_the_read_set(): void

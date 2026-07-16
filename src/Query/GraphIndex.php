@@ -2,6 +2,8 @@
 
 namespace AppGraph\Query;
 
+use AppGraph\Storage\GraphStore;
+use AppGraph\Support\AgentPayloadLimiter;
 use AppGraph\Support\BoundedText;
 use JsonException;
 use RuntimeException;
@@ -9,6 +11,10 @@ use RuntimeException;
 class GraphIndex
 {
     private const MAX_INCLUDED_SEED_EDGES = 64;
+
+    private const MAX_EXACT_REFERENCE_CHARACTERS = 4096;
+
+    private const MAX_EXACT_REFERENCE_BYTES = 16384;
 
     private const MAX_SUFFIXES_PER_ID = 64;
 
@@ -85,8 +91,47 @@ class GraphIndex
             throw new RuntimeException("AppGraph graph at [{$path}] is missing nodes/edges. Re-run `php artisan appgraph:scan`.");
         }
 
+        // JSON is a portable mirror, never an authoritative immutable
+        // snapshot. A copied or stale mirror can carry a numeric id that now
+        // refers to an unrelated SQLite store, so never expose it as a
+        // verification baseline.
+        if (is_array($graph['meta'] ?? null)) {
+            unset($graph['meta']['generation']);
+        }
+
         $index = self::fromArray($graph, $path);
 
+        self::$cache = [$path => ['signature' => $signature, 'index' => $index]];
+
+        return $index;
+    }
+
+    public static function loadStore(
+        GraphStore $store,
+        string $generationReference = 'current',
+    ): self
+    {
+        $graph = $store->graph($generationReference);
+        $generation = is_array($graph['meta']['generation'] ?? null)
+            ? $graph['meta']['generation']
+            : null;
+
+        if ($generation === null || ! is_string($generation['id'] ?? null)) {
+            throw new RuntimeException('AppGraph has no committed SQLite generation. Run `php artisan appgraph:scan` first.');
+        }
+
+        $path = $store->path();
+        $signature = (string) $generation['id']
+            .':'.(string) $generation['graphFingerprint']
+            .':'.(($generation['current'] ?? false) ? 'current' : 'historical');
+
+        if (isset(self::$cache[$path]) && self::$cache[$path]['signature'] === $signature) {
+            return self::$cache[$path]['index'];
+        }
+
+        // Staleness is evaluated from persisted scan metadata. The SQLite file,
+        // not an optional JSON mirror, is the existence anchor for that check.
+        $index = self::fromArrayPayload($graph, $store->path(), true);
         self::$cache = [$path => ['signature' => $signature, 'index' => $index]];
 
         return $index;
@@ -97,6 +142,26 @@ class GraphIndex
      */
     public static function fromArray(array $graph, ?string $sourcePath = null): self
     {
+        return self::fromArrayPayload($graph, $sourcePath, false);
+    }
+
+    /**
+     * Hydrate an index from decoded data. Only the integrity-checked SQLite
+     * loader may retain immutable generation metadata; arbitrary arrays have
+     * the same untrusted baseline semantics as portable JSON.
+     *
+     * @param array<string, mixed> $graph
+     */
+    private static function fromArrayPayload(
+        array $graph,
+        ?string $sourcePath,
+        bool $trustedGeneration,
+    ): self
+    {
+        if (! $trustedGeneration && is_array($graph['meta'] ?? null)) {
+            unset($graph['meta']['generation']);
+        }
+
         $nodesById = [];
         $nodeIdsByType = [];
         $nodeIdsByFile = [];
@@ -1148,7 +1213,24 @@ class GraphIndex
         $compact = [];
 
         foreach (['file', 'line', 'rule', 'source', 'inference', 'syntax'] as $key) {
-            $value = $record[$key] ?? null;
+            if (! array_key_exists($key, $record)) {
+                continue;
+            }
+
+            $value = $record[$key];
+
+            if (AgentPayloadLimiter::isExactStringKey($key)) {
+                if (! is_string($value) || ! $this->isBoundedExactReference($value)) {
+                    // Evidence records are the atomic provenance unit. Keeping
+                    // the other fields after dropping or shortening its source
+                    // would make them appear to describe a different location.
+                    return [];
+                }
+
+                $compact[$key] = $value;
+
+                continue;
+            }
 
             if (! is_scalar($value)) {
                 continue;
@@ -1158,6 +1240,15 @@ class GraphIndex
         }
 
         return $compact;
+    }
+
+    private function isBoundedExactReference(string $value): bool
+    {
+        return $value !== ''
+            && ! str_contains($value, "\0")
+            && strlen($value) <= self::MAX_EXACT_REFERENCE_BYTES
+            && mb_strlen($value) <= self::MAX_EXACT_REFERENCE_CHARACTERS
+            && preg_match('//u', $value) === 1;
     }
 
     /** @param array<string, mixed> $state @return array<int, string> */

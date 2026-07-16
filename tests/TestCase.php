@@ -12,6 +12,9 @@ abstract class TestCase extends Orchestra
      */
     private array $temporaryPaths = [];
 
+    /** @var array<int, string> */
+    private array $temporaryDirectories = [];
+
     /**
      * @param \Illuminate\Foundation\Application $app
      * @return array<int, class-string>
@@ -30,6 +33,9 @@ abstract class TestCase extends Orchestra
     {
         $app['config']->set('app.name', 'AppGraph Test App');
         $app['config']->set('appgraph.php_facts.persistent_cache', false);
+        $storeDirectory = sys_get_temp_dir().'/appgraph-store-'.bin2hex(random_bytes(6));
+        $this->temporaryDirectories[] = $storeDirectory;
+        $app['config']->set('appgraph.store.path', $storeDirectory.'/appgraph.sqlite');
         $app['config']->set('database.default', 'testing');
         $app['config']->set('database.connections.testing', [
             'driver' => 'sqlite',
@@ -44,6 +50,20 @@ abstract class TestCase extends Orchestra
         foreach ($this->temporaryPaths as $path) {
             if (is_file($path)) {
                 @unlink($path);
+            }
+        }
+
+        foreach ($this->temporaryDirectories as $directory) {
+            foreach (['appgraph.sqlite', 'appgraph.sqlite-wal', 'appgraph.sqlite-shm', '.scan.lock'] as $file) {
+                $path = $directory.'/'.$file;
+
+                if (is_file($path)) {
+                    @unlink($path);
+                }
+            }
+
+            if (is_dir($directory)) {
+                @rmdir($directory);
             }
         }
 

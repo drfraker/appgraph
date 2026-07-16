@@ -20,6 +20,7 @@ use RuntimeException;
 class SearchTool extends Tool
 {
     use InteractsWithQueryEngine;
+    use RejectsUnknownInput;
 
     /**
      * @return array<string, mixed>
@@ -27,19 +28,41 @@ class SearchTool extends Tool
     public function schema(JsonSchema $schema): array
     {
         return [
-            'term' => $schema->string()->description('Substring to match against node ids and labels.')->required(),
-            'type' => $schema->string()->description('Optional node type filter: route, method, class, model, table, column, index, foreign_key, form_request, event, or job.'),
-            'limit' => $schema->integer()->description('Maximum results (default 50).'),
+            'term' => $schema->string()->min(1)->max(512)->description('Literal substring to match against node ids and labels.')->required(),
+            'type' => $schema->string()->min(1)->max(128)->description('Optional node type filter: route, method, class, model, table, column, index, foreign_key, form_request, event, or job.'),
+            'limit' => $schema->integer()->min(1)->max(200)->description('Maximum results (default 50).'),
         ];
     }
 
     public function handle(Request $request): Response|ResponseFactory
     {
+        if (($error = $this->rejectUnknownInput($request, ['term', 'type', 'limit'])) !== null) {
+            return $error;
+        }
+
+        $validated = $request->validate([
+            'term' => ['required', 'string', 'min:1', 'max:512', static function (string $attribute, mixed $value, \Closure $fail): void {
+                if (is_string($value) && (trim($value) === '' || str_contains($value, "\0") || strlen($value) > 2048)) {
+                    $fail("The {$attribute} field must be a nonblank literal no longer than 2048 bytes and without NUL bytes.");
+                }
+            }],
+            'type' => ['sometimes', 'filled', 'string', 'min:1', 'max:128', static function (string $attribute, mixed $value, \Closure $fail): void {
+                if (is_string($value) && (trim($value) === '' || str_contains($value, "\0") || strlen($value) > 512)) {
+                    $fail("The {$attribute} field must be a nonblank node type no longer than 512 bytes and without NUL bytes.");
+                }
+            }],
+            'limit' => ['sometimes', 'integer', 'between:1,200', static function (string $attribute, mixed $value, \Closure $fail): void {
+                if (! is_int($value)) {
+                    $fail("The {$attribute} field must be a JSON integer.");
+                }
+            }],
+        ]);
+
         try {
-            return Response::structured($this->engine()->search(
-                (string) $request->get('term'),
-                $request->get('type') ?: null,
-                (int) ($request->get('limit') ?: config('appgraph.query.limit', 50)),
+            return $this->structuredResponse($this->searchGraph(
+                trim($validated['term']),
+                isset($validated['type']) ? trim($validated['type']) : null,
+                (int) ($validated['limit'] ?? max(1, min(200, (int) config('appgraph.query.limit', 50)))),
             ));
         } catch (RuntimeException $exception) {
             return Response::error($exception->getMessage());

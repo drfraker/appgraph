@@ -15,12 +15,17 @@ use InvalidArgumentException;
 use RuntimeException;
 
 #[Name('appgraph_context')]
-#[Description('Compile a bounded task-specific context for this Laravel application. Returns ranked graph seeds, recommended source reads, causal paths, verification targets, and explicit uncertainties. Supply known targets when available and changed_files when planning around existing edits.')]
+#[Description('Compile a bounded task-specific context for this Laravel application. Returns ranked graph seeds, recommended source reads, causal paths, verification targets, bounded scanner-warning evidence, and explicit uncertainties. Supply known targets when available and changed_files when planning around existing edits.')]
 #[IsReadOnly]
 #[IsIdempotent]
 class ContextTool extends Tool
 {
     use InteractsWithQueryEngine;
+    use RejectsUnknownInput;
+
+    private const MAX_TARGET_CHARACTERS = 4096;
+
+    private const MAX_TARGET_BYTES = 16384;
 
     /**
      * @return array<string, mixed>
@@ -34,7 +39,7 @@ class ContextTool extends Tool
                 ->description('Nonblank task description used to rank relevant application context.')
                 ->required(),
             'targets' => $schema->array()
-                ->items($schema->string()->min(1)->max(512))
+                ->items($schema->string()->min(1)->max(self::MAX_TARGET_CHARACTERS))
                 ->max(10)
                 ->unique()
                 ->description('Optional exact or fuzzy AppGraph targets, such as a route name, Class::method, model, table, or column.'),
@@ -60,6 +65,17 @@ class ContextTool extends Tool
 
     public function handle(Request $request): Response|ResponseFactory
     {
+        if (($error = $this->rejectUnknownInput($request, [
+            'task',
+            'targets',
+            'changed_files',
+            'token_budget',
+            'depth',
+            'min_confidence',
+        ])) !== null) {
+            return $error;
+        }
+
         $validated = $request->validate([
             'task' => [
                 'required',
@@ -71,13 +87,17 @@ class ContextTool extends Tool
                     }
                 },
             ],
-            'targets' => ['sometimes', 'array', 'max:10'],
-            'targets.*' => ['string', 'min:1', 'max:512', 'distinct:strict'],
-            'changed_files' => ['sometimes', 'array', 'max:50'],
+            'targets' => ['sometimes', 'array', 'list', 'max:10'],
+            'targets.*' => ['string', 'min:1', 'max:'.self::MAX_TARGET_CHARACTERS, 'distinct:strict', static function (string $attribute, mixed $value, \Closure $fail): void {
+                if (is_string($value) && (str_contains($value, "\0") || strlen($value) > self::MAX_TARGET_BYTES)) {
+                    $fail("The {$attribute} field must not exceed ".self::MAX_TARGET_BYTES.' bytes or contain NUL bytes.');
+                }
+            }],
+            'changed_files' => ['sometimes', 'array', 'list', 'max:50'],
             'changed_files.*' => ['string', 'min:1', 'max:1024', 'distinct:strict'],
-            'token_budget' => ['sometimes', 'integer', 'between:512,16000'],
-            'depth' => ['sometimes', 'integer', 'between:1,6'],
-            'min_confidence' => ['sometimes', 'numeric', 'between:0,1'],
+            'token_budget' => ['sometimes', 'integer:strict', 'between:512,16000'],
+            'depth' => ['sometimes', 'integer:strict', 'between:1,6'],
+            'min_confidence' => ['sometimes', 'numeric:strict', 'between:0,1'],
         ]);
 
         $defaultTokenBudget = max(512, min(
@@ -91,7 +111,7 @@ class ContextTool extends Tool
         ));
 
         try {
-            return Response::structured($this->engine()->contextForTask(
+            return $this->structuredResponse($this->engine()->contextForTask(
                 trim($validated['task']),
                 array_values($validated['targets'] ?? []),
                 array_values($validated['changed_files'] ?? []),

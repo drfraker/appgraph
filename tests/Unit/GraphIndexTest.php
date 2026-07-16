@@ -649,6 +649,42 @@ class GraphIndexTest extends TestCase
         $this->assertArrayNotHasKey('unbounded', $results[0]['edges'][0]);
     }
 
+    public function test_seeded_traversal_preserves_exact_evidence_files_or_omits_the_record(): void
+    {
+        $exactFile = str_repeat('nested/', 100).'Action.php';
+        $oversizedFile = str_repeat('x', 4097);
+        $history = [[
+            'from' => 'Seed',
+            'to' => 'Target',
+            'type' => 'calls',
+            'metadata' => [
+                'evidence' => [
+                    ['file' => $exactFile, 'line' => 10, 'rule' => 'exact_source'],
+                    ['file' => $oversizedFile, 'line' => 11, 'rule' => 'oversized_source'],
+                ],
+            ],
+        ]];
+
+        $results = GraphIndex::fromArray([
+            'meta' => [],
+            'nodes' => [
+                ['id' => 'Seed', 'type' => 'method', 'label' => 'Seed'],
+            ],
+            'edges' => [],
+        ])->traverseFromSeeds(
+            [['id' => 'Seed', 'edges' => $history]],
+            [],
+            includeEdges: true,
+            maxEvidencePerEdge: 2,
+        );
+
+        $edge = $results[0]['edges'][0];
+
+        $this->assertSame($exactFile, $edge['evidence'][0]['file']);
+        $this->assertSame(1, $edge['evidenceOmitted']);
+        $this->assertCount(1, $edge['evidence']);
+    }
+
     public function test_top_paths_returns_distinct_complete_paths_in_rank_order_and_ignores_cycles(): void
     {
         $graph = [

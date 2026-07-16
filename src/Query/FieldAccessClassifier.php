@@ -132,6 +132,9 @@ final class FieldAccessClassifier
             $examinedOperations++;
 
             if (! is_array($operation)) {
+                $truncated = true;
+                $classified['possible']['unknown'] = 'unknown';
+
                 continue;
             }
 
@@ -161,6 +164,9 @@ final class FieldAccessClassifier
                 $examinedFields++;
 
                 if (! is_string($operationField) || $operationField === '') {
+                    $truncated = true;
+                    $fieldEvidenceIncomplete = true;
+
                     continue;
                 }
 

@@ -9,6 +9,7 @@ use AppGraph\Tests\Fixtures\ProgressNoteController;
 use AppGraph\Tests\Fixtures\UpdateProgressNoteRequest;
 use AppGraph\Tests\TestCase;
 use Closure;
+use Composer\Autoload\ClassLoader;
 use Illuminate\Foundation\Http\FormRequest;
 use Illuminate\Routing\Attributes\Controllers\Middleware as MiddlewareAttribute;
 use Illuminate\Routing\Controller;
@@ -45,6 +46,575 @@ class RouteScannerTest extends TestCase
         $this->assertSame('update(UpdateProgressNoteRequest $request, ProgressNote $note): array', $method['signature']);
         $this->assertSame('ProgressNoteController', $method['class']);
         $this->assertSame('update', $method['method']);
+    }
+
+    public function test_route_identity_includes_the_normalized_domain(): void
+    {
+        Route::domain('API.Example.COM')->get('/shared', [BoundRouteController::class, 'show']);
+        Route::domain('Admin.Example.COM')->get('/shared', [OverrideRouteController::class, 'show']);
+        Route::get('/shared', [BoundRouteController::class, 'show']);
+
+        $graph = new Graph();
+        app(RouteScanner::class)->scan($graph);
+        $array = $graph->toArray();
+        $api = 'route:GET://api.example.com/shared';
+        $admin = 'route:GET://admin.example.com/shared';
+        $domainless = 'route:GET:/shared';
+
+        $this->assertGraphHasNode($array, $api, 'route');
+        $this->assertGraphHasNode($array, $admin, 'route');
+        $this->assertGraphHasNode($array, $domainless, 'route');
+        $this->assertGraphHasEdge($array, $api, BoundRouteController::class.'::show', 'routes_to');
+        $this->assertGraphHasEdge($array, $admin, OverrideRouteController::class.'::show', 'routes_to');
+        $this->assertSame('api.example.com', $this->graphNode($array, $api)['metadata']['domain']);
+        $this->assertSame('//api.example.com/shared', $this->graphNode($array, $api)['metadata']['endpoint']);
+        $this->assertSame('GET api.example.com/shared', $this->graphNode($array, $api)['label']);
+    }
+
+    public function test_same_process_rescan_reads_current_controller_source_instead_of_stale_reflection(): void
+    {
+        $directory = base_path('app/Http/Controllers');
+        $file = $directory.'/AppGraphFreshRouteController.php';
+        $class = 'App\\Http\\Controllers\\AppGraphFreshRouteController';
+        @mkdir($directory, 0777, true);
+
+        file_put_contents($file, <<<'PHP'
+<?php
+
+namespace App\Http\Controllers;
+
+final class AppGraphFreshRouteController extends \Illuminate\Routing\Controller
+{
+    public function show(\AppGraph\Tests\Fixtures\UpdateProgressNoteRequest $request): array
+    {
+        return [];
+    }
+}
+PHP);
+
+        require_once $file;
+
+        try {
+            Route::get('/fresh-controller-source', [$class, 'show']);
+            $scanner = app(RouteScanner::class);
+            $before = new Graph();
+            $scanner->scan($before);
+
+            $methodId = $class.'::show';
+            $beforeArray = $before->toArray();
+            $this->assertSame(
+                'show(UpdateProgressNoteRequest $request): array',
+                $this->graphNode($beforeArray, $methodId)['signature'],
+            );
+            $this->assertGraphHasEdge(
+                $beforeArray,
+                $methodId,
+                UpdateProgressNoteRequest::class,
+                'validates_with',
+            );
+
+            file_put_contents($file, <<<'PHP'
+<?php
+
+namespace App\Http\Controllers;
+
+final class AppGraphFreshRouteController extends \Illuminate\Routing\Controller
+{
+    public function show(int $after): int
+    {
+        return $after;
+    }
+}
+PHP);
+
+            $after = new Graph();
+            $scanner->scan($after);
+            $afterArray = $after->toArray();
+            $method = $this->graphNode($afterArray, $methodId);
+
+            $this->assertSame('show(int $after): int', $method['signature']);
+            $this->assertSame('after', $method['inputs'][0]['name']);
+            $this->assertSame('int', $method['inputs'][0]['type']);
+            $this->assertNull($this->graphEdge(
+                $afterArray,
+                $methodId,
+                UpdateProgressNoteRequest::class,
+                'validates_with',
+            ));
+
+            file_put_contents($file, <<<'PHP'
+<?php
+
+namespace App\Http\Controllers;
+
+final class AppGraphFreshRouteController extends \Illuminate\Routing\Controller
+{
+    public function replacement(): int
+    {
+        return 1;
+    }
+}
+PHP);
+
+            $removed = new Graph();
+            $scanner->scan($removed);
+            $removedArray = $removed->toArray();
+
+            $this->assertNull($this->graphEdge(
+                $removedArray,
+                'route:GET:/fresh-controller-source',
+                $methodId,
+                'routes_to',
+            ));
+            $this->assertContains(
+                'controller_method_not_found',
+                array_column($removedArray['meta']['warnings'] ?? [], 'reason'),
+            );
+        } finally {
+            @unlink($file);
+        }
+    }
+
+    public function test_same_process_rescan_reads_current_middleware_entry_method_source(): void
+    {
+        $directory = base_path('app/Http/Middleware');
+        $file = $directory.'/AppGraphFreshMiddleware.php';
+        $class = 'App\\Http\\Middleware\\AppGraphFreshMiddleware';
+        @mkdir($directory, 0777, true);
+
+        file_put_contents($file, <<<'PHP'
+<?php
+
+namespace App\Http\Middleware;
+
+final class AppGraphFreshMiddleware extends \AppGraph\Tests\Unit\ExternalMiddlewareParent
+{
+    public function handle(mixed $request, \Closure $next): mixed
+    {
+        return $next($request);
+    }
+}
+PHP);
+
+        require_once $file;
+
+        try {
+            app('router')->aliasMiddleware('fresh-source', $class);
+            Route::get('/fresh-middleware-source', static fn (): string => 'ok')
+                ->middleware('fresh-source');
+            $scanner = app(RouteScanner::class);
+            $before = new Graph();
+            $scanner->scan($before);
+            $routeId = 'route:GET:/fresh-middleware-source';
+
+            $this->assertGraphHasEdge($before->toArray(), $routeId, $class.'::handle', 'passes_through');
+
+            file_put_contents($file, <<<'PHP'
+<?php
+
+namespace App\Http\Middleware;
+
+final class AppGraphFreshMiddleware extends \AppGraph\Tests\Unit\ExternalMiddlewareParent
+{
+    public function __invoke(mixed $request, \Closure $next, string $mode): mixed
+    {
+        return $next($request);
+    }
+}
+PHP);
+
+            $after = new Graph();
+            $scanner->scan($after);
+            $afterArray = $after->toArray();
+            $methodId = $class.'::__invoke';
+
+            $this->assertGraphHasEdge($afterArray, $routeId, $methodId, 'passes_through');
+            $this->assertNull($this->graphEdge($afterArray, $routeId, $class.'::handle', 'passes_through'));
+            $this->assertSame(
+                '__invoke(mixed $request, Closure $next, string $mode): mixed',
+                $this->graphNode($afterArray, $methodId)['signature'],
+            );
+
+            file_put_contents($file, <<<'PHP'
+<?php
+
+namespace App\Http\Middleware;
+
+final class AppGraphFreshMiddleware extends \AppGraph\Tests\Unit\ExternalMiddlewareParent
+{
+}
+PHP);
+
+            $removed = new Graph();
+            $scanner->scan($removed);
+            $removedArray = $removed->toArray();
+
+            $this->assertNull($this->graphEdge(
+                $removedArray,
+                $routeId,
+                $class.'::handle',
+                'passes_through',
+            ));
+            $this->assertNull($this->graphEdge(
+                $removedArray,
+                $routeId,
+                $class.'::__invoke',
+                'passes_through',
+            ));
+        } finally {
+            @unlink($file);
+        }
+    }
+
+    public function test_it_resolves_controller_and_middleware_methods_composed_from_nested_traits(): void
+    {
+        $directory = base_path('app/Http/Controllers');
+        $file = $directory.'/AppGraphTraitRouteController.php';
+        $controller = 'App\\Http\\Controllers\\AppGraphTraitRouteController';
+        $middleware = 'App\\Http\\Controllers\\AppGraphTraitAliasMiddleware';
+        $controllerTrait = 'App\\Http\\Controllers\\AppGraphNestedControllerAction';
+        $middlewareTrait = 'App\\Http\\Controllers\\AppGraphNestedMiddlewareAction';
+        @mkdir($directory, 0777, true);
+        file_put_contents($file, <<<'PHP'
+<?php
+
+namespace App\Http\Controllers;
+
+trait AppGraphNestedControllerAction
+{
+    public function show(): array
+    {
+        return [];
+    }
+}
+
+trait AppGraphComposedControllerAction
+{
+    use AppGraphNestedControllerAction;
+}
+
+final class AppGraphTraitRouteController
+{
+    use AppGraphComposedControllerAction;
+}
+
+trait AppGraphNestedMiddlewareAction
+{
+    protected function process(mixed $request, \Closure $next): mixed
+    {
+        return $next($request);
+    }
+}
+
+trait AppGraphComposedMiddlewareAction
+{
+    use AppGraphNestedMiddlewareAction;
+}
+
+final class AppGraphTraitAliasMiddleware
+{
+    use AppGraphComposedMiddlewareAction {
+        process as public handle;
+    }
+}
+PHP);
+        require_once $file;
+
+        try {
+            app('router')->aliasMiddleware('trait-agent', $middleware);
+            Route::get('/trait-controller', [$controller, 'SHOW'])
+                ->middleware('trait-agent');
+            $graph = new Graph();
+            app(RouteScanner::class)->scan($graph);
+            $array = $graph->toArray();
+            $routeId = 'route:GET:/trait-controller';
+
+            $this->assertGraphHasEdge($array, $routeId, $controllerTrait.'::show', 'routes_to');
+            $this->assertSame(
+                'SHOW',
+                $this->graphEdge(
+                    $array,
+                    $routeId,
+                    $controllerTrait.'::show',
+                    'routes_to',
+                )['metadata']['requestedMethod'],
+            );
+            $this->assertGraphHasEdge($array, $routeId, $middlewareTrait.'::process', 'passes_through');
+            $middlewareEdge = $this->graphEdge(
+                $array,
+                $routeId,
+                $middlewareTrait.'::process',
+                'passes_through',
+            );
+            $occurrence = array_values($middlewareEdge['metadata']['occurrences'])[0];
+
+            $this->assertSame('handle', $occurrence['invocation_method']);
+            $this->assertSame($middlewareTrait, $occurrence['declaring_class']);
+            $this->assertSame('handle', $occurrence['composed_as']);
+            $this->assertSame('public', $occurrence['composed_visibility']);
+            $this->assertSame('trait', $this->graphNode($array, $middlewareTrait)['type']);
+            $this->assertSame(
+                'protected',
+                $this->graphNode($array, $middlewareTrait.'::process')['metadata']['visibility'],
+            );
+        } finally {
+            @unlink($file);
+        }
+    }
+
+    public function test_route_action_method_lookup_is_case_insensitive_but_emits_source_casing(): void
+    {
+        Route::get('/uppercase-action', [BoundRouteController::class, 'SHOW']);
+
+        $graph = new Graph();
+        app(RouteScanner::class)->scan($graph);
+        $array = $graph->toArray();
+        $routeId = 'route:GET:/uppercase-action';
+        $methodId = BoundRouteController::class.'::show';
+
+        $this->assertGraphHasEdge($array, $routeId, $methodId, 'routes_to');
+        $this->assertNull($this->graphEdge(
+            $array,
+            $routeId,
+            BoundRouteController::class.'::SHOW',
+            'routes_to',
+        ));
+        $this->assertSame('show', $this->graphNode($array, $methodId)['method']);
+        $this->assertSame(
+            'SHOW',
+            $this->graphEdge($array, $routeId, $methodId, 'routes_to')['metadata']['requestedMethod'],
+        );
+    }
+
+    public function test_local_controller_can_fall_back_to_reflection_at_an_external_parent_boundary(): void
+    {
+        $directory = base_path('app/Http/Controllers');
+        $file = $directory.'/AppGraphExternalParentController.php';
+        $class = 'App\\Http\\Controllers\\AppGraphExternalParentController';
+        @mkdir($directory, 0777, true);
+        file_put_contents($file, <<<'PHP'
+<?php
+
+namespace App\Http\Controllers;
+
+final class AppGraphExternalParentController extends \Illuminate\Routing\Controller
+{
+}
+PHP);
+        require_once $file;
+
+        try {
+            Route::get('/external-parent-action', [$class, 'getMiddleware']);
+            $graph = new Graph();
+            app(RouteScanner::class)->scan($graph);
+
+            $this->assertGraphHasEdge(
+                $graph->toArray(),
+                'route:GET:/external-parent-action',
+                Controller::class.'::getMiddleware',
+                'routes_to',
+            );
+        } finally {
+            @unlink($file);
+        }
+    }
+
+    public function test_inherited_handle_remains_preferred_over_local_invokable_middleware(): void
+    {
+        $directory = base_path('app/Http/Middleware');
+        $file = $directory.'/AppGraphInheritedHandleMiddleware.php';
+        $class = 'App\\Http\\Middleware\\AppGraphInheritedHandleMiddleware';
+        @mkdir($directory, 0777, true);
+        file_put_contents($file, <<<'PHP'
+<?php
+
+namespace App\Http\Middleware;
+
+final class AppGraphInheritedHandleMiddleware extends \AppGraph\Tests\Unit\ExternalHandleMiddlewareParent
+{
+    public function __invoke(mixed $request, \Closure $next): mixed
+    {
+        return $next($request);
+    }
+}
+PHP);
+        require_once $file;
+
+        try {
+            app('router')->aliasMiddleware('inherited-handle-agent', $class);
+            Route::get('/inherited-handle-middleware', static fn (): string => 'ok')
+                ->middleware('inherited-handle-agent');
+            $graph = new Graph();
+            app(RouteScanner::class)->scan($graph);
+            $array = $graph->toArray();
+            $routeId = 'route:GET:/inherited-handle-middleware';
+
+            $this->assertGraphHasEdge(
+                $array,
+                $routeId,
+                ExternalHandleMiddlewareParent::class.'::handle',
+                'passes_through',
+            );
+            $this->assertNull($this->graphEdge(
+                $array,
+                $routeId,
+                $class.'::__invoke',
+                'passes_through',
+            ));
+        } finally {
+            @unlink($file);
+        }
+    }
+
+    public function test_unloaded_composer_discoverable_project_middleware_is_read_from_source(): void
+    {
+        $directory = base_path('app/Http/Middleware');
+        $file = $directory.'/ProjectMiddleware.php';
+        $class = 'AppGraphUnloaded\\ProjectMiddleware';
+        $loader = new ClassLoader();
+        $loader->addPsr4('AppGraphUnloaded\\', $directory.'/');
+        $loader->register(true);
+        @mkdir($directory, 0777, true);
+        file_put_contents($file, <<<'PHP'
+<?php
+
+namespace AppGraphUnloaded;
+
+final class ProjectMiddleware
+{
+    public function handle(mixed $request, \Closure $next): mixed
+    {
+        return $next($request);
+    }
+}
+PHP);
+
+        try {
+            $this->assertFalse(class_exists($class, false));
+            app('router')->aliasMiddleware('unloaded-source-agent', $class);
+            Route::get('/unloaded-source-middleware', static fn (): string => 'ok')
+                ->middleware('unloaded-source-agent');
+            $graph = new Graph();
+            app(RouteScanner::class)->scan($graph);
+
+            $this->assertFalse(class_exists($class, false));
+            $this->assertGraphHasEdge(
+                $graph->toArray(),
+                'route:GET:/unloaded-source-middleware',
+                $class.'::handle',
+                'passes_through',
+            );
+        } finally {
+            $loader->unregister();
+            @unlink($file);
+        }
+    }
+
+    public function test_non_public_and_abstract_controller_actions_are_not_claimed_executable(): void
+    {
+        Route::get('/protected-action', [ProtectedRouteController::class, 'show']);
+        Route::get('/abstract-action', [AbstractRouteController::class, 'show']);
+
+        $graph = new Graph();
+        app(RouteScanner::class)->scan($graph);
+        $array = $graph->toArray();
+
+        $this->assertNull($this->graphEdge(
+            $array,
+            'route:GET:/protected-action',
+            ProtectedRouteController::class.'::show',
+            'routes_to',
+        ));
+        $this->assertNull($this->graphEdge(
+            $array,
+            'route:GET:/abstract-action',
+            AbstractRouteController::class.'::show',
+            'routes_to',
+        ));
+        $reasons = array_column($array['meta']['warnings'] ?? [], 'reason');
+        $this->assertContains('controller_method_not_public', $reasons);
+        $this->assertContains('controller_class_not_concrete', $reasons);
+    }
+
+    public function test_missing_and_nonautoloadable_actions_are_suppressed_but_public_magic_actions_are_explicit(): void
+    {
+        $missingClass = 'AppGraph\\Tests\\Fixtures\\DefinitelyMissingRouteController';
+        $directory = base_path('app/Http/Controllers');
+        $file = $directory.'/AppGraphDynamicRouteController.php';
+        $dynamicClass = 'App\\Http\\Controllers\\AppGraphDynamicRouteController';
+        @mkdir($directory, 0777, true);
+        file_put_contents($file, <<<'PHP'
+<?php
+
+namespace App\Http\Controllers;
+
+final class AppGraphDynamicRouteController
+{
+    public function __call(string $method, array $parameters): array
+    {
+        return [];
+    }
+}
+PHP);
+        require_once $file;
+
+        try {
+            Route::get('/missing-action', [BoundRouteController::class, 'absent']);
+            Route::get('/dynamic-action', [$dynamicClass, 'virtualAction']);
+            Route::get('/nonautoloadable-action', [$missingClass, 'show']);
+
+            $graph = new Graph();
+            app(RouteScanner::class)->scan($graph);
+            $array = $graph->toArray();
+
+            $this->assertNull($this->graphEdge(
+                $array,
+                'route:GET:/missing-action',
+                BoundRouteController::class.'::absent',
+                'routes_to',
+            ));
+            $this->assertNull($this->graphEdge(
+                $array,
+                'route:GET:/nonautoloadable-action',
+                $missingClass.'::show',
+                'routes_to',
+            ));
+            $dynamic = $this->graphEdge(
+                $array,
+                'route:GET:/dynamic-action',
+                $dynamicClass.'::virtualAction',
+                'routes_to',
+            );
+
+            $this->assertNotNull($dynamic);
+            $this->assertSame(0.5, $dynamic['confidence']);
+            $this->assertTrue($dynamic['metadata']['dynamicAction']);
+            $this->assertSame(
+                'controller_dynamic_action_via_magic_call',
+                $this->graphNode($array, $dynamicClass.'::virtualAction')['metadata']['reason'],
+            );
+        } finally {
+            @unlink($file);
+        }
+    }
+
+    public function test_optional_and_composite_controller_parameters_do_not_invent_container_dependencies(): void
+    {
+        Route::post('/optional-dependency', [DependencyShapeController::class, 'optional']);
+        Route::post('/composite-dependency', [DependencyShapeController::class, 'composite']);
+
+        $graph = new Graph();
+        app(RouteScanner::class)->scan($graph);
+        $array = $graph->toArray();
+        $optional = DependencyShapeController::class.'::optional';
+        $composite = DependencyShapeController::class.'::composite';
+
+        $this->assertNull($this->graphEdge($array, $optional, RequestedRouteRequest::class, 'validates_with'));
+        $this->assertNull($this->graphEdge($array, $composite, RequestedRouteRequest::class, 'validates_with'));
+        $this->assertNull($this->graphEdge($array, $composite, ProgressNote::class, 'uses_model'));
+        $reasons = array_column($array['meta']['warnings'] ?? [], 'reason');
+        $this->assertContains('optional_typed_parameter_uses_default', $reasons);
+        $this->assertContains('composite_typed_parameter_not_container_resolved', $reasons);
     }
 
     public function test_it_bridges_the_resolved_middleware_pipeline_to_executable_methods(): void
@@ -369,7 +939,13 @@ class RouteScannerTest extends TestCase
         $this->assertSame(RequestedRouteRequest::class, $bound['metadata']['requestedRequest']);
         $this->assertSame(RuntimeRouteRequest::class, $bound['metadata']['runtimeRequest']);
         $this->assertNull($this->graphEdge($array, $shadowedMethod, RequestedRouteRequest::class, 'validates_with'));
-        $this->assertNull($this->graphEdge($array, $shadowedMethod, RuntimeRouteRequest::class, 'validates_with'));
+        $this->assertGraphHasEdge($array, $shadowedMethod, RuntimeRouteRequest::class, 'validates_with');
+        $this->assertTrue($this->graphEdge(
+            $array,
+            $shadowedMethod,
+            RuntimeRouteRequest::class,
+            'validates_with',
+        )['metadata']['sharesRouteParameterName']);
 
         $this->assertNull($this->graphEdge($array, $unknownMethod, UnknownRouteRequest::class, 'validates_with'));
         $this->assertNull($this->graphEdge($array, $existingMethod, ExistingRuntimeRouteRequest::class, 'validates_with'));
@@ -382,13 +958,25 @@ class RouteScannerTest extends TestCase
         $warningReasons = array_column($array['meta']['warnings'] ?? [], 'reason');
         $this->assertContains('form_request_container_target_unknown', $warningReasons);
         $this->assertContains('form_request_existing_instance_bypasses_lifecycle', $warningReasons);
-        $this->assertContains('route_parameter_shadows_form_request', $warningReasons);
+        $this->assertNotContains('route_parameter_shadows_form_request', $warningReasons);
     }
 }
 
 class AgentMiddlewareBase
 {
     public function handle(mixed $request, Closure $next, string ...$parameters): mixed
+    {
+        return $next($request);
+    }
+}
+
+class ExternalMiddlewareParent
+{
+}
+
+class ExternalHandleMiddlewareParent
+{
+    public function handle(mixed $request, Closure $next): mixed
     {
         return $next($request);
     }
@@ -491,6 +1079,35 @@ class BoundLegacyController extends Controller
 class BoundRouteController
 {
     public function show(): array
+    {
+        return [];
+    }
+}
+
+class ProtectedRouteController
+{
+    protected function show(): array
+    {
+        return [];
+    }
+}
+
+abstract class AbstractRouteController
+{
+    public function show(): array
+    {
+        return [];
+    }
+}
+
+class DependencyShapeController
+{
+    public function optional(?RequestedRouteRequest $request = null): array
+    {
+        return [];
+    }
+
+    public function composite(RequestedRouteRequest|ProgressNote $dependency): array
     {
         return [];
     }

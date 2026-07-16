@@ -44,9 +44,12 @@ PHP);
 <?php
 namespace AppGraph\Tests\GeneratedPolicies\Http\Controllers;
 use AppGraph\Tests\GeneratedPolicies\Models\ProgressNote;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Support\Facades\Gate;
 class ProgressNoteController
 {
+    use AuthorizesRequests;
+
     public function sign(ProgressNote $note): void
     {
         $this->authorize('sign', $note);

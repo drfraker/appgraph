@@ -140,14 +140,12 @@ class QueryEngine
             $minConfidence,
         );
         $meta = $this->index->meta();
-        $scannerWarnings = ScannerWarningSummary::fromMeta($meta);
-        $payload['scannerWarnings'] = $scannerWarnings;
         $generation = $meta['generation'] ?? null;
 
         if (is_array($generation) && is_string($generation['id'] ?? null)) {
             $payload['verification']['baselineGeneration'] = $generation;
         }
-        $truncated = (bool) $payload['truncated'] || $scannerWarnings['truncated'];
+        $truncated = (bool) $payload['truncated'];
         unset($payload['truncated']);
         $sourcePath = $this->index->sourcePath();
 

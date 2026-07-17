@@ -14,7 +14,7 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 use RuntimeException;
 
 #[Name('appgraph_query')]
-#[Description('Traverse this Laravel app\'s code graph. Use flow-from on a route or method to orient for feature work; impact-of before changing a table, column, model, or method; routes-touching for HTTP surface; writes-to/reads-from for table access or proven/possible/excluded column access; callers-of/calls-from for call graphs; and models/tables for summaries.')]
+#[Description('Run a focused graph traversal after resolving a target. Use flow-from for a route or method, impact-of before changing a table/column/model/method, routes-touching for HTTP surface, writes-to/reads-from for data access, and callers-of/calls-from for call graphs. Read returned source for detail.')]
 #[IsReadOnly]
 #[IsIdempotent]
 class QueryTool extends Tool

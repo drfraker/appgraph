@@ -82,11 +82,8 @@ return [
         'limit' => 50,
         'depth' => 4,
 
-        /*
-         * Task context budgets measure recommended source spans rather than
-         * response JSON. Internal hard ceilings still apply, so configuration
-         * can tune normal usage without making agent queries unbounded.
-         */
+        // Advanced CLI compatibility for context-for-task. The default MCP
+        // workflow intentionally uses search, node, and focused traversals.
         'context' => [
             'token_budget' => 4000,
             'depth' => 4,

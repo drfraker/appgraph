@@ -13,7 +13,7 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 use RuntimeException;
 
 #[Name('appgraph_overview')]
-#[Description('Orient yourself in this Laravel app\'s code graph: node/edge counts by type, bounded scanner-warning evidence, app metadata, graph age, and how many source files changed since the scan. Call this before other AppGraph tools; if current results matter and source files changed, call appgraph_refresh once.')]
+#[Description('Get broad architecture and graph-health orientation: node/edge counts by type, bounded scanner-warning evidence, app metadata, graph age, and source freshness. Use for unfamiliar areas or whole-app questions, not before every focused lookup.')]
 #[IsReadOnly]
 #[IsIdempotent]
 class OverviewTool extends Tool

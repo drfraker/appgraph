@@ -130,7 +130,7 @@ class QueryEngineTest extends TestCase
         );
     }
 
-    public function test_context_for_task_surfaces_complete_scanner_warning_counts_and_samples(): void
+    public function test_context_for_task_does_not_append_global_scanner_warnings(): void
     {
         $graph = $this->queryFixtureGraph();
         $graph['meta']['warnings'] = [
@@ -154,21 +154,7 @@ class QueryEngineTest extends TestCase
             'Update the note workflow safely',
             ['notes.update'],
         );
-        $summary = $context['scannerWarnings'];
-
-        $this->assertSame(2, $summary['total']);
-        $this->assertSame([
-            ['scanner' => 'calls', 'count' => 1],
-            ['scanner' => 'events', 'count' => 1],
-        ], $summary['byScanner']);
-        $this->assertSame(2, $summary['returnedSamples']);
-        $this->assertSame(0, $summary['omittedSamples']);
-        $this->assertSame(0, $summary['omittedFields']);
-        $this->assertFalse($summary['truncated']);
-        $this->assertSame(
-            ['calls', 'events'],
-            array_column(array_column($summary['samples'], 'fields'), 'scanner'),
-        );
+        $this->assertArrayNotHasKey('scannerWarnings', $context);
     }
 
     public function test_public_array_indexes_cannot_claim_an_immutable_generation(): void

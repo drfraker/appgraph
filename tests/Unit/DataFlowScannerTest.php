@@ -81,6 +81,11 @@ class ProgressNote extends AbstractNote
 {
     protected $table = 'progress_notes';
 
+    public function scopeFilter($query, array $filters)
+    {
+        return $query->when($filters['body'] ?? null, fn ($query, $body) => $query->where('body', $body));
+    }
+
     public function images()
     {
         return $this->hasMany(ProgressNoteImage::class);
@@ -189,6 +194,24 @@ class ProgressNoteController
         DB::table('progress_notes')->delete();
     }
 
+    public function scopedPagination(): void
+    {
+        ProgressNote::query()
+            ->when(true, fn ($query) => $query->whereRaw('id > 0'))
+            ->whereBetween('created_at', ['2026-01-01', '2026-12-31'])
+            ->whereDoesntHave('images')
+            ->with('images')
+            ->withCount('images')
+            ->orderBy('created_at')
+            ->filter(['body' => 'Changed'])
+            ->paginate();
+    }
+
+    public function builderOnly(): void
+    {
+        $query = ProgressNote::query();
+    }
+
     public function sameLineWrites(): void
     {
         DB::table('progress_notes')->update(['alpha' => 1]); DB::table('progress_notes')->update(['omega' => 1]);
@@ -224,8 +247,10 @@ PHP);
         $this->assertGraphHasEdge($array, $controller.'::findByBody', 'table:progress_notes', 'reads');
         $this->assertGraphHasEdge($array, $controller.'::queryBuilderReads', 'table:progress_notes', 'reads');
         $this->assertGraphHasEdge($array, $controller.'::queryBuilderWrites', 'table:progress_notes', 'writes');
+        $this->assertGraphHasEdge($array, $controller.'::scopedPagination', 'table:progress_notes', 'reads');
         $this->assertGraphHasEdge($array, $controller.'::sameLineWrites', 'table:progress_notes', 'writes');
         $this->assertGraphHasEdge($array, $controller.'::mutateAbstractModel', 'table:progress_notes', 'writes');
+        $this->assertNull($this->graphEdge($array, $controller.'::builderOnly', 'table:progress_notes', 'reads'));
 
         $pivotEdge = $this->graphEdge($array, $controller.'::update', 'table:billables', 'writes');
 
@@ -276,6 +301,14 @@ PHP);
         $this->assertSame('unknown', $queryWriteOperations[2]['fieldCoverage']);
         $this->assertSame([], $queryWriteOperations[3]['fields']);
         $this->assertSame('whole_row', $queryWriteOperations[3]['fieldCoverage']);
+
+        $paginationEdge = $this->graphEdge($array, $controller.'::scopedPagination', 'table:progress_notes', 'reads');
+        $paginationOperation = collect(array_values($paginationEdge['metadata']['operations']))
+            ->firstWhere('operation', 'paginate');
+        $this->assertSame(
+            'AppGraph\\Tests\\GeneratedDataFlows\\Models\\ProgressNote::scopeFilter',
+            $paginationOperation['localScope'],
+        );
 
         $sameLineEdge = $this->graphEdge($array, $controller.'::sameLineWrites', 'table:progress_notes', 'writes');
         $sameLineOperations = array_values($sameLineEdge['metadata']['operations']);

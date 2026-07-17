@@ -119,27 +119,55 @@ class DataFlowScanner
      * @var array<int, string>
      */
     private array $queryPassthroughOperations = [
+        'crossJoin',
+        'distinct',
+        'from',
+        'groupBy',
+        'groupByRaw',
+        'having',
+        'havingRaw',
+        'join',
         'latest',
+        'leftJoin',
         'limit',
         'newQuery',
         'oldest',
         'on',
         'orWhere',
+        'orWhereRaw',
         'orderBy',
+        'orderByRaw',
         'query',
+        'reorder',
+        'rightJoin',
         'select',
         'addSelect',
+        'selectRaw',
         'take',
+        'tap',
+        'unless',
+        'when',
         'where',
         'whereBelongsTo',
+        'whereBetween',
+        'whereColumn',
         'whereDate',
+        'whereDoesntHave',
         'whereHas',
         'whereIn',
+        'whereKey',
+        'whereKeyNot',
+        'whereNotBetween',
+        'whereNotIn',
         'whereNotNull',
         'whereNull',
+        'whereRaw',
         'with',
         'withCount',
+        'withWhereHas',
         'without',
+        'withoutGlobalScope',
+        'withoutGlobalScopes',
     ];
 
     /**
@@ -641,6 +669,7 @@ class DataFlowScanner
             'operation' => $metadata['operation'] ?? null,
             'syntax' => $metadata['syntax'] ?? null,
             'model' => $metadata['model'] ?? null,
+            'localScope' => $metadata['localScope'] ?? null,
             'relationshipMethod' => $metadata['relationshipMethod'] ?? null,
             'relationshipType' => $metadata['relationshipType'] ?? null,
             'fields' => $metadata['fields'] ?? null,
@@ -838,11 +867,19 @@ class DataFlowScanner
                 return null;
             }
 
-            if (in_array($operation, $this->queryPassthroughOperations, true)) {
+            $localScope = $this->localScopeForAccess($access, $operation);
+
+            if (in_array($operation, $this->queryPassthroughOperations, true) || $localScope !== null) {
                 $fieldEvidence = $this->queryFieldEvidenceFromCall($expression, $operation);
                 $access['kind'] = 'model_query';
-                $access['confidence'] *= 0.95;
-                $access['inference'] = 'model_query_chain';
+                $access['confidence'] *= $localScope === null ? 1.0 : 0.95;
+                $access['inference'] = $localScope === null
+                    ? 'model_query_chain'
+                    : 'model_local_scope';
+
+                if ($localScope !== null) {
+                    $access['metadata']['localScope'] = $localScope;
+                }
 
                 return $this->applyQueryFieldEvidence($access, $operation, $fieldEvidence);
             }
@@ -877,10 +914,21 @@ class DataFlowScanner
                 ];
             }
 
-            if (in_array($operation, $this->queryPassthroughOperations, true)) {
+            $localScope = $this->localScopeForAccess($receiver, $operation);
+
+            if (in_array($operation, $this->queryPassthroughOperations, true) || $localScope !== null) {
                 $fieldEvidence = $this->queryFieldEvidenceFromCall($expression, $operation);
-                $receiver['confidence'] = round(($receiver['confidence'] ?? 0.7) * 0.98, 2);
-                $receiver['inference'] = ($receiver['inference'] ?? 'query_chain').':query_passthrough';
+                $receiver['confidence'] = round(
+                    ($receiver['confidence'] ?? 0.7) * ($localScope === null ? 1.0 : 0.95),
+                    2,
+                );
+                $receiver['inference'] = $localScope === null
+                    ? ($receiver['inference'] ?? 'query_chain')
+                    : 'model_query_with_local_scope';
+
+                if ($localScope !== null) {
+                    $receiver['metadata']['localScope'] = $localScope;
+                }
 
                 if (($receiver['kind'] ?? null) === 'model') {
                     $receiver['kind'] = 'model_query';
@@ -953,6 +1001,20 @@ class DataFlowScanner
         }
 
         return $this->relationships[$class.'::'.$method] ?? null;
+    }
+
+    /** @param array<string, mixed> $access */
+    private function localScopeForAccess(array $access, string $operation): ?string
+    {
+        $class = $access['class'] ?? null;
+
+        if (! is_string($class) || $class === '') {
+            return null;
+        }
+
+        $scope = 'scope'.Str::studly($operation);
+
+        return isset($this->methods[$class][$scope]) ? $class.'::'.$scope : null;
     }
 
     /**

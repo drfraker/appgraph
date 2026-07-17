@@ -14,7 +14,7 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 use RuntimeException;
 
 #[Name('appgraph_search')]
-#[Description('Find nodes in this Laravel app\'s code graph by substring (case-insensitive over ids and labels). Use to locate the exact node id for a class, method, route, table, event, or job before calling appgraph_node or appgraph_query.')]
+#[Description('Find the exact graph id for a class, method, route, table, event, or job by case-insensitive id/label substring. Start here when the target id is not already known.')]
 #[IsReadOnly]
 #[IsIdempotent]
 class SearchTool extends Tool

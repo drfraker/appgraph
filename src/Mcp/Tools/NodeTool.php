@@ -14,7 +14,7 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 use RuntimeException;
 
 #[Name('appgraph_node')]
-#[Description('Inspect one node in this Laravel app\'s code graph and its incoming/outgoing edges. Accepts exact ids, bare table names, table.column, Class::method, or unambiguous class basenames. Use after appgraph_search to drill into a specific class, method, table, event, or job.')]
+#[Description('Inspect one resolved node and its direct incoming/outgoing relationships plus source location. Use after appgraph_search; read the referenced files for implementation detail, and traverse only when direct edges are insufficient.')]
 #[IsReadOnly]
 #[IsIdempotent]
 class NodeTool extends Tool

@@ -575,6 +575,24 @@ class GraphStore
         string $typeClause,
         bool $useFts,
     ): array {
+        // Results are relevance-ranked: exact id/label/name match, then label or
+        // name prefix, then suffix (class basenames), then bare substring, with
+        // shorter labels first inside a tier. Node-id order is only the final
+        // deterministic tiebreak, not the ranking.
+        $rankExpression = <<<SQL
+            CASE
+                WHEN lower(membership.node_id) = lower(:rankExact)
+                    OR lower(membership.label) = lower(:rankExact)
+                    OR lower(membership.name) = lower(:rankExact) THEN 0
+                WHEN lower(membership.label) LIKE lower(:rankPrefix) ESCAPE '\\'
+                    OR lower(membership.name) LIKE lower(:rankPrefix) ESCAPE '\\' THEN 1
+                WHEN lower(membership.label) LIKE lower(:rankSuffix) ESCAPE '\\'
+                    OR lower(membership.name) LIKE lower(:rankSuffix) ESCAPE '\\' THEN 2
+                ELSE 3
+            END
+            SQL;
+        $escaped = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $term);
+
         if ($useFts) {
             $statement = $pdo->prepare(<<<SQL
                 SELECT
@@ -595,7 +613,7 @@ class GraphStore
                 WHERE node_search MATCH :term
                   AND membership.generation_id = :generation
                   {$typeClause}
-                ORDER BY membership.node_id
+                ORDER BY {$rankExpression}, length(membership.label), membership.node_id
                 LIMIT :limit
                 SQL);
             $statement->bindValue('term', '"'.str_replace('"', '""', $term).'"');
@@ -621,13 +639,15 @@ class GraphStore
                     lower(membership.node_id) LIKE lower(:term) ESCAPE '\\'
                     OR lower(membership.label) LIKE lower(:term) ESCAPE '\\'
                   )
-                ORDER BY membership.node_id
+                ORDER BY {$rankExpression}, length(membership.label), membership.node_id
                 LIMIT :limit
                 SQL);
-            $escaped = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $term);
             $statement->bindValue('term', '%'.$escaped.'%');
         }
 
+        $statement->bindValue('rankExact', $term);
+        $statement->bindValue('rankPrefix', $escaped.'%');
+        $statement->bindValue('rankSuffix', '%'.$escaped);
         $statement->bindValue('generation', $generationId, PDO::PARAM_INT);
 
         if ($type !== null) {

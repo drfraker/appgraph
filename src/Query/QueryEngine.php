@@ -83,6 +83,7 @@ class QueryEngine
             ],
             'scannerWarnings' => $scannerWarnings,
         ];
+        $scannerWarningsTruncated = (bool) ($scannerWarnings['truncated'] ?? false);
 
         $analysis = $meta['analysis'] ?? [];
         $analysisSummary = array_filter([
@@ -111,7 +112,7 @@ class QueryEngine
             }
         }
 
-        return $this->envelope('overview', null, $payload, $scannerWarnings['truncated']);
+        return $this->envelope('overview', null, $payload, $scannerWarningsTruncated);
     }
 
     /**
@@ -143,7 +144,7 @@ class QueryEngine
         $generation = $meta['generation'] ?? null;
 
         if (is_array($generation) && is_string($generation['id'] ?? null)) {
-            $payload['verification']['baselineGeneration'] = $generation;
+            $payload['verification']['baselineGeneration'] = $generation['id'];
         }
         $truncated = (bool) $payload['truncated'];
         unset($payload['truncated']);
@@ -199,6 +200,7 @@ class QueryEngine
                 'label' => $node['label'] ?? null,
                 'file' => $node['file'] ?? null,
                 'line' => $node['line'] ?? null,
+                'endLine' => $node['endLine'] ?? null,
             ], static fn ($value): bool => $value !== null),
             $this->index->search($term, $type, $limit, $truncated)
         );
@@ -773,7 +775,7 @@ class QueryEngine
 
         return $this->envelope('flow-from', $target, array_filter([
             'route' => $route,
-            'entrypoint' => $methods[$entrypointId],
+            'entrypoint' => $entrypointId,
             ...$groups,
             'analysisWarnings' => $analysisWarnings ?: null,
             'truncation' => $truncation ?: null,
@@ -958,18 +960,10 @@ class QueryEngine
         }
         unset($group);
 
-        $results = [...$matches['proven'], ...$matches['possible']];
-
-        if (count($results) > $limit) {
-            $truncated = true;
-            $results = array_slice($results, 0, $limit);
-        }
-
         return $this->envelope($query, $target, [
             'table' => $tableId,
             'column' => $columnId,
             'field' => $field,
-            'results' => $results,
             'matches' => $matches,
             'counts' => $counts,
         ], $truncated);
@@ -1540,7 +1534,7 @@ class QueryEngine
         $generation = $meta['generation'] ?? null;
 
         if (is_array($generation) && is_string($generation['id'] ?? null)) {
-            $envelope['generation'] = $generation;
+            $envelope['revision'] = $generation['id'];
         } else {
             $envelope['generationUnavailable'] = [
                 'reason' => 'legacy_json_without_immutable_generation',
@@ -1552,11 +1546,6 @@ class QueryEngine
 
         if (is_string($generatedAt)) {
             $envelope['generatedAt'] = $generatedAt;
-            $timestamp = strtotime($generatedAt);
-
-            if ($timestamp !== false) {
-                $envelope['graphAgeSeconds'] = max(0, time() - $timestamp);
-            }
         }
 
         $envelope += $payload;

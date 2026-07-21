@@ -105,19 +105,18 @@ return [
         'scan_timeout_seconds' => 300,
 
         /*
-         * Keep the authoritative SQLite generation fresh when an MCP tool is queried:
+         * Whether an MCP lookup may trigger a scan implicitly:
          *
-         *   'stale'   - scan when no committed generation exists, and rescan
-         *               when recorded source inputs changed (always-current;
-         *               queries may block repeatedly during an editing session).
-         *   'missing' - scan only when no committed generation exists (fastest;
-         *               legacy JSON alone does not satisfy automatic modes).
-         *   'off'     - never scan automatically; use SQLite when available or
-         *               fall back to configured legacy JSON when it exists.
+         *   'off'     - never scan automatically (default). Lookups are genuinely
+         *               read-only; a missing graph returns an error pointing at
+         *               appgraph_refresh. The installer builds the initial graph.
+         *   'missing' - scan only when no committed generation exists (legacy
+         *               JSON alone does not satisfy automatic modes).
+         *   'stale'   - scan when missing, and rescan when recorded source
+         *               inputs changed (always-current; queries may block
+         *               repeatedly during an editing session).
          */
-        // Build once on first use. Agents can call appgraph_refresh after a
-        // meaningful batch of edits without making every query trigger a full scan.
-        'auto_scan' => 'missing',
+        'auto_scan' => 'off',
     ],
 
     'overview' => [

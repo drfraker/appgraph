@@ -811,7 +811,7 @@ class GraphIndexTest extends TestCase
         $index = GraphIndex::fromArray($this->queryFixtureGraph());
 
         $this->assertSame(
-            ['App\Models\Note', 'App\Models\Tag'],
+            ['App\Models\Tag', 'App\Models\Note'],
             array_column($index->search('models', 'model'), 'id')
         );
 

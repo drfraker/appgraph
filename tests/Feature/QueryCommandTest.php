@@ -55,9 +55,10 @@ class QueryCommandTest extends TestCase
         ]);
 
         $this->assertSame('column:notes.title', $payload['column']);
-        $this->assertSame('possible', $payload['results'][0]['match']);
+        $this->assertSame('possible', $payload['matches']['possible'][0]['match']);
         $this->assertSame(0, $payload['counts']['proven']);
         $this->assertSame(1, $payload['counts']['possible']);
+        $this->assertArrayNotHasKey('results', $payload);
     }
 
     public function test_flow_from_route_name_returns_a_feature_slice(): void
@@ -67,7 +68,7 @@ class QueryCommandTest extends TestCase
             'target' => 'notes.update',
         ]);
 
-        $this->assertSame('App\Http\Controllers\NoteController::update', $payload['entrypoint']['id']);
+        $this->assertSame('App\Http\Controllers\NoteController::update', $payload['entrypoint']);
         $this->assertSame(
             ['App\Http\Requests\UpdateNoteRequest'],
             array_column($payload['formRequests'], 'id')
@@ -368,8 +369,9 @@ class QueryCommandTest extends TestCase
             '--type' => 'method',
         ]);
 
-        $this->assertSame($generation, $stored['generation']['id']);
-        $this->assertContains($stored['searchBackend'], ['trigram', 'fallback']);
+        $this->assertSame($generation, $stored['revision']);
+        $this->assertArrayNotHasKey('generation', $stored);
+        $this->assertArrayNotHasKey('searchBackend', $stored);
         $this->assertSame(
             array_column($json['results'], 'id'),
             array_column($stored['results'], 'id'),
@@ -391,11 +393,14 @@ class QueryCommandTest extends TestCase
             '--type' => 'method',
         ]);
 
-        $this->assertSame($generation, $overview['generation']['id']);
+        $this->assertSame($generation, $overview['revision']);
+        $this->assertArrayNotHasKey('generation', $overview);
+        $this->assertArrayNotHasKey('graphAgeSeconds', $overview);
         $this->assertSame(12, $overview['counts']['nodes']);
-        $this->assertSame($generation, $search['generation']['id']);
+        $this->assertSame($generation, $search['revision']);
+        $this->assertArrayNotHasKey('generation', $search);
         $this->assertSame(
-            ['App\Services\NoteService::helper', 'App\Services\NoteService::save'],
+            ['App\Services\NoteService::save', 'App\Services\NoteService::helper'],
             array_column($search['results'], 'id'),
         );
         $this->assertFileDoesNotExist($this->graphPath);

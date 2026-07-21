@@ -1637,7 +1637,39 @@ class GraphIndex
             $results[] = $node;
         }
 
-        usort($results, static fn (array $a, array $b): int => $a['id'] <=> $b['id']);
+        // Mirror the store backend's relevance ranking (exact > prefix >
+        // suffix > substring, shorter labels first, node id as the final
+        // tiebreak) so ordering and truncation membership do not depend on
+        // which backend serves the search.
+        $lowerTerm = mb_strtolower($term);
+        $ranked = array_map(
+            static function (array $node) use ($lowerTerm): array {
+                $label = (string) ($node['label'] ?? '');
+                $lowerLabel = mb_strtolower($label);
+                $lowerName = mb_strtolower((string) ($node['name'] ?? ''));
+                $tier = 3;
+
+                if (mb_strtolower($node['id']) === $lowerTerm
+                    || $lowerLabel === $lowerTerm
+                    || ($lowerName !== '' && $lowerName === $lowerTerm)) {
+                    $tier = 0;
+                } elseif (str_starts_with($lowerLabel, $lowerTerm)
+                    || ($lowerName !== '' && str_starts_with($lowerName, $lowerTerm))) {
+                    $tier = 1;
+                } elseif (str_ends_with($lowerLabel, $lowerTerm)
+                    || ($lowerName !== '' && str_ends_with($lowerName, $lowerTerm))) {
+                    $tier = 2;
+                }
+
+                return [$tier, strlen($label), $node['id'], $node];
+            },
+            $results,
+        );
+        usort(
+            $ranked,
+            static fn (array $a, array $b): int => [$a[0], $a[1], $a[2]] <=> [$b[0], $b[1], $b[2]],
+        );
+        $results = array_column($ranked, 3);
 
         if (count($results) > $limit) {
             $truncated = true;

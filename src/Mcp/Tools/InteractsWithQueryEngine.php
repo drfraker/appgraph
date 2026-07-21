@@ -4,6 +4,7 @@ namespace AppGraph\Mcp\Tools;
 
 use AppGraph\Query\GraphIndex;
 use AppGraph\Query\QueryEngine;
+use AppGraph\Query\SearchPayload;
 use AppGraph\Query\StalenessChecker;
 use AppGraph\Storage\GraphStore;
 use AppGraph\Support\MemoryLimit;
@@ -22,13 +23,20 @@ trait InteractsWithQueryEngine
 
         $store = $this->store();
 
+        if (! $store->hasCurrent() && ! is_file($path)) {
+            throw new \RuntimeException(
+                'AppGraph has no graph for this application yet. Call appgraph_refresh once to build it'
+                .' (or run `php artisan appgraph:scan`); the initial scan can take a while on large applications.'
+            );
+        }
+
         return new QueryEngine(
             $store->hasCurrent() ? GraphIndex::loadStore($store) : GraphIndex::load($path),
             app(StalenessChecker::class),
         );
     }
 
-    /** @return array{engine: QueryEngine, result: array<string, mixed>, lockOwner: string} */
+    /** @return array{result: array<string, mixed>, lockOwner: string} */
     private function refreshGraph(
         ?string $baselineGeneration = null,
     ): array
@@ -66,10 +74,6 @@ trait InteractsWithQueryEngine
             }
 
             return [
-                'engine' => new QueryEngine(
-                    GraphIndex::loadStore($store, $generation),
-                    app(StalenessChecker::class),
-                ),
                 'result' => $result,
                 'lockOwner' => $lockOwner,
             ];
@@ -81,14 +85,15 @@ trait InteractsWithQueryEngine
     }
 
     /**
-     * Generate the graph on demand so the server works the moment it is installed,
-     * without the user having to remember to run `appgraph:scan` first. Honors the
-     * `appgraph.mcp.auto_scan` policy: scan when missing, optionally rescan when the
-     * existing graph is stale, or stay out of the way entirely.
+     * Honor the `appgraph.mcp.auto_scan` policy. Lookups are read-only by
+     * default ('off'): a missing graph produces a structured error pointing at
+     * appgraph_refresh instead of an implicit scan that bootstraps the host
+     * application, blocks the tool call, and writes graph storage. 'missing'
+     * and 'stale' opt back into automatic scanning.
      */
     private function ensureGraph(string $path): void
     {
-        $mode = config('appgraph.mcp.auto_scan', 'missing');
+        $mode = config('appgraph.mcp.auto_scan', 'off');
 
         if ($mode === 'off') {
             return;
@@ -139,35 +144,6 @@ trait InteractsWithQueryEngine
             return $this->engine()->search($term, $type, $limit);
         }
 
-        $search = $store->searchNodes($term, $type, $limit);
-        $generation = $search['generation'];
-        $payload = [
-            'query' => 'search',
-            'target' => $term,
-            'generation' => $generation,
-            'generatedAt' => $generation['generatedAt'],
-            'results' => array_map(
-                static fn (array $node): array => array_filter([
-                    'id' => $node['id'],
-                    'type' => $node['type'],
-                    'label' => $node['label'] ?? null,
-                    'file' => $node['file'] ?? null,
-                    'line' => $node['line'] ?? null,
-                ], static fn (mixed $value): bool => $value !== null),
-                $search['results'],
-            ),
-            'searchBackend' => $search['fts'],
-        ];
-        $timestamp = strtotime((string) $generation['generatedAt']);
-
-        if ($timestamp !== false) {
-            $payload['graphAgeSeconds'] = max(0, time() - $timestamp);
-        }
-
-        if ($search['truncated']) {
-            $payload['truncated'] = true;
-        }
-
-        return $payload;
+        return SearchPayload::fromStoreResult($term, $store->searchNodes($term, $type, $limit));
     }
 }

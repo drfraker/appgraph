@@ -122,7 +122,8 @@ class McpToolsTest extends TestCase
                     'App\\Listeners\\SendNotification',
                     $payload['scannerWarnings']['samples'][0]['fields']['class'],
                 );
-                $this->assertFalse($payload['scannerWarnings']['truncated']);
+                $this->assertArrayNotHasKey('truncated', $payload['scannerWarnings']);
+                $this->assertArrayNotHasKey('bounds', $payload['scannerWarnings']);
                 $json->etc();
             });
     }
@@ -134,8 +135,8 @@ class McpToolsTest extends TestCase
             ->assertSee('AppGraph returned structured content for [search].')
             ->assertDontSee('App\Services\NoteService::helper')
             ->assertStructuredContent(fn (AssertableJson $json) => $json
-                ->where('results.0.id', 'App\Services\NoteService::helper')
-                ->where('results.1.id', 'App\Services\NoteService::save')
+                ->where('results.0.id', 'App\Services\NoteService::save')
+                ->where('results.1.id', 'App\Services\NoteService::helper')
                 ->etc());
     }
 
@@ -227,8 +228,9 @@ class McpToolsTest extends TestCase
             ->assertOk()
             ->assertStructuredContent(fn (AssertableJson $json) => $json
                 ->where('column', 'column:notes.title')
-                ->where('results.0.match', 'possible')
+                ->where('matches.possible.0.match', 'possible')
                 ->where('counts.possible', 1)
+                ->missing('results')
                 ->etc());
 
         AppGraphServer::tool(QueryTool::class, ['query' => 'impact-of', 'target' => 'notes.title'])
@@ -240,7 +242,7 @@ class McpToolsTest extends TestCase
         AppGraphServer::tool(QueryTool::class, ['query' => 'flow-from', 'target' => 'notes.update'])
             ->assertOk()
             ->assertStructuredContent(fn (AssertableJson $json) => $json
-                ->where('entrypoint.id', 'App\Http\Controllers\NoteController::update')
+                ->where('entrypoint', 'App\Http\Controllers\NoteController::update')
                 ->where('formRequests.0.id', 'App\Http\Requests\UpdateNoteRequest')
                 ->where('dataAccess.0.table', 'notes')
                 ->etc());
@@ -311,8 +313,10 @@ class McpToolsTest extends TestCase
         AppGraphServer::tool(OverviewTool::class)
             ->assertOk()
             ->assertStructuredContent(fn (AssertableJson $json) => $json
-                ->where('generation.id', $generation)
+                ->where('revision', $generation)
                 ->where('counts.nodes', 12)
+                ->missing('generation')
+                ->missing('graphAgeSeconds')
                 ->etc());
 
         $this->assertSame($generation, $store->current()['id']);
@@ -329,8 +333,9 @@ class McpToolsTest extends TestCase
         AppGraphServer::tool(OverviewTool::class)
             ->assertOk()
             ->assertStructuredContent(fn (AssertableJson $json) => $json
-                ->has('generation.id')
+                ->whereType('revision', 'string')
                 ->where('counts.nodes', 0)
+                ->missing('generation')
                 ->etc());
 
         $this->assertNotNull(app(GraphStore::class)->current());
@@ -338,21 +343,25 @@ class McpToolsTest extends TestCase
 
     public function test_refresh_tool_rebuilds_the_graph_explicitly(): void
     {
-        foreach (['routes', 'database', 'models', 'calls', 'data_flow', 'form_requests', 'events', 'side_effects', 'frontend', 'tests', 'policies', 'container_bindings'] as $scanner) {
-            config()->set("appgraph.scan.{$scanner}", false);
-        }
+        $this->disableAllScanners();
 
         AppGraphServer::tool(RefreshTool::class)
             ->assertOk()
-            ->assertStructuredContent(fn (AssertableJson $json) => $json
-                ->where('query', 'overview')
-                ->where('refreshed', true)
-                ->where('generationChanged', true)
-                ->where('counts.nodes', 0)
-                ->etc());
+            ->assertStructuredContent(function (AssertableJson $json): void {
+                $payload = $json->toArray();
+
+                $this->assertSame('refresh', $payload['query']);
+                $this->assertTrue($payload['changed']);
+                $this->assertTrue($payload['firstGeneration']);
+                $this->assertIsString($payload['revision']);
+                $this->assertSame(0, $payload['counts']['nodes']);
+                $this->assertArrayNotHasKey('refreshed', $payload);
+                $this->assertArrayNotHasKey('generationChanged', $payload);
+                $json->etc();
+            });
     }
 
-    public function test_refresh_does_not_compare_fresh_child_runtime_evidence_to_the_long_lived_parent(): void
+    public function test_overview_does_not_compare_fresh_child_runtime_evidence_to_the_long_lived_parent(): void
     {
         $scan = app(ScanFingerprint::class)->capture();
         $scan['runtimeEvidenceSession'] = str_repeat('a', 32);
@@ -366,21 +375,9 @@ class McpToolsTest extends TestCase
             'appName' => 'Fresh child fixture',
             'scan' => $scan,
         ]);
-        $result = app(GraphStore::class)->publish($graph);
-        app()->instance(ScanRunner::class, new class($result) implements ScanRunner
-        {
-            /** @param array<string, mixed> $result */
-            public function __construct(private array $result)
-            {
-            }
+        app(GraphStore::class)->publish($graph);
 
-            public function run(?string $preserveGeneration = null): array
-            {
-                return $this->result;
-            }
-        });
-
-        AppGraphServer::tool(RefreshTool::class)
+        AppGraphServer::tool(OverviewTool::class)
             ->assertOk()
             ->assertStructuredContent(function (AssertableJson $json): void {
                 $payload = $json->toArray();
@@ -421,15 +418,68 @@ class McpToolsTest extends TestCase
             ->assertStructuredContent(function (AssertableJson $json) use ($baseline): void {
                 $payload = $json->toArray();
 
-                $this->assertSame($baseline, $payload['generation']['id']);
-                $this->assertSame($baseline, $payload['previousGeneration']['id']);
-                $this->assertFalse($payload['generationChanged']);
-                $this->assertArrayNotHasKey('verification', $payload);
+                $this->assertSame($baseline, $payload['revision']);
+                $this->assertSame($baseline, $payload['previousRevision']);
+                $this->assertFalse($payload['changed']);
+                $this->assertArrayNotHasKey('comparison', $payload);
+                $this->assertArrayNotHasKey('counts', $payload);
+                $this->assertArrayNotHasKey('changes', $payload);
+                $this->assertArrayNotHasKey('firstGeneration', $payload);
                 $json->etc();
             });
 
         $this->assertSame($baseline, $store->current()['id']);
         $this->assertCount(1, $store->generations()['generations']);
+    }
+
+    public function test_refresh_returns_a_change_receipt_between_generations(): void
+    {
+        $store = app(GraphStore::class);
+        $baseline = $store->publish($this->graphObject($this->queryFixtureGraph()))['generation']['id'];
+
+        $modified = $this->queryFixtureGraph();
+        $modified['nodes'][] = [
+            'id' => 'App\Services\NoteService::added',
+            'type' => 'method',
+            'label' => 'NoteService::added',
+            'file' => 'app/Services/NoteService.php',
+            'line' => 50,
+        ];
+        $modified['edges'][] = [
+            'from' => 'App\Services\NoteService::save',
+            'to' => 'App\Services\NoteService::added',
+            'type' => 'calls',
+            'confidence' => 1.0,
+        ];
+        app()->instance(ScanRunner::class, new class($store, $this->graphObject($modified)) implements ScanRunner
+        {
+            public function __construct(private GraphStore $store, private Graph $graph)
+            {
+            }
+
+            public function run(?string $preserveGeneration = null): array
+            {
+                return $this->store->publish($this->graph);
+            }
+        });
+
+        $payload = null;
+        AppGraphServer::tool(RefreshTool::class)
+            ->assertOk()
+            ->assertStructuredContent(function (AssertableJson $json) use (&$payload): void {
+                $payload = $json->toArray();
+                $json->etc();
+            });
+
+        $this->assertSame('refresh', $payload['query']);
+        $this->assertSame($store->current()['id'], $payload['revision']);
+        $this->assertSame($baseline, $payload['previousRevision']);
+        $this->assertNotSame($baseline, $payload['revision']);
+        $this->assertTrue($payload['changed']);
+        $this->assertTrue($payload['comparison']['graphChanged']);
+        $this->assertGreaterThanOrEqual(1, $payload['counts']['overall']['total']);
+        $this->assertNotEmpty($payload['changes']);
+        $this->assertArrayNotHasKey('firstGeneration', $payload);
     }
 
     public function test_stale_auto_scan_does_not_refresh_an_unchanged_runtime_aware_generation(): void
@@ -445,9 +495,10 @@ class McpToolsTest extends TestCase
             ->assertStructuredContent(function (AssertableJson $json) use ($generation): void {
                 $payload = $json->toArray();
 
-                $this->assertSame($generation, $payload['generation']['id']);
+                $this->assertSame($generation, $payload['revision']);
                 $this->assertFalse($payload['staleness']['stale']);
                 $this->assertFalse($payload['staleness']['containerBindingsChanged']);
+                $this->assertArrayNotHasKey('generation', $payload);
                 $json->etc();
             });
 
@@ -520,6 +571,7 @@ class McpToolsTest extends TestCase
 
         AppGraphServer::tool(OverviewTool::class)
             ->assertHasErrors()
+            ->assertSee('appgraph_refresh')
             ->assertSee('appgraph:scan');
     }
 

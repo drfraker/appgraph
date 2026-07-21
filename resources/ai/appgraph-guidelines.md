@@ -22,7 +22,8 @@ for what the application does.
 5. Use `appgraph_overview` only for unfamiliar areas, whole-application architecture,
    or graph health. It is not a required first call.
 6. If source changed and current graph results matter, call `appgraph_refresh` once
-   after a meaningful batch of edits.
+   after a meaningful batch of edits. It returns a change receipt (counts and
+   bounded details by category); check it for unexpected collateral changes.
 
 Keep queries narrow. Confidence is a static-evidence ranking, not a probability.
 `analysisWarnings`, missing mapped tests, and truncated results are prompts to inspect

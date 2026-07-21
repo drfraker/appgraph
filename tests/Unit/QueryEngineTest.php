@@ -25,7 +25,8 @@ class QueryEngineTest extends TestCase
         $this->assertSame('overview', $overview['query']);
         $this->assertSame('Query Fixture App', $overview['meta']['appName']);
         $this->assertSame('2026-06-09T00:00:00.000000Z', $overview['generatedAt']);
-        $this->assertIsInt($overview['graphAgeSeconds']);
+        $this->assertArrayNotHasKey('graphAgeSeconds', $overview);
+        $this->assertArrayNotHasKey('generation', $overview);
         $this->assertSame(12, $overview['counts']['nodes']);
         $this->assertSame(12, $overview['counts']['edges']);
         $this->assertSame(3, $overview['counts']['byNodeType']['model']);
@@ -101,12 +102,16 @@ class QueryEngineTest extends TestCase
             ['scanner' => 'alpha', 'count' => 2],
             ['scanner' => 'zeta', 'count' => 38],
         ], $summary['byScanner']);
-        $this->assertSame($summary['bounds']['maxSamples'], $summary['returnedSamples']);
-        $this->assertSame(40 - $summary['returnedSamples'], $summary['omittedSamples']);
-        $this->assertTrue($summary['samplesTruncated']);
-        $this->assertTrue($summary['fieldsTruncated']);
-        $this->assertTrue($summary['messagesTruncated']);
+        $this->assertSame($summary['bounds']['maxSamples'], count($summary['samples']));
+        $this->assertSame(40 - count($summary['samples']), $summary['omittedSamples']);
+        $this->assertGreaterThan(0, $summary['omittedFields']);
+        $this->assertGreaterThan(0, $summary['truncatedMessages']);
         $this->assertTrue($summary['truncated']);
+        $this->assertArrayNotHasKey('structured', $summary);
+        $this->assertArrayNotHasKey('returnedSamples', $summary);
+        $this->assertArrayNotHasKey('samplesTruncated', $summary);
+        $this->assertArrayNotHasKey('fieldsTruncated', $summary);
+        $this->assertArrayNotHasKey('messagesTruncated', $summary);
         $this->assertTrue($forward['truncated']);
         $this->assertArrayNotHasKey('responseTruncated', $forward);
 
@@ -188,8 +193,10 @@ class QueryEngineTest extends TestCase
         $byColumn = $engine->writesTo('notes.title');
         $this->assertSame('column:notes.title', $byColumn['column']);
         $this->assertSame('title', $byColumn['field']);
-        $this->assertSame('possible', $byColumn['results'][0]['match']);
-        $this->assertSame(['create', 'save'], $byColumn['results'][0]['possibleOps']);
+        $this->assertSame(['proven' => 0, 'possible' => 1, 'excluded' => 0], $byColumn['counts']);
+        $this->assertSame('possible', $byColumn['matches']['possible'][0]['match']);
+        $this->assertSame(['create', 'save'], $byColumn['matches']['possible'][0]['possibleOps']);
+        $this->assertArrayNotHasKey('results', $byColumn);
     }
 
     public function test_data_access_details_are_bounded_per_row_with_explicit_truncation(): void
@@ -223,9 +230,10 @@ class QueryEngineTest extends TestCase
         $this->assertCount(32, $table['results'][0]['ops']);
         $this->assertCount(64, $table['results'][0]['fields']);
         $this->assertTrue($column['truncated']);
-        $this->assertTrue($column['results'][0]['detailsTruncated']);
-        $this->assertCount(32, $column['results'][0]['ops']);
-        $this->assertLessThanOrEqual(64, count($column['results'][0]['fields']));
+        $columnRow = $column['matches']['proven'][0];
+        $this->assertTrue($columnRow['detailsTruncated']);
+        $this->assertCount(32, $columnRow['ops']);
+        $this->assertLessThanOrEqual(64, count($columnRow['fields']));
     }
 
     public function test_malformed_operation_evidence_is_possible_and_explicitly_truncated(): void
@@ -255,8 +263,8 @@ class QueryEngineTest extends TestCase
         $this->assertTrue($table['truncated']);
         $this->assertTrue($table['results'][0]['detailsTruncated']);
         $this->assertTrue($column['truncated']);
-        $this->assertSame('possible', $column['results'][0]['match']);
-        $this->assertTrue($column['results'][0]['detailsTruncated']);
+        $this->assertSame('possible', $column['matches']['possible'][0]['match']);
+        $this->assertTrue($column['matches']['possible'][0]['detailsTruncated']);
         $this->assertSame(1, $column['counts']['possible']);
         $this->assertSame(0, $column['counts']['excluded']);
     }
@@ -273,9 +281,10 @@ class QueryEngineTest extends TestCase
         $this->assertSame(['get'], $reads['results'][0]['ops']);
 
         $columnReads = $engine->readsFrom('notes.title');
-        $this->assertSame('possible', $columnReads['results'][0]['match']);
+        $this->assertSame('possible', $columnReads['matches']['possible'][0]['match']);
         $this->assertSame(0, $columnReads['counts']['proven']);
         $this->assertSame(1, $columnReads['counts']['possible']);
+        $this->assertArrayNotHasKey('results', $columnReads);
     }
 
     public function test_column_access_separates_proven_possible_and_excluded_operations(): void
@@ -347,8 +356,8 @@ class QueryEngineTest extends TestCase
         $this->assertSame([], $result['matches']['possible']);
 
         $nested = (new QueryEngine(GraphIndex::fromArray($graph)))->writesTo('notes.meta');
-        $this->assertSame('proven', $nested['results'][0]['match']);
-        $this->assertSame(['create'], $nested['results'][0]['provenOps']);
+        $this->assertSame('proven', $nested['matches']['proven'][0]['match']);
+        $this->assertSame(['create'], $nested['matches']['proven'][0]['provenOps']);
     }
 
     public function test_column_access_treats_legacy_coverage_as_unknown_and_whole_rows_as_proven(): void
@@ -398,12 +407,12 @@ class QueryEngineTest extends TestCase
         $engine = new QueryEngine(GraphIndex::fromArray($graph));
 
         $writes = $engine->writesTo('notes.title');
-        $this->assertSame('proven', collect($writes['results'])->firstWhere('id', 'App\\Services\\RowDeleter::delete')['match']);
-        $this->assertSame('possible', collect($writes['results'])->firstWhere('id', 'App\\Services\\LegacyWriter::save')['match']);
+        $this->assertSame('proven', collect($writes['matches']['proven'])->firstWhere('id', 'App\\Services\\RowDeleter::delete')['match']);
+        $this->assertSame('possible', collect($writes['matches']['possible'])->firstWhere('id', 'App\\Services\\LegacyWriter::save')['match']);
         $this->assertNotContains('App\\Services\\LegacyWriter::save', array_column($writes['matches']['excluded'], 'id'));
 
         $reads = $engine->readsFrom('notes.title');
-        $this->assertSame('proven', collect($reads['results'])->firstWhere('id', 'App\\Services\\WildcardReader::read')['match']);
+        $this->assertSame('proven', collect($reads['matches']['proven'])->firstWhere('id', 'App\\Services\\WildcardReader::read')['match']);
     }
 
     public function test_callers_of_traverses_call_graph_upstream(): void
@@ -425,8 +434,9 @@ class QueryEngineTest extends TestCase
         $this->assertSame('route:PUT:/notes/{note}', $flow['route']['id']);
         $this->assertSame('PUT /notes/{note}', $flow['route']['label']);
         $this->assertSame('notes.update', $flow['route']['name']);
-        $this->assertSame('App\Http\Controllers\NoteController::update', $flow['entrypoint']['id']);
-        $this->assertSame(0, $flow['entrypoint']['depth']);
+        $this->assertSame('App\Http\Controllers\NoteController::update', $flow['entrypoint']);
+        $this->assertSame($flow['entrypoint'], $flow['methods'][0]['id']);
+        $this->assertSame(0, $flow['methods'][0]['depth']);
         $this->assertSame(
             [
                 'App\Http\Controllers\NoteController::update',
@@ -763,7 +773,7 @@ class QueryEngineTest extends TestCase
             relatedGroups: [],
         );
 
-        $this->assertSame($preferred, $flow['entrypoint']['id']);
+        $this->assertSame($preferred, $flow['entrypoint']);
         $this->assertTrue($flow['truncated']);
         $this->assertTrue($flow['truncation']['routeActionSelection']);
         $this->assertTrue($flow['truncation']['executionTraversal']);
@@ -868,7 +878,7 @@ class QueryEngineTest extends TestCase
         $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom('notes.update', limit: 1);
 
         $this->assertTrue($flow['truncated']);
-        $this->assertSame($action, $flow['entrypoint']['id']);
+        $this->assertSame($action, $flow['entrypoint']);
         $this->assertSame([$action], array_column($flow['methods'], 'id'));
         $this->assertTrue($flow['truncation']['executionTraversal']);
         $this->assertTrue($flow['truncation']['actionReservation']);
@@ -888,7 +898,10 @@ class QueryEngineTest extends TestCase
         $flow = (new QueryEngine(GraphIndex::fromArray($graph)))->flowFrom('notes.update');
 
         $this->assertSame(0.7, $flow['route']['actionConfidence']);
-        $this->assertSame(0.7, $flow['entrypoint']['confidence']);
+        $this->assertSame(
+            0.7,
+            collect($flow['methods'])->firstWhere('id', $flow['entrypoint'])['confidence'],
+        );
     }
 
     public function test_flow_from_crosses_form_request_lifecycle_hooks_into_their_downstream_effects(): void
@@ -978,7 +991,7 @@ class QueryEngineTest extends TestCase
         $limited = $engine->flowFrom('notes.update', limit: 2);
         $this->assertTrue($limited['truncated']);
         $this->assertCount(2, $limited['methods']);
-        $this->assertSame($action, $limited['entrypoint']['id']);
+        $this->assertSame($action, $limited['entrypoint']);
     }
 
     public function test_flow_from_compact_listener_output_excludes_registered_but_non_executing_listeners(): void
@@ -1626,7 +1639,7 @@ class QueryEngineTest extends TestCase
         $results = $this->engine()->search('NoteService')['results'];
 
         $this->assertSame(
-            ['App\Services\NoteService::helper', 'App\Services\NoteService::save'],
+            ['App\Services\NoteService::save', 'App\Services\NoteService::helper'],
             array_column($results, 'id')
         );
         $this->assertSame(['id', 'type', 'label', 'file', 'line'], array_keys($results[0]));

@@ -89,7 +89,7 @@ The default MCP server deliberately exposes five tools:
 | `appgraph_node` | Inspect one node, direct edges, and source location |
 | `appgraph_query` | Run a focused flow, impact, data-access, or call traversal |
 | `appgraph_overview` | Inspect broad architecture, graph health, and freshness |
-| `appgraph_refresh` | Rebuild the graph once after meaningful source changes |
+| `appgraph_refresh` | Rebuild the graph after meaningful source changes and return a change receipt (counts and bounded details by category: routes, writes, authorization, queues, tests) |
 
 `appgraph_query` supports:
 
@@ -164,9 +164,9 @@ Automatic MCP scanning is configured with `appgraph.mcp.auto_scan`:
 
 | Value | Behavior |
 |---|---|
-| `missing` | Scan only when no authoritative generation exists; default |
+| `off` | Never scan automatically; lookups are read-only and a missing graph points at `appgraph_refresh`; default |
+| `missing` | Scan only when no authoritative generation exists |
 | `stale` | Rescan before a lookup when tracked source inputs changed |
-| `off` | Never scan automatically |
 
 ## Graph coverage
 

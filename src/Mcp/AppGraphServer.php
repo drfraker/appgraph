@@ -23,7 +23,8 @@ For a known area, use appgraph_search to resolve the exact id, appgraph_node for
 relationships, and appgraph_query only when you need a focused flow or impact traversal.
 Use appgraph_overview only for broad architecture orientation. Read the returned source
 before drawing conclusions or editing. If current results matter after source changes,
-call appgraph_refresh once.
+call appgraph_refresh once; its change receipt shows what actually changed by category,
+including collateral changes you did not intend.
 
 The graph is static analysis, not live state. Confidence scores rank static evidence;
 they are not probabilities. Treat analysis warnings as prompts to inspect the referenced

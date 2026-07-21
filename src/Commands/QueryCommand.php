@@ -4,6 +4,7 @@ namespace AppGraph\Commands;
 
 use AppGraph\Query\GraphIndex;
 use AppGraph\Query\QueryEngine;
+use AppGraph\Query\SearchPayload;
 use AppGraph\Query\StalenessChecker;
 use AppGraph\Query\UnresolvedTargetException;
 use AppGraph\Storage\ChangeVerifier;
@@ -259,36 +260,7 @@ class QueryCommand extends Command
     /** @return array<string, mixed> */
     private function storedSearchPayload(GraphStore $store, string $term, ?string $type, int $limit): array
     {
-        $search = $store->searchNodes($term, $type, $limit);
-        $generation = $search['generation'];
-        $payload = [
-            'query' => 'search',
-            'target' => $term,
-            'generation' => $generation,
-            'generatedAt' => $generation['generatedAt'],
-            'results' => array_map(
-                static fn (array $node): array => array_filter([
-                    'id' => $node['id'],
-                    'type' => $node['type'],
-                    'label' => $node['label'] ?? null,
-                    'file' => $node['file'] ?? null,
-                    'line' => $node['line'] ?? null,
-                ], static fn (mixed $value): bool => $value !== null),
-                $search['results'],
-            ),
-            'searchBackend' => $search['fts'],
-        ];
-        $timestamp = strtotime((string) $generation['generatedAt']);
-
-        if ($timestamp !== false) {
-            $payload['graphAgeSeconds'] = max(0, time() - $timestamp);
-        }
-
-        if ($search['truncated']) {
-            $payload['truncated'] = true;
-        }
-
-        return $payload;
+        return SearchPayload::fromStoreResult($term, $store->searchNodes($term, $type, $limit));
     }
 
     private function boundedIntegerOption(string $name, int $default, int $minimum, int $maximum): int

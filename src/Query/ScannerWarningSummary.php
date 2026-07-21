@@ -173,28 +173,45 @@ final class ScannerWarningSummary
             || $fieldsTruncated
             || $messagesTruncated;
 
-        return [
-            'total' => $total,
-            'structured' => count($structured),
-            'unstructured' => $unstructured,
-            'unattributed' => $unattributed,
-            'scannerGroups' => count($scannerGroups),
-            'returnedScannerGroups' => count($byScanner),
+        // Zero-valued counters and derivable booleans are omitted: an agent
+        // reading {total: 0} learns as much as it would from two dozen zeros,
+        // and every response carries this summary. Returned collection sizes
+        // are derivable from the collections themselves.
+        $summary = ['total' => $total];
+
+        if ($unstructured > 0 || $unattributed > 0) {
+            $summary['structured'] = count($structured);
+            $summary['unstructured'] = $unstructured;
+            $summary['unattributed'] = $unattributed;
+        }
+
+        foreach ([
             'omittedScannerGroups' => $omittedScannerGroups,
             'omittedScannerWarnings' => $omittedScannerWarnings,
-            'returnedSamples' => $returnedSamples,
             'omittedSamples' => $omittedSamples,
             'omittedFields' => $omittedFields,
             'truncatedMessages' => $truncatedMessages,
-            'sourceMalformed' => $sourceMalformed,
-            'byScannerTruncated' => $byScannerTruncated,
-            'samplesTruncated' => $samplesTruncated,
-            'fieldsTruncated' => $fieldsTruncated,
-            'messagesTruncated' => $messagesTruncated,
-            'truncated' => $truncated,
-            'byScanner' => $byScanner,
-            'samples' => $samples,
-            'bounds' => [
+        ] as $key => $count) {
+            if ($count > 0) {
+                $summary[$key] = $count;
+            }
+        }
+
+        if ($sourceMalformed) {
+            $summary['sourceMalformed'] = true;
+        }
+
+        if ($byScanner !== []) {
+            $summary['byScanner'] = $byScanner;
+        }
+
+        if ($samples !== []) {
+            $summary['samples'] = $samples;
+        }
+
+        if ($truncated) {
+            $summary['truncated'] = true;
+            $summary['bounds'] = [
                 'maxScannerGroups' => self::MAX_SCANNER_GROUPS,
                 'maxScannerBytes' => self::MAX_SCANNER_BYTES,
                 'returnedScannerBytes' => $scannerBytes,
@@ -204,8 +221,10 @@ final class ScannerWarningSummary
                 'maxSamplesBytes' => self::MAX_SAMPLES_BYTES,
                 'returnedSamplesBytes' => $sampleBytes,
                 'maxMessageBytes' => self::MAX_MESSAGE_BYTES,
-            ],
-        ];
+            ];
+        }
+
+        return $summary;
     }
 
     /** @param array<string, mixed> $warning @return array<string, mixed> */

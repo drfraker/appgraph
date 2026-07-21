@@ -13,7 +13,7 @@ final class TaskContextPlanner
 
     private const MAX_TASK_CHARACTERS = 4000;
 
-    private const MAX_TARGETS = 10;
+    private const MAX_TARGETS = 20;
 
     private const MAX_CHANGED_FILES = 50;
 
@@ -345,10 +345,6 @@ final class TaskContextPlanner
         $task = trim($task);
         $characters = preg_match_all('/./us', $task, $matches);
 
-        if ($task === '') {
-            throw new InvalidArgumentException('Task context requires a nonblank task description.');
-        }
-
         if ($characters === false || $characters > self::MAX_TASK_CHARACTERS || strlen($task) > self::MAX_TASK_BYTES) {
             throw new InvalidArgumentException('Task context descriptions must not exceed 4000 characters.');
         }
@@ -367,6 +363,12 @@ final class TaskContextPlanner
 
         $targets = $this->validatedStringList($targets, 'targets', self::MAX_TARGETS, 4096);
         $changedFiles = $this->validatedStringList($changedFiles, 'changed files', self::MAX_CHANGED_FILES, 1024);
+
+        if ($task === '' && $targets === [] && $changedFiles === []) {
+            throw new InvalidArgumentException(
+                'Task context requires a nonblank task description, an explicit target, or a changed file.',
+            );
+        }
 
         return [$task, $targets, $changedFiles];
     }
@@ -479,27 +481,32 @@ final class TaskContextPlanner
             }
         }
 
-        $termOmitted = 0;
-        $identifierOmitted = 0;
-        $terms = $this->taskTerms($task, $termOmitted);
-        $identifiers = $this->taskIdentifiers($task, $identifierOmitted);
+        $terms = [];
+        $identifiers = [];
 
-        if ($termOmitted > 0) {
-            $omitted['input_limit'] += $termOmitted;
-            $uncertainties[] = [
-                'reason' => 'task_term_limit',
-                'count' => $termOmitted,
-                'message' => 'Additional unique task terms were omitted from lexical ranking.',
-            ];
-        }
+        if ($task !== '') {
+            $termOmitted = 0;
+            $identifierOmitted = 0;
+            $terms = $this->taskTerms($task, $termOmitted);
+            $identifiers = $this->taskIdentifiers($task, $identifierOmitted);
 
-        if ($identifierOmitted > 0) {
-            $omitted['input_limit'] += $identifierOmitted;
-            $uncertainties[] = [
-                'reason' => 'task_identifier_limit',
-                'count' => $identifierOmitted,
-                'message' => 'Additional explicit-looking task identifiers were omitted from exact matching.',
-            ];
+            if ($termOmitted > 0) {
+                $omitted['input_limit'] += $termOmitted;
+                $uncertainties[] = [
+                    'reason' => 'task_term_limit',
+                    'count' => $termOmitted,
+                    'message' => 'Additional unique task terms were omitted from lexical ranking.',
+                ];
+            }
+
+            if ($identifierOmitted > 0) {
+                $omitted['input_limit'] += $identifierOmitted;
+                $uncertainties[] = [
+                    'reason' => 'task_identifier_limit',
+                    'count' => $identifierOmitted,
+                    'message' => 'Additional explicit-looking task identifiers were omitted from exact matching.',
+                ];
+            }
         }
         $exactNodes = [];
         $lexical = [];
@@ -552,115 +559,117 @@ final class TaskContextPlanner
             }
         }
 
-        foreach ($this->index->nodes() as $node) {
-            if ($nodeCount >= self::MAX_SCANNED_NODES) {
-                break;
+        if ($task !== '') {
+            foreach ($this->index->nodes() as $node) {
+                if ($nodeCount >= self::MAX_SCANNED_NODES) {
+                    break;
+                }
+
+                $nodeCount++;
+                $id = (string) ($node['id'] ?? '');
+
+                if (max(
+                    strlen($id),
+                    strlen((string) ($node['label'] ?? '')),
+                    strlen((string) ($node['metadata']['name'] ?? '')),
+                    strlen((string) ($node['file'] ?? '')),
+                ) > 2048) {
+                    $omitted['node_text_limit']++;
+                }
+
+                if (! $this->nodeHasBoundedIdentity($node)) {
+                    continue;
+                }
+
+                if ($this->nodeMatchesIdentifier($node, $identifiers)) {
+                    $exactNodes[$id] = $node;
+
+                    if (count($exactNodes) >= self::LEXICAL_PRUNE_AT) {
+                        $omitted['identifier_candidate_limit'] += $this->pruneExactNodes($exactNodes);
+                    }
+                }
+
+                $matches = $this->lexicalMatches($node, $terms);
+
+                if ($matches === []) {
+                    continue;
+                }
+
+                foreach (array_keys($matches) as $term) {
+                    $documentFrequency[$term]++;
+                }
+                $lexicalMatchCount++;
             }
 
-            $nodeCount++;
-            $id = (string) ($node['id'] ?? '');
+            $omitted['identifier_candidate_limit'] += $this->pruneExactNodes($exactNodes);
 
-            if (max(
-                strlen($id),
-                strlen((string) ($node['label'] ?? '')),
-                strlen((string) ($node['metadata']['name'] ?? '')),
-                strlen((string) ($node['file'] ?? '')),
-            ) > 2048) {
-                $omitted['node_text_limit']++;
+            if ($this->index->nodeCount() > $nodeCount) {
+                $omitted['node_scan_limit'] += $this->index->nodeCount() - $nodeCount;
             }
 
-            if (! $this->nodeHasBoundedIdentity($node)) {
-                continue;
+            foreach ($exactNodes as $node) {
+                $this->addSeed($seedsById, $node, 0.92, 'task_identifier');
             }
 
-            if ($this->nodeMatchesIdentifier($node, $identifiers)) {
-                $exactNodes[$id] = $node;
+            $totalIdf = 0.0;
+            $idf = [];
 
-                if (count($exactNodes) >= self::LEXICAL_PRUNE_AT) {
-                    $omitted['identifier_candidate_limit'] += $this->pruneExactNodes($exactNodes);
+            foreach ($terms as $term) {
+                $idf[$term] = log(($nodeCount + 1) / (($documentFrequency[$term] ?? 0) + 1)) + 1;
+                $totalIdf += $idf[$term];
+            }
+
+            $rescanned = 0;
+
+            foreach ($this->index->nodes() as $node) {
+                if ($rescanned >= $nodeCount) {
+                    break;
+                }
+
+                $rescanned++;
+
+                if (! $this->nodeHasBoundedIdentity($node)) {
+                    continue;
+                }
+
+                $matches = $this->lexicalMatches($node, $terms);
+
+                if ($matches === []) {
+                    continue;
+                }
+
+                $weighted = 0.0;
+
+                foreach ($matches as $term => $weight) {
+                    $weighted += $idf[$term] * $weight;
+                }
+
+                $coverage = $totalIdf > 0 ? $weighted / $totalIdf : 0.0;
+                $relevance = min(0.90, 0.55 + (0.35 * $coverage));
+                $lexical[(string) $node['id']] = [
+                    'node' => $node,
+                    'matches' => $matches,
+                    'provisional' => $relevance,
+                ];
+
+                if (count($lexical) >= self::LEXICAL_PRUNE_AT) {
+                    $this->pruneLexical($lexical);
                 }
             }
 
-            $matches = $this->lexicalMatches($node, $terms);
+            $this->pruneLexical($lexical);
+            $omitted['lexical_candidate_limit'] += max(0, $lexicalMatchCount - count($lexical));
 
-            if ($matches === []) {
-                continue;
+            foreach ($lexical as $candidate) {
+                $relevance = (float) $candidate['provisional'];
+                $this->addSeed(
+                    $seedsById,
+                    $candidate['node'],
+                    $relevance,
+                    'task_lexical',
+                    array_keys($candidate['matches']),
+                );
             }
-
-            foreach (array_keys($matches) as $term) {
-                $documentFrequency[$term]++;
-            }
-            $lexicalMatchCount++;
-        }
-
-        $omitted['identifier_candidate_limit'] += $this->pruneExactNodes($exactNodes);
-
-        if ($this->index->nodeCount() > $nodeCount) {
-            $omitted['node_scan_limit'] += $this->index->nodeCount() - $nodeCount;
-        }
-
-        foreach ($exactNodes as $node) {
-            $this->addSeed($seedsById, $node, 0.92, 'task_identifier');
-        }
-
-        $totalIdf = 0.0;
-        $idf = [];
-
-        foreach ($terms as $term) {
-            $idf[$term] = log(($nodeCount + 1) / (($documentFrequency[$term] ?? 0) + 1)) + 1;
-            $totalIdf += $idf[$term];
-        }
-
-        $rescanned = 0;
-
-        foreach ($this->index->nodes() as $node) {
-            if ($rescanned >= $nodeCount) {
-                break;
-            }
-
-            $rescanned++;
-
-            if (! $this->nodeHasBoundedIdentity($node)) {
-                continue;
-            }
-
-            $matches = $this->lexicalMatches($node, $terms);
-
-            if ($matches === []) {
-                continue;
-            }
-
-            $weighted = 0.0;
-
-            foreach ($matches as $term => $weight) {
-                $weighted += $idf[$term] * $weight;
-            }
-
-            $coverage = $totalIdf > 0 ? $weighted / $totalIdf : 0.0;
-            $relevance = min(0.90, 0.55 + (0.35 * $coverage));
-            $lexical[(string) $node['id']] = [
-                'node' => $node,
-                'matches' => $matches,
-                'provisional' => $relevance,
-            ];
-
-            if (count($lexical) >= self::LEXICAL_PRUNE_AT) {
-                $this->pruneLexical($lexical);
-            }
-        }
-
-        $this->pruneLexical($lexical);
-        $omitted['lexical_candidate_limit'] += max(0, $lexicalMatchCount - count($lexical));
-
-        foreach ($lexical as $candidate) {
-            $relevance = (float) $candidate['provisional'];
-            $this->addSeed(
-                $seedsById,
-                $candidate['node'],
-                $relevance,
-                'task_lexical',
-                array_keys($candidate['matches']),
-            );
         }
 
         $seeds = array_values($seedsById);

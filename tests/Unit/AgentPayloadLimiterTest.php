@@ -197,16 +197,20 @@ class AgentPayloadLimiterTest extends TestCase
             'abstract',
             'alias',
             'aliasTarget',
+            'anchor',
+            'at',
             'bindingAbstract',
             'bindingConcrete',
             'bindingConsumer',
             'concrete',
             'consumer',
+            'code',
             'controller',
             'controllerMethod',
             'declaredOn',
             'declaringClass',
             'foreignTable',
+            'input',
             'job',
             'middleware',
             'parameter',
@@ -223,6 +227,7 @@ class AgentPayloadLimiterTest extends TestCase
             'scanner',
             'targetTable',
             'trait',
+            'uncertaintyReason',
             'uri',
         ];
 
@@ -233,7 +238,7 @@ class AgentPayloadLimiterTest extends TestCase
             );
         }
 
-        foreach (['ambiguousLogicalTableSamples', 'foreignColumns', 'middleware', 'relationships', 'routeParameters', 'samplePaths', 'traits', 'unmappedChangedFiles'] as $key) {
+        foreach (['ambiguousLogicalTableSamples', 'foreignColumns', 'mapped', 'middleware', 'relationships', 'routeParameters', 'samplePaths', 'traits', 'unmappedChangedFiles', 'why'] as $key) {
             $this->assertTrue(
                 AgentPayloadLimiter::isExactStringCollectionKey($key),
                 "Expected {$key} values to be protected by exact-or-omit response handling.",

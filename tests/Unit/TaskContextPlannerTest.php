@@ -74,6 +74,36 @@ class TaskContextPlannerTest extends TestCase
         $this->assertSame($result, $reversedResult);
     }
 
+    public function test_empty_task_uses_only_explicit_targets_and_changed_files(): void
+    {
+        $graph = $this->withExactSpans($this->queryFixtureGraph());
+        $this->writeGraphFiles($graph);
+
+        $targetOnly = $this->planner($graph)->plan('', ['notes.update']);
+
+        $this->assertSame(['route:PUT:/notes/{note}'], array_column($targetOnly['seeds'], 'id'));
+        $this->assertSame(['explicit_target'], $targetOnly['seeds'][0]['sources']);
+        $this->assertSame(0, $targetOnly['omitted']['lexical_candidate_limit']);
+        $this->assertSame(0, $targetOnly['omitted']['identifier_candidate_limit']);
+        $this->assertSame(0, $targetOnly['omitted']['node_scan_limit']);
+
+        $fileOnly = $this->planner($graph)->plan('', changedFiles: ['app/Services/NoteService.php']);
+
+        $this->assertNotEmpty($fileOnly['seeds']);
+
+        foreach ($fileOnly['seeds'] as $seed) {
+            $this->assertSame(['changed_file'], $seed['sources']);
+        }
+    }
+
+    public function test_empty_task_without_explicit_inputs_is_rejected(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('a nonblank task description, an explicit target, or a changed file');
+
+        $this->planner($this->queryFixtureGraph())->plan('');
+    }
+
     public function test_shared_tables_are_terminal_unless_the_table_or_column_is_an_explicit_target(): void
     {
         $graph = [

@@ -10,6 +10,7 @@ use AppGraph\Mcp\Tools\OverviewTool;
 use AppGraph\Mcp\Tools\QueryTool;
 use AppGraph\Mcp\Tools\RefreshTool;
 use AppGraph\Mcp\Tools\SearchTool;
+use AppGraph\Mcp\Tools\SliceTool;
 use AppGraph\Storage\GraphStore;
 use AppGraph\Support\ScanResultRegistry;
 use AppGraph\Support\ScanRunner;
@@ -22,6 +23,9 @@ use Illuminate\Testing\Fluent\AssertableJson;
 class McpToolsTest extends TestCase
 {
     use BuildsQueryFixtureGraph;
+
+    /** @var array<int, string> */
+    private array $sliceFixtureDirectories = [];
 
     /**
      * @param \Illuminate\Foundation\Application $app
@@ -54,6 +58,15 @@ class McpToolsTest extends TestCase
         );
     }
 
+    protected function tearDown(): void
+    {
+        foreach ($this->sliceFixtureDirectories as $directory) {
+            (new \Illuminate\Filesystem\Filesystem)->deleteDirectory($directory);
+        }
+
+        parent::tearDown();
+    }
+
     public function test_server_registers_as_a_local_mcp_server(): void
     {
         $this->assertNotNull(\Laravel\Mcp\Facades\Mcp::getLocalServer('appgraph'));
@@ -68,8 +81,80 @@ class McpToolsTest extends TestCase
             SearchTool::class,
             NodeTool::class,
             QueryTool::class,
+            SliceTool::class,
             RefreshTool::class,
         ], $tools);
+    }
+
+    public function test_slice_tool_returns_a_bounded_fresh_read_plan(): void
+    {
+        [$graph, $file] = $this->sliceToolFixture();
+        (new GraphExporter())->exportData(
+            $graph,
+            storage_path(config('appgraph.output_path', 'appgraph/appgraph.json')),
+        );
+        $schema = app(SliceTool::class)->toArray()['inputSchema'];
+
+        $this->assertFalse($schema['additionalProperties']);
+        $this->assertSame(20, $schema['properties']['anchors']['maxItems']);
+        $this->assertSame(4096, $schema['properties']['anchors']['items']['maxLength']);
+        $this->assertSame(50, $schema['properties']['files']['maxItems']);
+        $this->assertSame(512, $schema['properties']['read_budget']['minimum']);
+        $this->assertSame(16000, $schema['properties']['read_budget']['maximum']);
+        $this->assertSame(6, $schema['properties']['depth']['maximum']);
+
+        AppGraphServer::tool(SliceTool::class, [
+            'anchors' => ['method:NoteWriter::save'],
+            'read_budget' => 512,
+            'depth' => 1,
+        ])
+            ->assertOk()
+            ->assertStructuredContent(function (AssertableJson $json) use ($file): void {
+                $payload = $json->toArray();
+
+                $this->assertSame('slice', $payload['query']);
+                $this->assertSame('current', $payload['freshness']['state']);
+                $this->assertSame('App\Services\NoteWriter::save', $payload['anchors'][0]['resolved']);
+                $this->assertSame($file, $payload['read'][0]['file']);
+                $this->assertContains('explicit_target', $payload['read'][0]['why']);
+                $this->assertLessThanOrEqual(512, $payload['budget']['usedTokens']);
+                $this->assertArrayNotHasKey('confidence', $payload['read'][0]);
+                $json->etc();
+            });
+    }
+
+    public function test_slice_tool_returns_a_structured_unresolved_anchor_error(): void
+    {
+        AppGraphServer::tool(SliceTool::class, ['anchors' => ['class:Tag']])
+            ->assertHasErrors()
+            ->assertSee('Candidates')
+            ->assertStructuredContent(fn (AssertableJson $json) => $json
+                ->where('query', 'slice')
+                ->where('code', 'unresolved_anchor')
+                ->where('anchor', 'class:Tag')
+                ->where('candidates', ['App\Models\Tag', 'App\Other\Tag'])
+                ->etc());
+    }
+
+    public function test_slice_tool_enforces_strict_bounded_inputs(): void
+    {
+        foreach ([
+            [],
+            ['anchors' => []],
+            ['files' => []],
+            ['anchors' => ['   ']],
+            ['anchors' => ["method:Note\0Writer"]],
+            ['anchors' => str_repeat('x', 10)],
+            ['anchors' => array_fill(0, 21, 'method:NoteWriter::save')],
+            ['files' => ['app/Note.php', 'app/Note.php']],
+            ['files' => [str_repeat('x', 1025)]],
+            ['anchors' => ['method:NoteWriter::save'], 'read_budget' => '512'],
+            ['anchors' => ['method:NoteWriter::save'], 'read_budget' => 511],
+            ['anchors' => ['method:NoteWriter::save'], 'depth' => 0],
+            ['anchors' => ['method:NoteWriter::save'], 'depth' => '4'],
+        ] as $arguments) {
+            AppGraphServer::tool(SliceTool::class, $arguments)->assertHasErrors();
+        }
     }
 
     public function test_overview_tool_reports_counts_and_staleness(): void
@@ -550,6 +635,7 @@ class McpToolsTest extends TestCase
             [SearchTool::class, ['term' => 'Note', 'limt' => 1], 'limt'],
             [NodeTool::class, ['id' => 'table:notes', 'ful' => true], 'ful'],
             [QueryTool::class, ['query' => 'tables', 'depht' => 2], 'depht'],
+            [SliceTool::class, ['files' => ['app/Note.php'], 'budegt' => 512], 'budegt'],
             [RefreshTool::class, ['depth' => 2], 'depth'],
         ] as [$tool, $arguments, $unknown]) {
             $schema = app($tool)->toArray()['inputSchema'];
@@ -580,5 +666,42 @@ class McpToolsTest extends TestCase
         foreach (['routes', 'database', 'models', 'calls', 'data_flow', 'form_requests', 'events', 'side_effects', 'frontend', 'tests', 'policies', 'container_bindings'] as $scanner) {
             config()->set("appgraph.scan.{$scanner}", false);
         }
+    }
+
+    /** @return array{array<string, mixed>, string} */
+    private function sliceToolFixture(): array
+    {
+        $directory = 'storage/framework/testing/appgraph-slice-'.bin2hex(random_bytes(4));
+        $file = $directory.'/NoteWriter.php';
+        $absolute = base_path($file);
+        $this->sliceFixtureDirectories[] = base_path($directory);
+
+        if (! is_dir(dirname($absolute))) {
+            mkdir(dirname($absolute), 0775, true);
+        }
+
+        file_put_contents($absolute, implode('', array_map(
+            static fn (int $line): string => sprintf("line %03d\n", $line),
+            range(1, 40),
+        )));
+
+        return [[
+            'meta' => [
+                'generatedAt' => '2026-07-21T18:00:00Z',
+                'scan' => [
+                    'algorithm' => 'sha256',
+                    'files' => [$file => hash_file('sha256', $absolute)],
+                ],
+            ],
+            'nodes' => [[
+                'id' => 'App\Services\NoteWriter::save',
+                'type' => 'method',
+                'label' => 'NoteWriter::save',
+                'file' => $file,
+                'line' => 3,
+                'endLine' => 20,
+            ]],
+            'edges' => [],
+        ], $file];
     }
 }

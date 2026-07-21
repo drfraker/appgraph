@@ -8,6 +8,7 @@ use AppGraph\Mcp\Tools\OverviewTool;
 use AppGraph\Mcp\Tools\QueryTool;
 use AppGraph\Mcp\Tools\RefreshTool;
 use AppGraph\Mcp\Tools\SearchTool;
+use AppGraph\Mcp\Tools\SliceTool;
 use Laravel\Mcp\Server;
 use Laravel\Mcp\Server\Attributes\Instructions;
 use Laravel\Mcp\Server\Attributes\Name;
@@ -37,6 +38,7 @@ class AppGraphServer extends Server
         SearchTool::class,
         NodeTool::class,
         QueryTool::class,
+        SliceTool::class,
         RefreshTool::class,
     ];
 }

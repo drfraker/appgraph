@@ -165,6 +165,31 @@ class QueryEngine
     }
 
     /**
+     * Compile a source-only reading plan from explicit graph anchors and files.
+     * Source contents are used only for bounded span sizing and freshness
+     * checks; they are never returned in the response.
+     *
+     * @param array<int, string> $anchors
+     * @param array<int, string> $files
+     * @return array<string, mixed>
+     */
+    public function slice(
+        array $anchors,
+        array $files,
+        int $readBudget = 4000,
+        int $depth = 4,
+    ): array {
+        $result = (new SlicePlanner($this->index, $this->basePath))->plan(
+            $anchors,
+            $files,
+            $readBudget,
+            $depth,
+        );
+
+        return $this->envelope('slice', null, $result['payload'], $result['truncated']);
+    }
+
+    /**
      * @return array<string, mixed>
      */
     public function node(string $target, int $limit = 50, bool $full = false): array

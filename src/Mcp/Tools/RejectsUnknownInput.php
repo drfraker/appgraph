@@ -27,6 +27,15 @@ trait RejectsUnknownInput
             ->withStructuredContent($payload);
     }
 
+    /** @param array<string, mixed> $payload */
+    private function structuredErrorResponse(string $message, array $payload): ResponseFactory
+    {
+        $payload = AgentPayloadLimiter::limit($payload);
+
+        return (new ResponseFactory(Response::error($message)))
+            ->withStructuredContent($payload);
+    }
+
     /** @return array<string, mixed> */
     public function toArray(): array
     {

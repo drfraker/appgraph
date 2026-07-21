@@ -26,7 +26,7 @@ Typical questions:
 
 ```bash
 composer config repositories.appgraph vcs https://github.com/drfraker/appgraph
-composer require --dev drfraker/appgraph:^0.4
+composer require --dev drfraker/appgraph:^0.6
 php artisan appgraph:install
 ```
 

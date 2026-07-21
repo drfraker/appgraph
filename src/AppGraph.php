@@ -4,5 +4,5 @@ namespace AppGraph;
 
 class AppGraph
 {
-    public const VERSION = '0.4.4';
+    public const VERSION = '0.6.0';
 }

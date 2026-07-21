@@ -53,24 +53,26 @@ php artisan appgraph:install
 
 ## Focused workflow
 
-For a known controller, route, model, or table:
+For a controller, route, method, model, table, column, event, or job:
 
-1. Use `appgraph_search` if the exact graph id is unknown.
-2. Use `appgraph_node` to inspect direct relationships and source locations.
-3. Read the referenced source with normal file tools.
-4. Use `appgraph_query` only when a bounded traversal answers a specific question.
+1. Use `appgraph_find` to resolve the target and inspect its direct relationships.
+2. Use `appgraph_slice` with explicit anchors or changed files to get a bounded,
+   Laravel-lifecycle-ordered source reading plan.
+3. Read the referenced source with normal file tools before drawing conclusions.
+4. After a meaningful batch of edits, use `appgraph_refresh` when current graph results
+   matter, and inspect its change receipt for unexpected collateral changes.
 
 For example:
 
 ```text
-appgraph_search "AppointmentsController"
-appgraph_node "App\Http\Controllers\AppointmentsController"
-appgraph_query flow-from "appointments.index"
+appgraph_find {"target":"AppointmentsController"}
+appgraph_slice {"anchors":["route:appointments.index"],"read_budget":4000}
+appgraph_refresh {}
 ```
 
-Use `appgraph_overview` only for unfamiliar areas, whole-application architecture, or
-graph health. It is not a required first call. After a meaningful batch of source
-changes, call `appgraph_refresh` once if current graph results matter.
+`not_observed` means the graph did not observe a match; it does not prove that the
+target does not exist. Uncertain results carry an `uncertainty` bucket and, when the
+graph knows why, an `uncertaintyReason`; everything else is ranked static evidence.
 
 The intended boundary is simple:
 
@@ -81,37 +83,21 @@ Source:   explain behavior and confirm consequential claims
 
 ## MCP tools
 
-The default MCP server deliberately exposes five tools:
+The default MCP server deliberately exposes three tools:
 
 | Tool | Purpose |
 |---|---|
-| `appgraph_search` | Resolve an exact graph id from an id or label substring |
-| `appgraph_node` | Inspect one node, direct edges, and source location |
-| `appgraph_query` | Run a focused flow, impact, data-access, or call traversal |
-| `appgraph_overview` | Inspect broad architecture, graph health, and freshness |
+| `appgraph_find` | Resolve one fuzzy target to a node card, or return ranked candidates honestly |
+| `appgraph_slice` | Turn explicit anchors or changed files into a budgeted source reading plan in stable Laravel-lifecycle order |
 | `appgraph_refresh` | Rebuild the graph after meaningful source changes and return a change receipt (counts and bounded details by category: routes, writes, authorization, queues, tests) |
 
-`appgraph_query` supports:
-
-| Query | Target | Answers |
-|---|---|---|
-| `flow-from` | route or `Class::method` | Bounded downstream feature path |
-| `impact-of` | table, column, model, or method | Bounded upstream impact |
-| `routes-touching` | model or table | Routes that can reach the target |
-| `writes-to` | table, model, or column | Methods that write the target |
-| `reads-from` | table, model, or column | Methods that read the target |
-| `callers-of` | `Class::method` | Transitive application callers |
-| `calls-from` | `Class::method` | Transitive application callees |
-| `models` | — | Compact model-to-table summary |
-| `tables` | — | Compact table reader/writer summary |
-
-Targets are forgiving: `users`, `users.email`, `App\Models\User`,
-`UserController::update`, named routes, and exact route ids are accepted when they
-resolve unambiguously.
+Set `appgraph.mcp.legacy_tools` to `true` to additionally expose
+`appgraph_overview`, `appgraph_search`, `appgraph_node`, and `appgraph_query` for
+compatibility. The focused workflow above is the recommended agent surface.
 
 ## Command line
 
-The same focused queries are available without MCP:
+The command line retains the broader navigation and traversal surface:
 
 ```bash
 php artisan appgraph:query search AppointmentsController --pretty
@@ -127,9 +113,9 @@ php artisan appgraph:query <query> [target] \
     [--limit=50] [--depth=4] [--min-confidence=0] [--type=] [--full] [--pretty]
 ```
 
-The CLI retains `context-for-task`, `generations`, `diff`, and `verify-change` for
-advanced or backwards-compatible local workflows. They are intentionally not exposed
-by the default agent server and are not part of the recommended exploration path.
+It also retains `context-for-task`, `generations`, `diff`, and `verify-change` for
+advanced or backwards-compatible local workflows. These commands are intentionally
+outside the default agent surface.
 
 ## Scan and storage
 
@@ -168,6 +154,10 @@ Automatic MCP scanning is configured with `appgraph.mcp.auto_scan`:
 | `missing` | Scan only when no authoritative generation exists |
 | `stale` | Rescan before a lookup when tracked source inputs changed |
 
+The published configuration also includes `appgraph.mcp.legacy_tools`, which defaults
+to `false`. Enable it only for clients or workflows that still depend on the four
+pre-focused MCP tools; it does not change the broader CLI surface.
+
 ## Graph coverage
 
 Scanning covers:
@@ -196,7 +186,9 @@ reads_cache, writes_cache, reads_filesystem, writes_filesystem, calls_external
 
 AppGraph is static analysis, not runtime truth.
 
-- Confidence values rank static evidence; they are not probabilities.
+- Uncertain findings use `inferred` or `low` buckets and include a reason when the
+  graph has one; omitted uncertainty is still ranked static evidence, not runtime
+  proof.
 - `analysisWarnings` are prompts to inspect relevant source.
 - Missing mapped tests do not prove missing runtime coverage.
 - Dynamic bindings, macros, generated calls, and unsupported framework surfaces may be

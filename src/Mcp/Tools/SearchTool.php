@@ -14,13 +14,17 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 use RuntimeException;
 
 #[Name('appgraph_search')]
-#[Description('Find the exact graph id for a class, method, route, table, event, or job by case-insensitive id/label substring. Start here when the target id is not already known.')]
+#[Description('Find the exact graph id for a class, method, route, table, event, or job by case-insensitive id, label, or route-name substring. Start here when the target id is not already known.')]
 #[IsReadOnly]
 #[IsIdempotent]
 class SearchTool extends Tool
 {
     use InteractsWithQueryEngine;
     use RejectsUnknownInput;
+
+    protected string $name = 'appgraph_search';
+
+    protected string $description = 'Find the exact graph id for a class, method, route, table, event, or job by case-insensitive id, label, or route-name substring. Start here when the target id is not already known.';
 
     /**
      * @return array<string, mixed>

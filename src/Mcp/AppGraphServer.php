@@ -18,29 +18,44 @@ use Laravel\Mcp\Server\Attributes\Version;
 #[Name('AppGraph')]
 #[Version(AppGraph::VERSION)]
 #[Instructions(<<<'MARKDOWN'
-AppGraph is this Laravel application's precomputed cross-layer map. It tells you where
-to look and why; application source remains the authority for what the code does.
-
-For a known area, use appgraph_search to resolve the exact id, appgraph_node for direct
-relationships, and appgraph_query only when you need a focused flow or impact traversal.
-Use appgraph_overview only for broad architecture orientation. Read the returned source
-before drawing conclusions or editing. If current results matter after source changes,
-call appgraph_refresh once; its change receipt shows what actually changed by category,
-including collateral changes you did not intend.
-
-The graph is static analysis, not live state. Confidence scores rank static evidence;
-they are not probabilities. Treat analysis warnings as prompts to inspect the referenced
-source, and narrow truncated results instead of assuming the omitted portion is empty.
+AppGraph is this Laravel application's precomputed cross-layer map; application source remains authoritative.
+Use appgraph_find to resolve one target and appgraph_slice to get a budgeted source-reading plan.
+Call appgraph_refresh after source changes when current results matter.
+Static analysis can be incomplete; `not_observed` does not mean nonexistent, so inspect returned source.
 MARKDOWN)]
 class AppGraphServer extends Server
 {
-    protected array $tools = [
-        OverviewTool::class,
-        SearchTool::class,
-        NodeTool::class,
-        QueryTool::class,
-        SliceTool::class,
-        FindTool::class,
-        RefreshTool::class,
-    ];
+    // Property fallbacks keep the declared laravel/mcp 0.5 compatibility;
+    // attribute metadata is consumed by laravel/mcp 0.6+.
+    protected string $name = 'AppGraph';
+
+    protected string $version = AppGraph::VERSION;
+
+    protected string $instructions = <<<'MARKDOWN'
+AppGraph is this Laravel application's precomputed cross-layer map; application source remains authoritative.
+Use appgraph_find to resolve one target and appgraph_slice to get a budgeted source-reading plan.
+Call appgraph_refresh after source changes when current results matter.
+Static analysis can be incomplete; `not_observed` does not mean nonexistent, so inspect returned source.
+MARKDOWN;
+
+    protected function boot(): void
+    {
+        $this->tools = [
+            FindTool::class,
+            SliceTool::class,
+            RefreshTool::class,
+        ];
+
+        if (config('appgraph.mcp.legacy_tools', false)) {
+            array_push(
+                $this->tools,
+                OverviewTool::class,
+                SearchTool::class,
+                NodeTool::class,
+                QueryTool::class,
+            );
+        }
+
+        parent::boot();
+    }
 }

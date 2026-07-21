@@ -22,6 +22,10 @@ class QueryTool extends Tool
     use InteractsWithQueryEngine;
     use RejectsUnknownInput;
 
+    protected string $name = 'appgraph_query';
+
+    protected string $description = 'Run a focused graph traversal after resolving a target. Use flow-from for a route or method, impact-of before changing a table/column/model/method, routes-touching for HTTP surface, writes-to/reads-from for data access, and callers-of/calls-from for call graphs. Read returned source for detail.';
+
     private const MAX_TARGET_CHARACTERS = 4096;
 
     private const MAX_TARGET_BYTES = 16384;

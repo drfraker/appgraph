@@ -83,7 +83,7 @@ return [
         'depth' => 4,
 
         // Advanced CLI compatibility for context-for-task. The default MCP
-        // workflow intentionally uses search, node, and focused traversals.
+        // workflow intentionally uses find and slice instead.
         'context' => [
             'token_budget' => 4000,
             'depth' => 4,
@@ -99,6 +99,10 @@ return [
          * connect via `php artisan mcp:start appgraph`.
          */
         'enabled' => true,
+
+        // Keep the default agent surface focused. Enable this only for clients
+        // that still call the original overview/search/node/query tools.
+        'legacy_tools' => false,
 
         // Fresh-process scans are bounded so a broken application bootstrap or
         // scanner cannot leave an agent request waiting indefinitely.

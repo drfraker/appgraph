@@ -22,6 +22,10 @@ class NodeTool extends Tool
     use InteractsWithQueryEngine;
     use RejectsUnknownInput;
 
+    protected string $name = 'appgraph_node';
+
+    protected string $description = 'Inspect one resolved node and its direct incoming/outgoing relationships plus source location. Use after appgraph_search; read the referenced files for implementation detail, and traverse only when direct edges are insufficient.';
+
     private const MAX_TARGET_CHARACTERS = 4096;
 
     private const MAX_TARGET_BYTES = 16384;

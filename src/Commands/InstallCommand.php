@@ -76,7 +76,7 @@ class InstallCommand extends Command
         $this->newLine();
         $this->components->info('AppGraph is ready for AI-assisted feature work and refactoring.');
         $this->line('  <fg=gray>Restart the AI client so it loads the new MCP server and project instructions.</>');
-        $this->line('  <fg=gray>Agents resolve targets with appgraph_search and traverse with appgraph_query as needed.</>');
+        $this->line('  <fg=gray>Agents resolve with appgraph_find, plan source reads with appgraph_slice, and rebuild after edits with appgraph_refresh.</>');
 
         return self::SUCCESS;
     }

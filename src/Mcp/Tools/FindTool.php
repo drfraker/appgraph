@@ -14,13 +14,17 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 use RuntimeException;
 
 #[Name('appgraph_find')]
-#[Description('Resolve one fuzzy application target into a bounded graph node card, or return exact candidate identities when the target is ambiguous or not observed.')]
+#[Description('Resolve one fuzzy application target into a bounded graph node card, ranked exact candidate rows, or an honest not-observed status.')]
 #[IsReadOnly]
 #[IsIdempotent]
 class FindTool extends Tool
 {
     use InteractsWithQueryEngine;
     use RejectsUnknownInput;
+
+    protected string $name = 'appgraph_find';
+
+    protected string $description = 'Resolve one fuzzy application target into a bounded graph node card, ranked exact candidate rows, or an honest not-observed status.';
 
     private const MAX_TARGET_CHARACTERS = 4096;
 

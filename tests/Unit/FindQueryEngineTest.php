@@ -21,8 +21,10 @@ class FindQueryEngineTest extends TestCase
         $this->assertSame($result['resolved'], $result['node']['id']);
         $this->assertArrayNotHasKey('metadata', $result['node']);
         $this->assertSame('calls', $result['out'][0]['type']);
+        $this->assertSame('inferred', $result['out'][1]['uncertainty']);
         $this->assertSame('App\Http\Controllers\NoteController::update', $result['in'][0]['from']);
         $this->assertArrayNotHasKey('candidates', $result);
+        $this->assertStringNotContainsString('"confidence"', json_encode($result, JSON_THROW_ON_ERROR));
     }
 
     public function test_find_normalizes_class_at_method_targets(): void
@@ -112,6 +114,40 @@ class FindQueryEngineTest extends TestCase
 
         $this->assertArrayNotHasKey('out', $resolved);
         $this->assertArrayNotHasKey('in', $resolved);
+    }
+
+    public function test_find_replaces_numeric_edge_confidence_with_uncertainty_buckets_and_recorded_reasons(): void
+    {
+        $target = 'App\Target::run';
+        $nodes = [
+            ['id' => $target, 'type' => 'method', 'label' => 'Target::run'],
+            ['id' => 'App\Certain::run', 'type' => 'method', 'label' => 'Certain::run'],
+            ['id' => 'App\Inferred::run', 'type' => 'method', 'label' => 'Inferred::run'],
+            ['id' => 'App\Low::run', 'type' => 'method', 'label' => 'Low::run'],
+        ];
+        $edges = [
+            ['from' => $target, 'to' => 'App\Certain::run', 'type' => 'calls', 'confidence' => 0.9],
+            ['from' => $target, 'to' => 'App\Inferred::run', 'type' => 'calls', 'confidence' => 0.6, 'metadata' => ['ambiguity' => 'interface_dispatch']],
+            ['from' => $target, 'to' => 'App\Low::run', 'type' => 'calls', 'confidence' => 0.59, 'metadata' => ['inference' => 'receiver_type_fallback']],
+        ];
+        $engine = new QueryEngine(GraphIndex::fromArray([
+            'meta' => [],
+            'nodes' => $nodes,
+            'edges' => $edges,
+        ]));
+
+        $find = $engine->find($target);
+        $out = array_column($find['out'], null, 'to');
+
+        $this->assertArrayNotHasKey('uncertainty', $out['App\Certain::run']);
+        $this->assertSame('inferred', $out['App\Inferred::run']['uncertainty']);
+        $this->assertSame('interface_dispatch', $out['App\Inferred::run']['uncertaintyReason']);
+        $this->assertSame('low', $out['App\Low::run']['uncertainty']);
+        $this->assertSame('receiver_type_fallback', $out['App\Low::run']['uncertaintyReason']);
+        $this->assertStringNotContainsString('"confidence"', json_encode($find, JSON_THROW_ON_ERROR));
+
+        $legacyNode = $engine->node($target);
+        $this->assertSame(0.9, $legacyNode['out'][0]['confidence']);
     }
 
     /** @param array<int, array<string, mixed>>|null $nodes */

@@ -222,7 +222,7 @@ class QueryEngine
 
             return $this->envelope('find', $target, [
                 'resolved' => $resolved,
-                ...$this->nodeCard($resolved, $limit, false, $truncated),
+                ...$this->nodeCard($resolved, $limit, false, $truncated, true),
             ], $truncated);
         }
 
@@ -1565,17 +1565,23 @@ class QueryEngine
         int $limit,
         bool &$truncated,
         bool $full = false,
+        bool $bucketUncertainty = false,
     ): array
     {
         $results = array_map(
-            static fn (array $edge): array => array_filter([
-                $endpoint => $edge[$endpoint],
-                'type' => $edge['type'],
-                'confidence' => $edge['confidence'] ?? 1.0,
-                'metadata' => $full && is_array($edge['metadata'] ?? null)
-                    ? $edge['metadata']
-                    : null,
-            ], static fn (mixed $value): bool => $value !== null && $value !== []),
+            static function (array $edge) use ($endpoint, $full, $bucketUncertainty): array {
+                $metadata = is_array($edge['metadata'] ?? null) ? $edge['metadata'] : [];
+                $confidence = (float) ($edge['confidence'] ?? 1.0);
+
+                return array_filter([
+                    $endpoint => $edge[$endpoint],
+                    'type' => $edge['type'],
+                    ...($bucketUncertainty
+                        ? UncertaintyBuckets::fields($confidence, $metadata)
+                        : ['confidence' => $confidence]),
+                    'metadata' => $full && $metadata !== [] ? $metadata : null,
+                ], static fn (mixed $value): bool => $value !== null && $value !== []);
+            },
             $edges
         );
 
@@ -1597,6 +1603,7 @@ class QueryEngine
         int $limit,
         bool $full,
         bool &$truncated,
+        bool $bucketUncertainty = false,
     ): array {
         $node = $this->index->node($id);
 
@@ -1608,8 +1615,22 @@ class QueryEngine
             unset($node['metadata']);
         }
 
-        $out = $this->boundedEdgeList($this->index->edgesFrom($id), 'to', $limit, $truncated, $full);
-        $in = $this->boundedEdgeList($this->index->edgesTo($id), 'from', $limit, $truncated, $full);
+        $out = $this->boundedEdgeList(
+            $this->index->edgesFrom($id),
+            'to',
+            $limit,
+            $truncated,
+            $full,
+            $bucketUncertainty,
+        );
+        $in = $this->boundedEdgeList(
+            $this->index->edgesTo($id),
+            'from',
+            $limit,
+            $truncated,
+            $full,
+            $bucketUncertainty,
+        );
 
         return array_filter([
             'node' => $node,

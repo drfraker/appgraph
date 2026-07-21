@@ -2,6 +2,7 @@
 
 namespace AppGraph\Tests\Feature;
 
+use AppGraph\AppGraph;
 use AppGraph\Graph\Graph;
 use AppGraph\Graph\GraphExporter;
 use AppGraph\Mcp\AppGraphServer;
@@ -20,6 +21,8 @@ use AppGraph\Tests\Support\BuildsQueryFixtureGraph;
 use AppGraph\Tests\Support\InProcessScanRunner;
 use AppGraph\Tests\TestCase;
 use Illuminate\Testing\Fluent\AssertableJson;
+use Laravel\Mcp\Server\Tool;
+use Laravel\Mcp\Server\Transport\FakeTransporter;
 
 class McpToolsTest extends TestCase
 {
@@ -52,6 +55,7 @@ class McpToolsTest extends TestCase
         // Most tool tests intentionally exercise the portable JSON fallback.
         // Tests that cover automatic authoritative generation opt in explicitly.
         config()->set('appgraph.mcp.auto_scan', 'off');
+        config()->set('appgraph.mcp.legacy_tools', true);
 
         (new GraphExporter())->exportData(
             $this->queryFixtureGraph(),
@@ -75,17 +79,76 @@ class McpToolsTest extends TestCase
 
     public function test_server_exposes_only_the_focused_navigation_tools(): void
     {
-        $tools = (new \ReflectionClass(AppGraphServer::class))->getDefaultProperties()['tools'];
+        config()->set('appgraph.mcp.legacy_tools', false);
+
+        $server = new AppGraphServer(new FakeTransporter);
+        $server->start();
+        $context = $server->createContext();
 
         $this->assertSame([
+            FindTool::class,
+            SliceTool::class,
+            RefreshTool::class,
+        ], $context->tools()
+            ->map(fn (Tool $tool): string => $tool::class)
+            ->all());
+        $this->assertLessThanOrEqual(4, count(preg_split('/\R/', trim($context->instructions)) ?: []));
+        $this->assertStringContainsString('appgraph_find', $context->instructions);
+        $this->assertStringContainsString('appgraph_slice', $context->instructions);
+        $this->assertStringContainsString('appgraph_refresh', $context->instructions);
+        $this->assertStringContainsString('not_observed', $context->instructions);
+        $this->assertSame(
+            (new \ReflectionClass(AppGraphServer::class))->getDefaultProperties()['instructions'],
+            $context->instructions,
+        );
+    }
+
+    public function test_server_can_opt_in_to_the_legacy_navigation_tools(): void
+    {
+        config()->set('appgraph.mcp.legacy_tools', true);
+
+        $server = new AppGraphServer(new FakeTransporter);
+        $server->start();
+
+        $this->assertSame([
+            FindTool::class,
+            SliceTool::class,
+            RefreshTool::class,
             OverviewTool::class,
             SearchTool::class,
             NodeTool::class,
             QueryTool::class,
-            SliceTool::class,
+        ], $server->createContext()->tools()
+            ->map(fn (Tool $tool): string => $tool::class)
+            ->all());
+    }
+
+    public function test_server_and_tool_metadata_keep_pre_attribute_mcp_fallbacks(): void
+    {
+        $serverProperties = (new \ReflectionClass(AppGraphServer::class))->getDefaultProperties();
+
+        $this->assertSame('AppGraph', $serverProperties['name']);
+        $this->assertSame(AppGraph::VERSION, $serverProperties['version']);
+        $this->assertLessThanOrEqual(
+            4,
+            count(preg_split('/\R/', trim($serverProperties['instructions'])) ?: []),
+        );
+
+        foreach ([
             FindTool::class,
+            SliceTool::class,
             RefreshTool::class,
-        ], $tools);
+            OverviewTool::class,
+            SearchTool::class,
+            NodeTool::class,
+            QueryTool::class,
+        ] as $toolClass) {
+            $properties = (new \ReflectionClass($toolClass))->getDefaultProperties();
+            $tool = app($toolClass)->toArray();
+
+            $this->assertSame($tool['name'], $properties['name']);
+            $this->assertSame($tool['description'], $properties['description']);
+        }
     }
 
     public function test_find_tool_advertises_strict_bounded_inputs_and_returns_a_resolved_node_card(): void

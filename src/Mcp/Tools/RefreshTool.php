@@ -19,6 +19,10 @@ class RefreshTool extends Tool
     use InteractsWithQueryEngine;
     use RejectsUnknownInput;
 
+    protected string $name = 'appgraph_refresh';
+
+    protected string $description = 'Rebuild this Laravel application\'s AppGraph after a meaningful batch of source changes and return a change receipt: what changed since the previous generation, counted overall and by category (routes, writes, authorization, queues, tests). Do not call before every lookup.';
+
     /**
      * Bounded number of per-change detail rows in a receipt. Counts always
      * describe the complete comparison; detail rows are a sample of it.

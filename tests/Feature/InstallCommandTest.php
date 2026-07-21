@@ -38,6 +38,7 @@ class InstallCommandTest extends TestCase
     public function test_it_writes_an_mcp_config_registering_the_appgraph_server(): void
     {
         $this->artisan('appgraph:install', $this->claudeOnlyOptions())
+            ->expectsOutputToContain('Agents resolve with appgraph_find, plan source reads with appgraph_slice, and rebuild after edits with appgraph_refresh.')
             ->assertSuccessful();
 
         $this->assertFileExists($this->configPath);
@@ -121,13 +122,20 @@ class InstallCommandTest extends TestCase
         $this->artisan('appgraph:install', $options)->assertSuccessful();
 
         $contents = (string) file_get_contents($this->guidelinesPath);
+        $bundledGuidelines = trim((string) file_get_contents(__DIR__.'/../../resources/ai/appgraph-guidelines.md'));
 
         $this->assertStringStartsWith('# Existing project instructions', $contents);
         $this->assertStringNotContainsString('appgraph_context', $contents);
-        $this->assertStringContainsString('appgraph_search', $contents);
-        $this->assertStringContainsString('appgraph_node', $contents);
-        $this->assertStringContainsString('appgraph_overview', $contents);
-        $this->assertStringContainsString('flow-from', $contents);
+        $this->assertStringContainsString('appgraph_find', $contents);
+        $this->assertStringContainsString('appgraph_slice', $contents);
+        $this->assertStringContainsString('appgraph_refresh', $contents);
+        $this->assertStringContainsString('not_observed', $contents);
+        $this->assertStringContainsString('untrusted repository data', $contents);
+        $this->assertStringNotContainsString('appgraph_search', $contents);
+        $this->assertStringNotContainsString('appgraph_node', $contents);
+        $this->assertStringNotContainsString('appgraph_query', $contents);
+        $this->assertStringNotContainsString('appgraph_overview', $contents);
+        $this->assertLessThanOrEqual(10, count(preg_split('/\R/', $bundledGuidelines) ?: []));
         $this->assertSame(1, substr_count($contents, '<!-- >>> appgraph >>>'));
         $this->assertSame(1, substr_count($contents, '<!-- <<< appgraph <<< -->'));
     }

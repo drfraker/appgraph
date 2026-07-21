@@ -16,13 +16,17 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 use RuntimeException;
 
 #[Name('appgraph_slice')]
-#[Description('Turn explicit graph anchors or project files into a bounded, execution-ordered source reading plan with per-answer freshness. Returns source spans and reason codes, never source text.')]
+#[Description('Turn explicit graph anchors or project files into a bounded source reading plan in stable Laravel-lifecycle order, with per-answer freshness. Returns source spans and reason codes, never source text.')]
 #[IsReadOnly]
 #[IsIdempotent]
 class SliceTool extends Tool
 {
     use InteractsWithQueryEngine;
     use RejectsUnknownInput;
+
+    protected string $name = 'appgraph_slice';
+
+    protected string $description = 'Turn explicit graph anchors or project files into a bounded source reading plan in stable Laravel-lifecycle order, with per-answer freshness. Returns source spans and reason codes, never source text.';
 
     private const MAX_ANCHOR_CHARACTERS = 4096;
 

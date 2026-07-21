@@ -430,7 +430,7 @@ final class AgentPayloadLimiter
         $entryRemaining = $remaining;
         $entryStats = $stats;
         $exactStringContext = $exactStringContext
-            || self::isExactStringCollectionKey($key);
+            || (self::isExactStringCollectionKey($key) && self::isExactStringList($value));
 
         $hasDirectExactEntry = self::hasDirectExactEntry($value);
 
@@ -473,7 +473,9 @@ final class AgentPayloadLimiter
 
                 if ($exactStringContext
                     || self::isExactStringKey($entryKey)
-                    || self::isExactStringCollectionKey($entryKey)) {
+                    || (self::isExactStringCollectionKey($entryKey)
+                        && is_array($item)
+                        && self::isExactStringList($item))) {
                     $remaining = $entryRemaining;
                     $stats = $entryStats;
                     $stats['omittedValues']++;
@@ -534,14 +536,32 @@ final class AgentPayloadLimiter
 
     private static function hasDirectExactEntry(array $value): bool
     {
-        foreach ($value as $key => $_item) {
+        foreach ($value as $key => $item) {
             if (is_string($key)
-                && (self::isExactStringKey($key) || self::isExactStringCollectionKey($key))) {
+                && (self::isExactStringKey($key)
+                    || (self::isExactStringCollectionKey($key)
+                        && is_array($item)
+                        && self::isExactStringList($item)))) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    private static function isExactStringList(array $value): bool
+    {
+        if (! array_is_list($value)) {
+            return false;
+        }
+
+        foreach ($value as $item) {
+            if (! is_string($item)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /** @return array<int, array{0: int|string, 1: mixed}> */

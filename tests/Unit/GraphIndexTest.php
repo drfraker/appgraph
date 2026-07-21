@@ -823,6 +823,38 @@ class GraphIndexTest extends TestCase
         $this->assertSame(['table:notes'], array_column($index->search('NOTES', 'table'), 'id'));
     }
 
+    public function test_search_matches_and_ranks_metadata_names(): void
+    {
+        $index = GraphIndex::fromArray([
+            'meta' => [],
+            'nodes' => [
+                [
+                    'id' => 'route:GET:/reports/{report}',
+                    'type' => 'route',
+                    'label' => 'GET /reports/{report}',
+                    'metadata' => ['name' => 'reports.show'],
+                ],
+                [
+                    'id' => 'route:GET:/reports',
+                    'type' => 'route',
+                    'label' => 'GET /reports',
+                    'metadata' => ['name' => 'reports'],
+                ],
+                [
+                    'id' => 'App\\Reports\\Dashboard',
+                    'type' => 'class',
+                    'label' => 'Dashboard',
+                ],
+            ],
+            'edges' => [],
+        ]);
+
+        $this->assertSame(
+            ['route:GET:/reports', 'route:GET:/reports/{report}', 'App\\Reports\\Dashboard'],
+            array_column($index->search('REPORTS'), 'id'),
+        );
+    }
+
     public function test_resolve_id_handles_exact_fuzzy_and_ambiguous_targets(): void
     {
         $index = GraphIndex::fromArray($this->queryFixtureGraph());

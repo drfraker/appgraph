@@ -638,6 +638,7 @@ class GraphStore
                   AND (
                     lower(membership.node_id) LIKE lower(:term) ESCAPE '\\'
                     OR lower(membership.label) LIKE lower(:term) ESCAPE '\\'
+                    OR lower(membership.name) LIKE lower(:term) ESCAPE '\\'
                   )
                 ORDER BY {$rankExpression}, length(membership.label), membership.node_id
                 LIMIT :limit

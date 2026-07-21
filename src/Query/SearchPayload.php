@@ -22,17 +22,7 @@ final class SearchPayload
             'target' => $term,
             'revision' => (string) $generation['id'],
             'generatedAt' => $generation['generatedAt'],
-            'results' => array_map(
-                static fn (array $node): array => array_filter([
-                    'id' => $node['id'],
-                    'type' => $node['type'],
-                    'label' => $node['label'] ?? null,
-                    'file' => $node['file'] ?? null,
-                    'line' => $node['line'] ?? null,
-                    'endLine' => $node['endLine'] ?? null,
-                ], static fn (mixed $value): bool => $value !== null),
-                $search['results'],
-            ),
+            'results' => self::projectNodes($search['results']),
         ];
 
         if ($search['truncated']) {
@@ -40,5 +30,24 @@ final class SearchPayload
         }
 
         return $payload;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $nodes
+     * @return array<int, array<string, mixed>>
+     */
+    public static function projectNodes(array $nodes): array
+    {
+        return array_map(
+            static fn (array $node): array => array_filter([
+                'id' => $node['id'],
+                'type' => $node['type'],
+                'label' => $node['label'] ?? null,
+                'file' => $node['file'] ?? null,
+                'line' => $node['line'] ?? null,
+                'endLine' => $node['endLine'] ?? null,
+            ], static fn (mixed $value): bool => $value !== null),
+            $nodes,
+        );
     }
 }

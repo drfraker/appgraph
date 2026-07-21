@@ -195,21 +195,75 @@ class QueryEngine
     public function node(string $target, int $limit = 50, bool $full = false): array
     {
         $id = $this->resolve($target);
-        $node = $this->index->node($id);
+        $truncated = false;
 
-        if (! $full) {
-            unset($node['metadata']);
+        return $this->envelope(
+            'node',
+            $target,
+            $this->nodeCard($id, $limit, $full, $truncated),
+            $truncated,
+        );
+    }
+
+    /**
+     * Resolve one human-oriented target into a compact node card. Ambiguous or
+     * unobserved targets are successful lookups with bounded candidate rows so
+     * agents can refine the target without a separate search round trip.
+     *
+     * @return array<string, mixed>
+     */
+    public function find(string $target, int $limit = 50): array
+    {
+        $resolution = $this->index->resolveId($target);
+        $resolved = $resolution['id'] ?? null;
+
+        if (is_string($resolved)) {
+            $truncated = false;
+
+            return $this->envelope('find', $target, [
+                'resolved' => $resolved,
+                ...$this->nodeCard($resolved, $limit, false, $truncated),
+            ], $truncated);
         }
 
-        $truncated = false;
-        $out = $this->boundedEdgeList($this->index->edgesFrom($id), 'to', $limit, $truncated, $full);
-        $in = $this->boundedEdgeList($this->index->edgesTo($id), 'from', $limit, $truncated, $full);
+        $resolverCandidates = array_values(array_filter(
+            $resolution['candidates'] ?? [],
+            static fn (mixed $candidate): bool => is_string($candidate),
+        ));
+        $candidateNodes = [];
 
-        return $this->envelope('node', $target, array_filter([
-            'node' => $node,
-            'out' => $out,
-            'in' => $in,
-        ], static fn ($value): bool => $value !== []), $truncated);
+        foreach ($resolverCandidates as $candidate) {
+            $node = $this->index->node($candidate);
+
+            if (is_array($node)) {
+                $candidateNodes[$candidate] = $node;
+            }
+        }
+
+        $searchTruncated = false;
+        $searchLimit = min(210, $limit + count($resolverCandidates));
+
+        foreach ($this->index->search($target, null, $searchLimit, $searchTruncated) as $node) {
+            $id = $node['id'] ?? null;
+
+            if (is_string($id) && ! isset($candidateNodes[$id])) {
+                $candidateNodes[$id] = $node;
+            }
+        }
+
+        $candidateRows = SearchPayload::projectNodes(array_values($candidateNodes));
+        $truncated = (bool) ($resolution['candidatesTruncated'] ?? false)
+            || $searchTruncated
+            || count($candidateRows) > $limit;
+        $candidateRows = array_slice($candidateRows, 0, $limit);
+        $payload = ['candidates' => $candidateRows];
+
+        if ($candidateRows === []) {
+            $payload['status'] = 'not_observed';
+            $payload['hint'] = 'No graph node matched this target; graph coverage may be incomplete.';
+        }
+
+        return $this->envelope('find', $target, $payload, $truncated);
     }
 
     /**
@@ -218,16 +272,8 @@ class QueryEngine
     public function search(string $term, ?string $type = null, int $limit = 50): array
     {
         $truncated = false;
-        $results = array_map(
-            static fn (array $node): array => array_filter([
-                'id' => $node['id'],
-                'type' => $node['type'],
-                'label' => $node['label'] ?? null,
-                'file' => $node['file'] ?? null,
-                'line' => $node['line'] ?? null,
-                'endLine' => $node['endLine'] ?? null,
-            ], static fn ($value): bool => $value !== null),
-            $this->index->search($term, $type, $limit, $truncated)
+        $results = SearchPayload::projectNodes(
+            $this->index->search($term, $type, $limit, $truncated),
         );
 
         return $this->envelope('search', $term, ['results' => $results], $truncated);
@@ -1541,6 +1587,35 @@ class QueryEngine
         }
 
         return $results;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function nodeCard(
+        string $id,
+        int $limit,
+        bool $full,
+        bool &$truncated,
+    ): array {
+        $node = $this->index->node($id);
+
+        if (! is_array($node)) {
+            throw new \RuntimeException("AppGraph resolved [{$id}] but the node is not present in this graph snapshot.");
+        }
+
+        if (! $full) {
+            unset($node['metadata']);
+        }
+
+        $out = $this->boundedEdgeList($this->index->edgesFrom($id), 'to', $limit, $truncated, $full);
+        $in = $this->boundedEdgeList($this->index->edgesTo($id), 'from', $limit, $truncated, $full);
+
+        return array_filter([
+            'node' => $node,
+            'out' => $out,
+            'in' => $in,
+        ], static fn (mixed $value): bool => $value !== []);
     }
 
     /**

@@ -191,6 +191,69 @@ class AgentPayloadLimiterTest extends TestCase
         }
     }
 
+    public function test_structured_candidate_rows_are_retained_atomically_under_the_byte_ceiling(): void
+    {
+        $candidates = [];
+
+        for ($index = 0; $index < 400; $index++) {
+            $candidates[] = [
+                'id' => "App\\Domain\\Feature{$index}::execute",
+                'type' => 'method',
+                'label' => "Feature {$index}",
+                'file' => "app/Domain/Feature{$index}.php",
+                'line' => $index + 1,
+                'endLine' => $index + 10,
+                'summary' => str_repeat("candidate {$index} detail ", 1000),
+            ];
+        }
+
+        $payload = [
+            'query' => 'find',
+            'target' => 'Feature::execute',
+            'candidates' => $candidates,
+        ];
+        $originalJson = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+
+        $this->assertGreaterThan(AgentPayloadLimiter::MAX_BYTES, strlen($originalJson));
+
+        $bounded = AgentPayloadLimiter::limit($payload);
+        $returnedJson = json_encode($bounded, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+
+        $this->assertLessThanOrEqual(AgentPayloadLimiter::MAX_BYTES, strlen($returnedJson));
+        $this->assertSame('find', $bounded['query']);
+        $this->assertSame('Feature::execute', $bounded['target']);
+        $this->assertTrue($bounded['responseTruncated']);
+        $this->assertNotEmpty($bounded['candidates']);
+        $this->assertLessThan(count($candidates), count($bounded['candidates']));
+
+        foreach ($bounded['candidates'] as $candidate) {
+            $index = (int) substr($candidate['id'], strlen('App\\Domain\\Feature'));
+
+            $this->assertSame($candidates[$index]['id'], $candidate['id']);
+            $this->assertSame($candidates[$index]['type'], $candidate['type']);
+            $this->assertSame($candidates[$index]['file'], $candidate['file']);
+        }
+    }
+
+    public function test_flat_string_candidate_collections_remain_exact_or_omitted(): void
+    {
+        $candidate = 'App\\Domain\\'.str_repeat('DeepNamespace\\', 600).'Feature';
+        $payload = [
+            'query' => 'find',
+            'target' => 'Feature',
+            'candidates' => array_fill(0, 200, $candidate),
+        ];
+
+        $bounded = AgentPayloadLimiter::limit($payload);
+
+        $this->assertTrue($bounded['responseTruncated']);
+        $this->assertSame(0, $bounded['responseBounds']['truncatedStrings']);
+
+        foreach ($bounded['candidates'] ?? [] as $returnedCandidate) {
+            $this->assertSame($candidate, $returnedCandidate);
+        }
+    }
+
     public function test_laravel_runtime_and_declaration_references_are_exact_fields(): void
     {
         $keys = [
@@ -238,7 +301,7 @@ class AgentPayloadLimiterTest extends TestCase
             );
         }
 
-        foreach (['ambiguousLogicalTableSamples', 'foreignColumns', 'mapped', 'middleware', 'relationships', 'routeParameters', 'samplePaths', 'traits', 'unmappedChangedFiles', 'why'] as $key) {
+        foreach (['ambiguousLogicalTableSamples', 'candidates', 'foreignColumns', 'mapped', 'middleware', 'relationships', 'routeParameters', 'samplePaths', 'traits', 'unmappedChangedFiles', 'why'] as $key) {
             $this->assertTrue(
                 AgentPayloadLimiter::isExactStringCollectionKey($key),
                 "Expected {$key} values to be protected by exact-or-omit response handling.",

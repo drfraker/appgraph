@@ -3,6 +3,7 @@
 namespace AppGraph\Mcp;
 
 use AppGraph\AppGraph;
+use AppGraph\Mcp\Tools\FindTool;
 use AppGraph\Mcp\Tools\NodeTool;
 use AppGraph\Mcp\Tools\OverviewTool;
 use AppGraph\Mcp\Tools\QueryTool;
@@ -39,6 +40,7 @@ class AppGraphServer extends Server
         NodeTool::class,
         QueryTool::class,
         SliceTool::class,
+        FindTool::class,
         RefreshTool::class,
     ];
 }

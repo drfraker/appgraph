@@ -1630,7 +1630,12 @@ class GraphIndex
                 continue;
             }
 
-            if (stripos($node['id'], $term) === false && stripos($node['label'] ?? '', $term) === false) {
+            $metadata = is_array($node['metadata'] ?? null) ? $node['metadata'] : [];
+            $name = (string) ($metadata['name'] ?? '');
+
+            if (stripos($node['id'], $term) === false
+                && stripos($node['label'] ?? '', $term) === false
+                && stripos($name, $term) === false) {
                 continue;
             }
 
@@ -1646,7 +1651,8 @@ class GraphIndex
             static function (array $node) use ($lowerTerm): array {
                 $label = (string) ($node['label'] ?? '');
                 $lowerLabel = mb_strtolower($label);
-                $lowerName = mb_strtolower((string) ($node['name'] ?? ''));
+                $metadata = is_array($node['metadata'] ?? null) ? $node['metadata'] : [];
+                $lowerName = mb_strtolower((string) ($metadata['name'] ?? ''));
                 $tier = 3;
 
                 if (mb_strtolower($node['id']) === $lowerTerm
@@ -1684,7 +1690,7 @@ class GraphIndex
      * bare table names, table.column shorthand, and class/method basenames (which
      * resolve only when unambiguous; otherwise candidates are returned).
      *
-     * @return array{id: ?string, candidates: array<int, string>}
+     * @return array{id: ?string, candidates: array<int, string>, candidatesTruncated?: bool}
      */
     public function resolveId(string $target): array
     {

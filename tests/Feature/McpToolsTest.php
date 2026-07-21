@@ -5,6 +5,7 @@ namespace AppGraph\Tests\Feature;
 use AppGraph\Graph\Graph;
 use AppGraph\Graph\GraphExporter;
 use AppGraph\Mcp\AppGraphServer;
+use AppGraph\Mcp\Tools\FindTool;
 use AppGraph\Mcp\Tools\NodeTool;
 use AppGraph\Mcp\Tools\OverviewTool;
 use AppGraph\Mcp\Tools\QueryTool;
@@ -82,8 +83,90 @@ class McpToolsTest extends TestCase
             NodeTool::class,
             QueryTool::class,
             SliceTool::class,
+            FindTool::class,
             RefreshTool::class,
         ], $tools);
+    }
+
+    public function test_find_tool_advertises_strict_bounded_inputs_and_returns_a_resolved_node_card(): void
+    {
+        $schema = app(FindTool::class)->toArray()['inputSchema'];
+
+        $this->assertFalse($schema['additionalProperties']);
+        $this->assertContains('target', $schema['required']);
+        $this->assertSame(1, $schema['properties']['target']['minLength']);
+        $this->assertSame(4096, $schema['properties']['target']['maxLength']);
+        $this->assertSame(1, $schema['properties']['limit']['minimum']);
+        $this->assertSame(200, $schema['properties']['limit']['maximum']);
+        $this->assertArrayNotHasKey('full', $schema['properties']);
+
+        AppGraphServer::tool(FindTool::class, [
+            'target' => 'App\\Services\\NoteService@save',
+            'limit' => 1,
+        ])
+            ->assertOk()
+            ->assertStructuredContent(function (AssertableJson $json): void {
+                $payload = $json->toArray();
+
+                $this->assertSame('find', $payload['query']);
+                $this->assertSame('App\\Services\\NoteService@save', $payload['target']);
+                $this->assertSame('App\\Services\\NoteService::save', $payload['resolved']);
+                $this->assertSame('App\\Services\\NoteService::save', $payload['node']['id']);
+                $this->assertArrayNotHasKey('metadata', $payload['node']);
+                $this->assertCount(1, $payload['out']);
+                $this->assertCount(1, $payload['in']);
+                $this->assertTrue($payload['truncated']);
+                $json->etc();
+            });
+
+        foreach ([
+            [],
+            ['target' => '   '],
+            ['target' => "NoteService\0save"],
+            ['target' => str_repeat('x', 4097)],
+            ['target' => 'NoteService::save', 'limit' => 0],
+            ['target' => 'NoteService::save', 'limit' => 201],
+            ['target' => 'NoteService::save', 'limit' => '50'],
+        ] as $arguments) {
+            AppGraphServer::tool(FindTool::class, $arguments)->assertHasErrors();
+        }
+    }
+
+    public function test_find_tool_returns_exact_candidate_rows_for_an_ambiguous_target(): void
+    {
+        AppGraphServer::tool(FindTool::class, ['target' => 'Tag'])
+            ->assertOk()
+            ->assertStructuredContent(function (AssertableJson $json): void {
+                $payload = $json->toArray();
+
+                $this->assertSame('find', $payload['query']);
+                $this->assertSame('Tag', $payload['target']);
+                $this->assertSame([
+                    'App\\Models\\Tag',
+                    'App\\Other\\Tag',
+                ], array_slice(array_column($payload['candidates'], 'id'), 0, 2));
+                $this->assertSame(
+                    ['model', 'model'],
+                    array_slice(array_column($payload['candidates'], 'type'), 0, 2),
+                );
+                $this->assertArrayNotHasKey('resolved', $payload);
+                $this->assertArrayNotHasKey('status', $payload);
+                $json->etc();
+            });
+    }
+
+    public function test_find_tool_treats_an_unobserved_target_as_a_successful_lookup(): void
+    {
+        AppGraphServer::tool(FindTool::class, ['target' => 'DefinitelyMissingGraphIdentity'])
+            ->assertOk()
+            ->assertStructuredContent(fn (AssertableJson $json) => $json
+                ->where('query', 'find')
+                ->where('target', 'DefinitelyMissingGraphIdentity')
+                ->where('candidates', [])
+                ->where('status', 'not_observed')
+                ->whereType('hint', 'string')
+                ->missing('resolved')
+                ->etc());
     }
 
     public function test_slice_tool_returns_a_bounded_fresh_read_plan(): void
@@ -225,7 +308,7 @@ class McpToolsTest extends TestCase
                 ->etc());
     }
 
-    public function test_long_authoritative_identity_round_trips_from_search_to_node_and_query(): void
+    public function test_long_authoritative_identity_round_trips_from_find_search_node_and_query(): void
     {
         $longId = 'App\\'.str_repeat('A', 600).'::run';
         $graph = $this->queryFixtureGraph();
@@ -251,6 +334,14 @@ class McpToolsTest extends TestCase
             ->assertOk()
             ->assertStructuredContent(fn (AssertableJson $json) => $json
                 ->where('results.0.id', $longId)
+                ->etc());
+
+        AppGraphServer::tool(FindTool::class, ['target' => $longId])
+            ->assertOk()
+            ->assertStructuredContent(fn (AssertableJson $json) => $json
+                ->where('target', $longId)
+                ->where('resolved', $longId)
+                ->where('node.id', $longId)
                 ->etc());
 
         AppGraphServer::tool(NodeTool::class, ['id' => $longId])
@@ -636,6 +727,7 @@ class McpToolsTest extends TestCase
             [NodeTool::class, ['id' => 'table:notes', 'ful' => true], 'ful'],
             [QueryTool::class, ['query' => 'tables', 'depht' => 2], 'depht'],
             [SliceTool::class, ['files' => ['app/Note.php'], 'budegt' => 512], 'budegt'],
+            [FindTool::class, ['target' => 'table:notes', 'full' => true], 'full'],
             [RefreshTool::class, ['depth' => 2], 'depth'],
         ] as [$tool, $arguments, $unknown]) {
             $schema = app($tool)->toArray()['inputSchema'];
@@ -648,7 +740,7 @@ class McpToolsTest extends TestCase
         }
     }
 
-    public function test_auto_scan_off_errors_when_graph_is_missing(): void
+    public function test_auto_scan_off_errors_with_refresh_guidance_when_graph_is_missing(): void
     {
         config()->set('appgraph.mcp.auto_scan', 'off');
 
@@ -656,6 +748,11 @@ class McpToolsTest extends TestCase
         @unlink($path);
 
         AppGraphServer::tool(OverviewTool::class)
+            ->assertHasErrors()
+            ->assertSee('appgraph_refresh')
+            ->assertSee('appgraph:scan');
+
+        AppGraphServer::tool(FindTool::class, ['target' => 'NoteService::save'])
             ->assertHasErrors()
             ->assertSee('appgraph_refresh')
             ->assertSee('appgraph:scan');

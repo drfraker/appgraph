@@ -196,6 +196,21 @@ class GraphStoreTest extends TestCase
         $this->assertSame(['node:slash'], array_column($store->searchNodes('\\')['results'], 'id'));
     }
 
+    public function test_fallback_search_matches_metadata_names(): void
+    {
+        $store = $this->store(enableFts: false);
+        $store->publish($this->graph(source: 'fallback-name', nodes: [
+            Node::make('route:GET:/dashboard', 'route', 'GET /dashboard', [
+                'metadata' => ['name' => 'admin.home'],
+            ]),
+        ]));
+
+        $result = $store->searchNodes('admin.home');
+
+        $this->assertSame('fallback', $result['fts']);
+        $this->assertSame(['route:GET:/dashboard'], array_column($result['results'], 'id'));
+    }
+
     public function test_generation_references_and_search_inputs_are_strictly_bounded(): void
     {
         $store = $this->store(enableFts: false);

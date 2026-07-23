@@ -136,8 +136,51 @@ class InstallCommandTest extends TestCase
         $this->assertStringNotContainsString('appgraph_query', $contents);
         $this->assertStringNotContainsString('appgraph_overview', $contents);
         $this->assertLessThanOrEqual(10, count(preg_split('/\R/', $bundledGuidelines) ?: []));
-        $this->assertSame(1, substr_count($contents, '<!-- >>> appgraph >>>'));
-        $this->assertSame(1, substr_count($contents, '<!-- <<< appgraph <<< -->'));
+        $this->assertSame(1, substr_count($contents, '<appgraph-guidelines>'));
+        $this->assertSame(1, substr_count($contents, '</appgraph-guidelines>'));
+        $this->assertStringNotContainsString('<!--', $contents);
+    }
+
+    public function test_it_migrates_legacy_comment_guidelines_blocks(): void
+    {
+        $options = [
+            '--client' => ['claude'],
+            '--path' => $this->configPath,
+            '--guidelines-path' => [$this->guidelinesPath],
+            '--no-scan' => true,
+            '--force' => true,
+            '--no-gitignore' => true,
+        ];
+
+        foreach (['<!-- >>> appgraph >>>', '<!-- >>> appgraph >>> -->'] as $legacyStartMarker) {
+            file_put_contents($this->guidelinesPath, implode(PHP_EOL, [
+                '# Existing project instructions',
+                '',
+                $legacyStartMarker,
+                '# Stale AppGraph workflow',
+                '',
+                '<!-- <<< appgraph <<< -->',
+                '',
+                '<laravel-boost-guidelines>',
+                'Existing Boost guidance.',
+                '</laravel-boost-guidelines>',
+                '',
+            ]));
+
+            $this->artisan('appgraph:install', $options)->assertSuccessful();
+            $this->artisan('appgraph:install', $options)->assertSuccessful();
+
+            $contents = (string) file_get_contents($this->guidelinesPath);
+
+            $this->assertStringStartsWith('# Existing project instructions', $contents);
+            $this->assertStringContainsString('<laravel-boost-guidelines>', $contents);
+            $this->assertStringContainsString('Existing Boost guidance.', $contents);
+            $this->assertStringNotContainsString('# Stale AppGraph workflow', $contents);
+            $this->assertStringNotContainsString('<!-- >>> appgraph >>>', $contents);
+            $this->assertStringNotContainsString('<!-- <<< appgraph <<< -->', $contents);
+            $this->assertSame(1, substr_count($contents, '<appgraph-guidelines>'));
+            $this->assertSame(1, substr_count($contents, '</appgraph-guidelines>'));
+        }
     }
 
     public function test_it_idempotently_ignores_the_generated_graph_directory(): void

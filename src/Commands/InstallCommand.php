@@ -13,9 +13,9 @@ class InstallCommand extends Command
 
     private const CODEX_BLOCK_END = '# <<< appgraph <<<';
 
-    private const GUIDELINES_BLOCK_START = '<!-- >>> appgraph >>>';
+    private const GUIDELINES_BLOCK_START = '<appgraph-guidelines>';
 
-    private const GUIDELINES_BLOCK_END = '<!-- <<< appgraph <<< -->';
+    private const GUIDELINES_BLOCK_END = '</appgraph-guidelines>';
 
     private const GITIGNORE_BLOCK_START = '# >>> appgraph generated files >>>';
 
@@ -192,6 +192,7 @@ class InstallCommand extends Command
 
         foreach ($this->guidelinePaths($files) as $path) {
             $contents = $files->exists($path) ? (string) $files->get($path) : '';
+            $contents = $this->migrateLegacyGuidelinesBlock($contents);
 
             $files->ensureDirectoryExists(dirname($path));
             $files->put($path, $this->upsertManagedBlock(
@@ -204,6 +205,21 @@ class InstallCommand extends Command
 
             $this->components->info("Agent workflow added to {$this->relativePath($path)}");
         }
+    }
+
+    private function migrateLegacyGuidelinesBlock(string $contents): string
+    {
+        $contents = preg_replace(
+            '/^<!-- >>> appgraph >>>(?: -->)?[ \t]*(?=\r?$)/m',
+            self::GUIDELINES_BLOCK_START,
+            $contents,
+        ) ?? $contents;
+
+        return preg_replace(
+            '/^<!-- <<< appgraph <<< -->[ \t]*(?=\r?$)/m',
+            self::GUIDELINES_BLOCK_END,
+            $contents,
+        ) ?? $contents;
     }
 
     private function installGitignore(Filesystem $files): void

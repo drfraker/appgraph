@@ -187,6 +187,23 @@ class ScanCommandTest extends TestCase
         $this->assertNull($store->current());
     }
 
+    public function test_scan_rejects_a_mirror_collision_with_the_runtime_evidence_lock(): void
+    {
+        $this->disableScanners();
+        $runtimeEvidence = storage_path('appgraph/runtime-collision.json');
+        config()->set('appgraph.runtime_evidence.path', $runtimeEvidence);
+        $store = app(GraphStore::class);
+
+        $this->artisan('appgraph:scan', [
+            '--output' => $runtimeEvidence.'.lock',
+            '--no-overview' => true,
+        ])
+            ->expectsOutputToContain('must be distinct files')
+            ->assertFailed();
+
+        $this->assertNull($store->current());
+    }
+
     public function test_scan_rejects_sidecar_lock_lexical_and_dangling_symlink_collisions(): void
     {
         $this->disableScanners();
@@ -1421,7 +1438,7 @@ class ScanCommandTest extends TestCase
 
         $graph = json_decode((string) file_get_contents($outputPath), true, flags: JSON_THROW_ON_ERROR);
 
-        $this->assertSame('0.6.1', $graph['meta']['appgraphVersion']);
+        $this->assertSame('0.7.0', $graph['meta']['appgraphVersion']);
         $this->assertSame($graph['meta']['generation']['id'], app(GraphStore::class)->current()['id']);
         $this->assertSame(count($graph['nodes']), app(GraphStore::class)->current()['counts']['nodes']);
         $this->assertSame(count($graph['edges']), app(GraphStore::class)->current()['counts']['edges']);
@@ -1480,7 +1497,7 @@ class ScanCommandTest extends TestCase
 
         $overview = json_decode((string) file_get_contents($overviewPath), true, flags: JSON_THROW_ON_ERROR);
 
-        $this->assertSame('0.6.1', $overview['meta']['appgraphVersion']);
+        $this->assertSame('0.7.0', $overview['meta']['appgraphVersion']);
         $this->assertSame([
             'maxDepth' => 5,
             'maxMethods' => 9,

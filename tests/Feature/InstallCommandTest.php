@@ -14,6 +14,8 @@ class InstallCommandTest extends TestCase
 
     private string $gitignorePath = '';
 
+    private string $phpunitPath = '';
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -22,11 +24,12 @@ class InstallCommandTest extends TestCase
         $this->codexPath = sys_get_temp_dir().'/appgraph-codex-'.bin2hex(random_bytes(4)).'.toml';
         $this->guidelinesPath = sys_get_temp_dir().'/appgraph-agents-'.bin2hex(random_bytes(4)).'.md';
         $this->gitignorePath = sys_get_temp_dir().'/appgraph-ignore-'.bin2hex(random_bytes(4));
+        $this->phpunitPath = sys_get_temp_dir().'/appgraph-phpunit-'.bin2hex(random_bytes(4)).'.xml';
     }
 
     protected function tearDown(): void
     {
-        foreach ([$this->configPath, $this->codexPath, $this->guidelinesPath, $this->gitignorePath] as $path) {
+        foreach ([$this->configPath, $this->codexPath, $this->guidelinesPath, $this->gitignorePath, $this->phpunitPath] as $path) {
             if (is_file($path)) {
                 @unlink($path);
             }
@@ -210,6 +213,7 @@ class InstallCommandTest extends TestCase
     public function test_it_ignores_distinct_json_and_sqlite_store_directories(): void
     {
         config()->set('appgraph.store.path', 'architecture-store/appgraph.sqlite');
+        config()->set('appgraph.runtime_evidence.path', 'runtime-map/evidence.json');
 
         $this->artisan('appgraph:install', [
             '--client' => ['claude'],
@@ -224,11 +228,13 @@ class InstallCommandTest extends TestCase
 
         $this->assertStringContainsString('/storage/appgraph/', $contents);
         $this->assertStringContainsString('/storage/architecture-store/', $contents);
+        $this->assertStringContainsString('/storage/runtime-map/', $contents);
     }
 
     public function test_it_exactly_ignores_an_absolute_store_in_the_project_root(): void
     {
         config()->set('appgraph.store.path', base_path('root-appgraph.sqlite'));
+        config()->set('appgraph.runtime_evidence.path', base_path('runtime-evidence.json'));
 
         $this->artisan('appgraph:install', [
             '--client' => ['claude'],
@@ -246,7 +252,51 @@ class InstallCommandTest extends TestCase
         $this->assertStringContainsString('/root-appgraph.sqlite-shm'.PHP_EOL, $contents);
         $this->assertStringContainsString('/root-appgraph.sqlite-journal'.PHP_EOL, $contents);
         $this->assertStringContainsString('/.scan.lock'.PHP_EOL, $contents);
+        $this->assertStringContainsString('/runtime-evidence.json'.PHP_EOL, $contents);
+        $this->assertStringContainsString('/runtime-evidence.json.lock'.PHP_EOL, $contents);
         $this->assertStringNotContainsString(PHP_EOL.'//'.PHP_EOL, $contents);
+    }
+
+    public function test_it_idempotently_registers_opt_in_runtime_evidence_in_phpunit_xml(): void
+    {
+        file_put_contents($this->phpunitPath, implode(PHP_EOL, [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<phpunit>',
+            '    <extensions>',
+            '        <bootstrap class="Existing\\Extension"/>',
+            '    </extensions>',
+            '</phpunit>',
+            '',
+        ]));
+
+        $options = $this->claudeOnlyOptions([
+            '--phpunit-path' => $this->phpunitPath,
+            '--no-runtime' => false,
+            '--force' => true,
+        ]);
+
+        $this->artisan('appgraph:install', $options)->assertSuccessful();
+        $this->artisan('appgraph:install', $options)->assertSuccessful();
+
+        $contents = (string) file_get_contents($this->phpunitPath);
+
+        $this->assertStringContainsString('<bootstrap class="Existing\\Extension"/>', $contents);
+        $this->assertStringContainsString('<bootstrap class="AppGraph\\Runtime\\PHPUnit\\AppGraphExtension">', $contents);
+        $this->assertStringContainsString('<parameter name="output" value="storage/appgraph/runtime-evidence.json"/>', $contents);
+        $this->assertSame(1, substr_count($contents, 'AppGraph\\Runtime\\PHPUnit\\AppGraphExtension'));
+    }
+
+    public function test_it_can_leave_phpunit_xml_untouched(): void
+    {
+        $original = "<?xml version=\"1.0\"?><phpunit/>\n";
+        file_put_contents($this->phpunitPath, $original);
+
+        $this->artisan('appgraph:install', $this->claudeOnlyOptions([
+            '--phpunit-path' => $this->phpunitPath,
+            '--no-runtime' => true,
+        ]))->assertSuccessful();
+
+        $this->assertSame($original, file_get_contents($this->phpunitPath));
     }
 
     /**
@@ -260,6 +310,7 @@ class InstallCommandTest extends TestCase
             '--path' => $this->configPath,
             '--no-guidelines' => true,
             '--no-gitignore' => true,
+            '--no-runtime' => true,
             '--no-scan' => true,
         ], $overrides);
     }

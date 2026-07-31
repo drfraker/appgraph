@@ -7,6 +7,7 @@ use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\FileFinder;
 use AppGraph\Support\ScanFingerprint;
 use Illuminate\Container\Container;
+use Illuminate\Config\Repository;
 use Illuminate\Bus\Dispatcher as BusDispatcher;
 use Illuminate\Events\Dispatcher as EventDispatcher;
 use Illuminate\Routing\RouteCollection;
@@ -175,13 +176,60 @@ class StalenessCheckerTest extends TestCase
         $this->assertSame(1, $freshness['changedFiles']);
     }
 
+    public function test_lazy_deprecation_logging_configuration_is_not_a_graph_fingerprint_input(): void
+    {
+        $previousContainer = Container::getInstance();
+        $container = new Container();
+        $configuration = new Repository([
+            'appgraph' => ['scan' => ['routes' => true]],
+            'logging' => [
+                'deprecations' => ['channel' => null, 'trace' => false],
+                'channels' => ['single' => ['driver' => 'single']],
+            ],
+        ]);
+        $container->instance('config', $configuration);
+        Container::setInstance($container);
+
+        try {
+            $fingerprint = new ScanFingerprint(new FileFinder($this->directory));
+            $before = $fingerprint->capture();
+
+            $configuration->set('logging.deprecations.channel', 'deprecations');
+            $configuration->set('logging.channels.deprecations', [
+                'driver' => 'monolog',
+                'handler' => 'Monolog\\Handler\\NullHandler',
+            ]);
+            $afterLaravelBootstrap = $fingerprint->capture();
+
+            $this->assertSame($before['configuration'], $afterLaravelBootstrap['configuration']);
+            $this->assertSame($before['fingerprint'], $afterLaravelBootstrap['fingerprint']);
+
+            $configuration->set('appgraph.scan.routes', false);
+            $graphConfigurationChanged = $fingerprint->capture();
+
+            $this->assertNotSame($before['configuration'], $graphConfigurationChanged['configuration']);
+            $this->assertNotSame($before['fingerprint'], $graphConfigurationChanged['fingerprint']);
+        } finally {
+            Container::setInstance($previousContainer);
+        }
+    }
+
     public function test_runtime_container_binding_changes_invalidate_the_fingerprint(): void
     {
         $files = new FileFinder($this->directory);
         $container = new Container();
+        $container->singleton('log', static fn () => new \stdClass());
+        $container->alias('log', \stdClass::class);
         $registry = new ContainerBindingRegistry($container, 'testing', 'App\\');
         $fingerprint = new ScanFingerprint($files, $registry);
         $before = $fingerprint->capture();
+
+        // PHP 8.5 causes Laravel's deprecation logger to materialize during
+        // otherwise read-only command execution. That framework singleton is
+        // not a graph input and must not create a fresh generation.
+        $container->make('log');
+        $loggerMaterialized = $fingerprint->capture();
+        $this->assertSame($before['containerBindings'], $loggerMaterialized['containerBindings']);
 
         // Resolving an unrelated framework/package singleton varies with CLI
         // boot order and must not make every new process look stale.
@@ -200,6 +248,12 @@ class StalenessCheckerTest extends TestCase
 
         $this->assertNotSame($before['containerBindings'], $after['containerBindings']);
         $this->assertNotSame($before['fingerprint'], $after['fingerprint']);
+
+        $container->bind('log', 'Vendor\\RuntimeLogger');
+        $vendorLogger = $fingerprint->capture();
+
+        $this->assertNotSame($after['containerBindings'], $vendorLogger['containerBindings']);
+        $this->assertNotSame($after['fingerprint'], $vendorLogger['fingerprint']);
     }
 
     public function test_booted_event_and_bus_registry_changes_invalidate_the_fingerprint_without_resolving_services(): void

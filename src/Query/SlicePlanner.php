@@ -107,15 +107,59 @@ final class SlicePlanner
         unset($entry);
 
         $mappedTests = [];
+        $runtimeEvidence = [];
 
         foreach ($plan['verification']['mappedTests'] as $test) {
             if (is_string($test['file'] ?? null)) {
                 $mappedTests[$test['file']] = $test['file'];
             }
+
+            if (! is_string($test['file'] ?? null)
+                || ! is_array($test['runtimeEvidence'] ?? null)) {
+                continue;
+            }
+
+            $evidence = $test['runtimeEvidence'];
+            $sources = array_values(array_filter(
+                is_array($evidence['sources'] ?? null) ? $evidence['sources'] : [],
+                static fn (mixed $source): bool => is_array($source)
+                    && is_string($source['file'] ?? null),
+            ));
+            usort($sources, static fn (array $left, array $right): int => $left['file'] <=> $right['file']);
+            $targets = array_values(array_filter(
+                is_array($evidence['targets'] ?? null) ? $evidence['targets'] : [],
+                static fn (mixed $target): bool => is_array($target)
+                    && is_string($target['id'] ?? null)
+                    && is_string($target['relationship'] ?? null),
+            ));
+            usort($targets, static fn (array $left, array $right): int => [
+                $left['id'],
+                $left['relationship'],
+            ] <=> [
+                $right['id'],
+                $right['relationship'],
+            ]);
+            $row = [
+                'testFile' => $test['file'],
+                'provenance' => 'appgraph_runtime',
+                'granularity' => 'file',
+            ];
+
+            if ($sources !== []) {
+                $row['sources'] = $sources;
+            }
+
+            if ($targets !== []) {
+                $row['targets'] = $targets;
+            }
+
+            $runtimeEvidence[$test['file']] = $row;
         }
         ksort($mappedTests);
+        ksort($runtimeEvidence);
         $tests = array_filter([
             'mapped' => array_values($mappedTests),
+            'runtimeEvidence' => array_values($runtimeEvidence),
             'commands' => $plan['verification']['commands'],
         ], static fn (array $value): bool => $value !== []);
         $omitted = array_filter(

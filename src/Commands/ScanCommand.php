@@ -16,6 +16,7 @@ use AppGraph\Scanners\FormRequestScanner;
 use AppGraph\Scanners\ModelScanner;
 use AppGraph\Scanners\PolicyScanner;
 use AppGraph\Scanners\RouteScanner;
+use AppGraph\Scanners\RuntimeEvidenceScanner;
 use AppGraph\Scanners\SideEffectScanner;
 use AppGraph\Scanners\TestScanner;
 use AppGraph\Storage\GraphStore;
@@ -81,6 +82,7 @@ class ScanCommand extends Command
         TestScanner $testScanner,
         PolicyScanner $policyScanner,
         ContainerBindingScanner $containerBindingScanner,
+        RuntimeEvidenceScanner $runtimeEvidenceScanner,
         ContainerBindingRegistry $containerBindings,
         FileFinder $files,
         PhpFileFacts $phpFileFacts,
@@ -156,6 +158,7 @@ class ScanCommand extends Command
                 $path,
                 $overviewPath,
                 $resultFile,
+                $runtimeEvidenceScanner->inputPath(),
             );
             MemoryLimit::ensure(config('appgraph.memory_limit', '256M'));
             $sourceObservations->reset();
@@ -185,6 +188,7 @@ class ScanCommand extends Command
             $includeTests = (bool) config('appgraph.scan.tests', true);
             $includePolicies = (bool) config('appgraph.scan.policies', true);
             $includeContainerBindings = (bool) config('appgraph.scan.container_bindings', true);
+            $includeRuntimeEvidence = (bool) config('appgraph.runtime_evidence.enabled', true);
 
             // Explicit schema-dump generation is the one scanner phase allowed to
             // write a scan input. Run it before the consistency fingerprint so the
@@ -198,6 +202,15 @@ class ScanCommand extends Command
                 $this->runScanner($graph, 'database', fn () => $databaseSchemaScanner->scan($graph));
                 $databaseScanned = true;
                 $additionalFingerprintFiles = $databaseSchemaScanner->generatedDumpPaths();
+            }
+
+            $runtimeEvidenceScanner->reset();
+
+            if ($includeRuntimeEvidence) {
+                $additionalFingerprintFiles = array_values(array_unique([
+                    ...$additionalFingerprintFiles,
+                    ...$runtimeEvidenceScanner->inputFiles(),
+                ]));
             }
 
             $liveSchemaBefore = null;
@@ -290,6 +303,16 @@ class ScanCommand extends Command
 
             if ($includeContainerBindings) {
                 $this->runScanner($graph, 'container_bindings', fn () => $containerBindingScanner->scan($graph));
+            }
+
+            if ($includeRuntimeEvidence) {
+                // Runtime evidence is projected last so recorded line ranges can
+                // connect to every semantic node produced by the static scanners.
+                $this->runScanner(
+                    $graph,
+                    'runtime_evidence',
+                    fn () => $runtimeEvidenceScanner->scan($graph),
+                );
             }
 
             if ($liveSchemaBefore !== null) {
@@ -400,6 +423,7 @@ class ScanCommand extends Command
                     $path,
                     $overviewPath,
                     $resultFile,
+                    $runtimeEvidenceScanner->inputPath(),
                 );
             } catch (Throwable $throwable) {
                 $mirrorsSafe = false;
@@ -631,6 +655,7 @@ class ScanCommand extends Command
         string $jsonPath,
         ?string $overviewPath,
         ?string $resultFile = null,
+        ?string $runtimeEvidencePath = null,
     ): void {
         $paths = [
             'SQLite store' => $this->pathIdentity($storePath),
@@ -649,9 +674,14 @@ class ScanCommand extends Command
             $paths['fresh-process result'] = $this->pathIdentity($resultFile);
         }
 
+        if ($runtimeEvidencePath !== null) {
+            $paths['runtime evidence'] = $this->pathIdentity($runtimeEvidencePath);
+            $paths['runtime evidence lock'] = $this->pathIdentity($runtimeEvidencePath.'.lock');
+        }
+
         if (count(array_unique($paths)) !== count($paths)) {
             throw new RuntimeException(
-                'AppGraph SQLite store, sidecars, scan lock, JSON mirror, overview, and result paths must be distinct files.'
+                'AppGraph SQLite store, sidecars, scan lock, JSON mirror, overview, result, runtime evidence, and runtime evidence lock paths must be distinct files.'
             );
         }
     }

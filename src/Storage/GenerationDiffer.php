@@ -861,8 +861,17 @@ class GenerationDiffer
                 SELECT
                     changes.*,
                     CASE
-                        WHEN (entity = 'node' AND (before_type = 'test' OR after_type = 'test'))
-                          OR (entity = 'edge' AND fact_type = 'tests_route')
+                        WHEN (entity = 'node' AND (
+                                before_type IN ('test', 'test_file')
+                                OR after_type IN ('test', 'test_file')
+                             ))
+                          OR (entity = 'edge' AND fact_type IN (
+                                'tests_route',
+                                'runtime_covers',
+                                'runtime_uses_table',
+                                'runtime_renders_blade',
+                                'runtime_renders_inertia'
+                             ))
                             THEN 'tests'
                         WHEN (entity = 'node' AND (before_type = 'policy' OR after_type = 'policy'))
                           OR (entity = 'edge' AND fact_type = 'authorizes_via')

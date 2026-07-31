@@ -366,6 +366,46 @@ class GraphIndex
     }
 
     /**
+     * Return a deterministic bounded set of nodes of one type declared in a
+     * graph file. This avoids making query consumers scan every source-file
+     * node when resolving file-granularity runtime evidence.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function nodesOfTypeInFile(
+        string $file,
+        string $type,
+        int $limit,
+        bool &$truncated = false,
+        ?int &$total = null,
+    ): array {
+        $file = str_replace('\\', '/', $file);
+        $limit = max(0, $limit);
+        $selected = [];
+        $total = 0;
+
+        foreach ($this->nodeIdsByFile[$file] ?? [] as $id) {
+            $node = $this->nodesById[$id];
+
+            if (($node['type'] ?? null) !== $type) {
+                continue;
+            }
+
+            $total++;
+
+            if (count($selected) < $limit) {
+                $selected[] = $node;
+            }
+        }
+
+        if ($total > $limit) {
+            $truncated = true;
+        }
+
+        return $selected;
+    }
+
+    /**
      * Sample a bounded set across the full deterministic file index. This keeps
      * large classes representative without copying every node into query state.
      *

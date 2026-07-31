@@ -83,6 +83,79 @@ class GenerationDifferTest extends TestCase
         $this->assertFalse($this->differ->diff($before, $after)['comparison']['semanticChanged']);
     }
 
+    public function test_runtime_test_nodes_and_edges_are_classified_as_tests(): void
+    {
+        $before = $this->graph('runtime-classification', 'same');
+        $after = $this->graph('runtime-classification', 'same');
+        $targets = [
+            Node::make('source_file:app/Service.php', 'source_file', 'app/Service.php', ['file' => 'app/Service.php']),
+            Node::make('table:orders', 'table', 'orders'),
+            Node::make('blade:orders.show', 'blade', 'orders.show'),
+            Node::make('frontend:Orders/Show', 'frontend', 'Orders/Show'),
+        ];
+
+        foreach ($targets as $node) {
+            $before->addNode($node);
+            $after->addNode(clone $node);
+        }
+
+        $testFile = 'test_file:tests/Feature/OrderTest.php';
+        $after->addNode(Node::make($testFile, 'test_file', 'tests/Feature/OrderTest.php', [
+            'file' => 'tests/Feature/OrderTest.php',
+        ]));
+        $after->addEdge(new Edge($testFile, 'source_file:app/Service.php', 'runtime_covers'));
+        $after->addEdge(new Edge($testFile, 'table:orders', 'runtime_uses_table'));
+        $after->addEdge(new Edge($testFile, 'blade:orders.show', 'runtime_renders_blade'));
+        $after->addEdge(new Edge($testFile, 'frontend:Orders/Show', 'runtime_renders_inertia'));
+        $beforeId = $this->store->publish($before)['generation']['id'];
+        $afterId = $this->store->publish($after)['generation']['id'];
+        $diff = $this->differ->diff($beforeId, $afterId, ['tests'], 10);
+        $factTypes = array_column($diff['changes']['tests'], 'factType');
+        sort($factTypes);
+
+        $this->assertSame(5, $diff['counts']['byCategory']['tests']['added']);
+        $this->assertSame([
+            'runtime_covers',
+            'runtime_renders_blade',
+            'runtime_renders_inertia',
+            'runtime_uses_table',
+            'test_file',
+        ], $factTypes);
+        $this->assertSame(0, $diff['counts']['byCategory']['edges']['total']);
+        $this->assertSame(0, $diff['counts']['byCategory']['nodes']['total']);
+    }
+
+    public function test_removed_runtime_coverage_is_a_scoped_cautious_finding(): void
+    {
+        $before = $this->graph('runtime-scope', 'same');
+        $after = $this->graph('runtime-scope', 'same');
+        $testFile = 'test_file:tests/Feature/ServiceTest.php';
+        $sourceFile = 'source_file:app/Service.php';
+
+        foreach ([$before, $after] as $graph) {
+            $graph->addNode(Node::make($testFile, 'test_file', 'tests/Feature/ServiceTest.php', [
+                'file' => 'tests/Feature/ServiceTest.php',
+            ]));
+            $graph->addNode(Node::make($sourceFile, 'source_file', 'app/Service.php', [
+                'file' => 'app/Service.php',
+            ]));
+        }
+
+        $before->addEdge(new Edge($testFile, $sourceFile, 'runtime_covers'));
+        $beforeId = $this->store->publish($before)['generation']['id'];
+        $afterId = $this->store->publish($after)['generation']['id'];
+        $verification = $this->verifier->verify($beforeId, $afterId, [$sourceFile]);
+
+        $this->assertSame(1, $verification['diff']['counts']['byCategory']['tests']['removed']);
+        $this->assertContains(
+            'runtime_coverage_mapping_removed',
+            array_column($verification['findings'], 'code'),
+        );
+        $this->assertSame(1, $verification['targetScope']['changesInScope']['total']);
+        $this->assertSame(0, $verification['targetScope']['collateralChanges']);
+        $this->assertTrue($verification['targetScope']['changesInScopeExact']);
+    }
+
     public function test_verify_change_returns_cautious_findings_and_collateral_scope(): void
     {
         [$before, $after] = $this->publishRichChange();
@@ -96,7 +169,7 @@ class GenerationDifferTest extends TestCase
         $codes = array_column($verification['findings'], 'code');
 
         $this->assertSame('verify-change', $verification['query']);
-        $this->assertStringContainsString('static AppGraph generation evidence', $verification['assessment']['basis']);
+        $this->assertStringContainsString('persisted AppGraph generation evidence', $verification['assessment']['basis']);
         $this->assertContains('route_action_removed', $codes);
         $this->assertContains('write_surface_added', $codes);
         $this->assertContains('authorization_edge_removed', $codes);

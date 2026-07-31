@@ -1303,6 +1303,18 @@ class ContainerBindingRegistry
             return false;
         }
 
+        // Laravel's deprecation handler resolves the framework-owned `log`
+        // singleton lazily. Its transition from an opaque factory diagnostic
+        // to a canonical self-observation is process history, not application
+        // architecture. Concrete application and vendor targets still flow
+        // through the normal relevance rules below.
+        if ($abstract === 'log' && (
+            isset($record['reason'])
+            || ($record['concrete'] ?? null) === $abstract
+        )) {
+            return false;
+        }
+
         if (isset($this->explicitDefaultDeclared[$this->canonical($abstract)])) {
             if (! str_contains($abstract, '\\')) {
                 return true;

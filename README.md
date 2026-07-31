@@ -26,13 +26,15 @@ Typical questions:
 
 ```bash
 composer config repositories.appgraph vcs https://github.com/drfraker/appgraph
-composer require --dev drfraker/appgraph:^0.6
+composer require --dev drfraker/appgraph:^0.7
 php artisan appgraph:install
 ```
 
 The installer registers the local MCP server, adds a compact AppGraph workflow to
-supported agent instruction files, ignores generated graph storage, and builds the
-initial graph. Restart the AI client after installation so it discovers the tools.
+supported agent instruction files, ignores generated graph storage, registers the
+opt-in PHPUnit/Pest runtime extension, and builds the initial graph. The extension is
+inert during normal test runs. Restart the AI client after installation so it discovers
+the tools.
 
 Useful installer options:
 
@@ -40,6 +42,8 @@ Useful installer options:
 --client=codex|claude
 --no-guidelines
 --no-gitignore
+--no-runtime
+--phpunit-path=phpunit.xml.dist
 --no-scan
 ```
 
@@ -158,6 +162,73 @@ The published configuration also includes `appgraph.mcp.legacy_tools`, which def
 to `false`. Enable it only for clients or workflows that still depend on the four
 pre-focused MCP tools; it does not change the broader CLI surface.
 
+## Runtime test evidence
+
+AppGraph includes an optional PHPUnit extension, compatible with PHPUnit tests and Pest
+tests, that records which test files actually execute source lines. It also observes
+Laravel database tables, rendered Blade files, and Inertia components. Recorded line
+ranges are projected onto AppGraph's existing methods and other source symbols, while a
+file-level relationship is retained as the conservative test-selection boundary.
+
+The installer adds the extension to `phpunit.xml` or `phpunit.xml.dist`. Activate it for
+an intentional recording run, then rebuild the graph:
+
+```bash
+# Xdebug must be loaded in coverage mode; PCOV is also supported.
+APPGRAPH_RUNTIME=1 XDEBUG_MODE=coverage php artisan test
+
+# Pest uses the same registered extension.
+APPGRAPH_RUNTIME=1 XDEBUG_MODE=coverage vendor/bin/pest
+
+php artisan appgraph:scan
+```
+
+The default recording path drives PCOV or Xdebug directly for each test. Its project
+scope includes Laravel PHP in `app/`, `routes/`, `config/`, `database/`, `resources/`,
+and other project directories while excluding dependencies, generated runtime files,
+and configured PHPUnit exclusions. This does not turn on PHPUnit's strict-coverage
+semantics. When you explicitly request a PHPUnit coverage report, AppGraph detects that
+active session and safely piggybacks on it instead; that run follows PHPUnit's `<source>`
+filter and coverage metadata.
+
+Without PCOV or Xdebug coverage mode, the extension remains inert and preserves the last
+valid snapshot. Laravel table, Blade, and Inertia observations are captured alongside
+line coverage during the active recording run. Workers merge through a lock-protected,
+atomic snapshot at:
+
+```text
+storage/appgraph/runtime-evidence.json
+```
+
+PCOV commonly defaults its collection directory to `app/`. To record executable PHP in
+`routes/`, `config/`, `database/`, and `resources/` as well, configure `pcov.directory`
+to the project root for the recording run. AppGraph still applies its own project scope
+and exclusions before persisting evidence. Run direct PCOV recording without another
+tool controlling PCOV in the same process: PCOV exposes no active-recorder query.
+AppGraph defers when PHPUnit owns coverage and refuses to clear already queued PCOV data,
+but an active recorder with an empty trace cannot be detected through PCOV's public API.
+
+Customize both the extension's `output` parameter and
+`appgraph.runtime_evidence.path` if that location changes. `APPGRAPH_RUNTIME_OUTPUT`
+can override the extension side for one run, and `APPGRAPH_RUNTIME_ROOT` handles unusual
+launchers whose project root cannot be inferred from the PHPUnit configuration.
+
+Direct capture conservatively skips process-isolated tests because their application code
+runs in a child process. Run those with a normal PHPUnit coverage report if their runtime
+edges are needed; AppGraph will use PHPUnit's coverage transport for that recording.
+
+Run AppGraph recording separately from Pest's own `--tia` mode. If both are requested,
+AppGraph defers to Pest TIA to avoid two coverage recorders contending for the driver.
+
+Snapshots are versioned and content-hashed. A scan rejects stale or missing-file
+relationships and labels legacy hashless observations as lower-confidence evidence.
+The snapshot is cumulative, so rerun the relevant tests after edits. An observed edge
+means the relationship occurred during a recorded run; it does not prove the test
+passed, that every path is covered, or that an unobserved relationship is absent.
+
+The runtime implementation adapts selected ideas from Pest's open-source TIA engine;
+see [Third-party notices](THIRD_PARTY_NOTICES.md) for attribution and license details.
+
 ## Graph coverage
 
 Scanning covers:
@@ -169,6 +240,7 @@ Scanning covers:
 - Events, jobs, listeners, handlers, observers, and ordered bus chains
 - Cache, filesystem, and Laravel HTTP-client side effects
 - Frontend route consumers and statically mapped route tests
+- Optional runtime test-to-file, line-to-symbol, table, Blade, and Inertia evidence
 - Relevant observed container bindings and framework execution bridges
 
 Important edge types include:
@@ -179,18 +251,22 @@ calls, validates_with, framework_invokes, authorizes_via
 uses_model, uses_table, reads, writes
 dispatches, handled_by, listens_to, observes
 consumes_route, tests_route
+runtime_covers, runtime_uses_table, runtime_renders_blade, runtime_renders_inertia
 reads_cache, writes_cache, reads_filesystem, writes_filesystem, calls_external
 ```
 
 ## Accuracy boundaries
 
-AppGraph is static analysis, not runtime truth.
+AppGraph is primarily static analysis. Optional runtime observations are bounded,
+historical evidence rather than current runtime truth.
 
 - Uncertain findings use `inferred` or `low` buckets and include a reason when the
   graph has one; omitted uncertainty is still ranked static evidence, not runtime
   proof.
 - `analysisWarnings` are prompts to inspect relevant source.
 - Missing mapped tests do not prove missing runtime coverage.
+- A runtime snapshot contains only tests that were recorded. Stale hashed relationships
+  are omitted, while unexecuted tests and paths remain unknown.
 - Dynamic bindings, macros, generated calls, and unsupported framework surfaces may be
   absent.
 - A bare Eloquent `Model::query()` creates a builder and is not itself a database read;
@@ -213,5 +289,5 @@ vendor/bin/phpunit
 ## Roadmap
 
 - Improve high-value Laravel relationship accuracy using real-application fixtures
-- Add Blade/Livewire consumers, Pest closure tests, and scheduler entry points
+- Add static Blade/Livewire consumers, static Pest closure route mappings, and scheduler entry points
 - Benchmark time-to-first-useful-source-read, response size, and finding accuracy

@@ -93,7 +93,61 @@ class SliceQueryEngineTest extends TestCase
             ["php artisan test 'tests/Feature/NoteUpdateTest.php'"],
             $slice['tests']['commands'],
         );
+        $this->assertArrayNotHasKey('runtimeEvidence', $slice['tests']);
         $this->assertRecursiveArrayNotHasKey('confidence', $slice);
+    }
+
+    public function test_slice_exposes_runtime_test_evidence_with_file_granularity(): void
+    {
+        $graph = $this->graph(true);
+        $graph['nodes'][] = [
+            'id' => 'source_file:app/Services/NoteService.php',
+            'type' => 'source_file',
+            'label' => 'app/Services/NoteService.php',
+            'file' => 'app/Services/NoteService.php',
+        ];
+        $graph['nodes'][] = [
+            'id' => 'test_file:tests/Feature/NoteUpdateTest.php',
+            'type' => 'test_file',
+            'label' => 'tests/Feature/NoteUpdateTest.php',
+            'file' => 'tests/Feature/NoteUpdateTest.php',
+        ];
+        $graph['edges'][] = [
+            'from' => 'test_file:tests/Feature/NoteUpdateTest.php',
+            'to' => 'source_file:app/Services/NoteService.php',
+            'type' => 'runtime_covers',
+            'confidence' => 1.0,
+        ];
+        $graph['edges'][] = [
+            'from' => 'test_file:tests/Feature/NoteUpdateTest.php',
+            'to' => 'App\Services\NoteService::save',
+            'type' => 'runtime_covers',
+            'confidence' => 1.0,
+        ];
+        $graph['edges'][] = [
+            'from' => 'test_file:tests/Feature/NoteUpdateTest.php',
+            'to' => 'table:notes',
+            'type' => 'runtime_uses_table',
+            'confidence' => 1.0,
+        ];
+        $slice = (new QueryEngine(GraphIndex::fromArray($graph), basePath: $this->project))
+            ->slice(['route:notes.update'], []);
+
+        $this->assertSame(['tests/Feature/NoteUpdateTest.php'], $slice['tests']['mapped']);
+        $this->assertSame([[
+            'testFile' => 'tests/Feature/NoteUpdateTest.php',
+            'provenance' => 'appgraph_runtime',
+            'granularity' => 'file',
+            'sources' => [['file' => 'app/Services/NoteService.php']],
+            'targets' => [
+                ['id' => 'App\Services\NoteService::save', 'relationship' => 'runtime_covers'],
+                ['id' => 'table:notes', 'relationship' => 'runtime_uses_table'],
+            ],
+        ]], $slice['tests']['runtimeEvidence']);
+        $this->assertSame(
+            ["php artisan test 'tests/Feature/NoteUpdateTest.php'"],
+            $slice['tests']['commands'],
+        );
     }
 
     public function test_slice_freshness_is_current_stale_or_unverified_per_answer(): void

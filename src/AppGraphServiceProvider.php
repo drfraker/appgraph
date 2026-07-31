@@ -6,6 +6,8 @@ use AppGraph\Commands\InstallCommand;
 use AppGraph\Commands\QueryCommand;
 use AppGraph\Commands\ScanCommand;
 use AppGraph\Query\StalenessChecker;
+use AppGraph\Runtime\JsonRuntimeEvidenceStore;
+use AppGraph\Runtime\RuntimeEvidenceRegistry;
 use AppGraph\Storage\GraphStore;
 use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\FileFinder;
@@ -55,6 +57,18 @@ class AppGraphServiceProvider extends ServiceProvider
             );
         });
         $this->app->singleton(SourceFileObservations::class);
+        $this->app->singleton(JsonRuntimeEvidenceStore::class, function ($app): JsonRuntimeEvidenceStore {
+            $configuredPath = $app['config']->get(
+                'appgraph.runtime_evidence.path',
+                'appgraph/runtime-evidence.json',
+            );
+            $path = is_string($configuredPath) && trim($configuredPath) !== ''
+                ? trim($configuredPath)
+                : 'appgraph/runtime-evidence.json';
+            $path = $this->isAbsolutePath($path) ? $path : $app->storagePath($path);
+
+            return new JsonRuntimeEvidenceStore($path, $app->basePath());
+        });
         $this->app->singleton(PhpFileFacts::class, function ($app): PhpFileFacts {
             $persistent = (bool) $app['config']->get('appgraph.php_facts.persistent_cache', true);
             $configuredPath = $app['config']->get(
@@ -102,6 +116,8 @@ class AppGraphServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        RuntimeEvidenceRegistry::armLaravel($this->app);
+
         if (! $this->app->runningInConsole()) {
             return;
         }

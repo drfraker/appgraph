@@ -247,7 +247,7 @@ class ChangeVerifier
             'query' => 'verify-change',
             'assessment' => [
                 'status' => $status,
-                'basis' => 'static AppGraph generation evidence',
+                'basis' => 'persisted AppGraph generation evidence, including recorded runtime facts when present',
                 'statement' => 'This assessment reports graph-visible structural evidence. It does not prove the change is safe, correct, complete, deployed, or covered by passing tests.',
             ],
             'baseline' => $diff['from'],
@@ -336,7 +336,7 @@ class ChangeVerifier
 
     /**
      * Turn bounded raw changes into cautious review prompts. Findings describe
-     * static evidence only; they deliberately avoid claims such as "unsafe" or
+     * persisted graph evidence only; they deliberately avoid claims such as "unsafe" or
      * "unauthorized" that the graph cannot establish.
      *
      * @param array<string, mixed> $diff
@@ -495,6 +495,10 @@ class ChangeVerifier
                 $factType === 'tests_route' && $kind === 'removed' => [
                     'test_route_mapping_removed', 'high',
                     'A static test-to-route mapping was removed; verify relevant tests still exercise the route.',
+                ],
+                $factType === 'runtime_covers' && $kind === 'removed' => [
+                    'runtime_coverage_mapping_removed', 'medium',
+                    'An observed runtime coverage mapping disappeared; rerun the relevant tests with runtime evidence before treating this as a coverage loss.',
                 ],
                 $factType === 'test' && $kind === 'removed' => [
                     'test_node_removed', 'medium',

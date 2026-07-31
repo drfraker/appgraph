@@ -28,6 +28,16 @@ return [
         'cache_path' => 'appgraph/cache/php-facts',
     ],
 
+    'runtime_evidence' => [
+        /*
+         * Optional evidence captured by the AppGraph runtime collector. Missing
+         * snapshots are ignored. Present snapshots are schema-validated and
+         * content hashes are checked before their relationships are imported.
+         */
+        'enabled' => true,
+        'path' => 'appgraph/runtime-evidence.json',
+    ],
+
     'database' => [
         /*
          * "dump" uses Laravel's schema dump implementation, then parses the SQL file.

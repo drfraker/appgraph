@@ -53,6 +53,20 @@ final class TaskContextPlanner
 
     private const MAX_MAPPED_TESTS = 32;
 
+    private const MAX_SOURCE_FILE_NODES_PER_FILE = 4;
+
+    private const MAX_RUNTIME_SOURCES_PER_TEST = 16;
+
+    private const MAX_RUNTIME_TARGETS_PER_TEST = 16;
+
+    /** @var array<int, string> */
+    private const RUNTIME_TARGET_EDGE_TYPES = [
+        'runtime_covers',
+        'runtime_uses_table',
+        'runtime_renders_blade',
+        'runtime_renders_inertia',
+    ];
+
     private const MAX_VERIFICATION_TARGETS = 16;
 
     private const MAX_VERIFICATION_COMMANDS = 16;
@@ -243,6 +257,7 @@ final class TaskContextPlanner
         $omitted = $this->mergeCounts($omitted, $expanded['omitted']);
         $verification = $this->verification(
             $expanded['contexts'],
+            $normalizedChangedFiles,
             $expanded['relatedFactsRemaining'],
             $minConfidence,
         );
@@ -1893,10 +1908,12 @@ final class TaskContextPlanner
 
     /**
      * @param array<string, array<string, mixed>> $contexts
+     * @param array<int, string> $changedFiles
      * @return array<string, mixed>
      */
     private function verification(
         array $contexts,
+        array $changedFiles,
         int $relatedFactsRemaining,
         float $minConfidence,
     ): array
@@ -1974,6 +1991,15 @@ final class TaskContextPlanner
             }
         }
 
+        $this->mergeRuntimeAffectedTests(
+            $contexts,
+            $changedFiles,
+            $mapped,
+            $relatedFactsRemaining,
+            $minConfidence,
+            $omitted,
+        );
+
         foreach ($mapped as &$mappedTest) {
             unset($mappedTest['_routes']);
         }
@@ -2040,6 +2066,355 @@ final class TaskContextPlanner
             'omitted' => $omitted,
             'relatedFactsRemaining' => $relatedFactsRemaining,
         ];
+    }
+
+    /**
+     * Merge direct observed relationships from relevant context nodes into the
+     * verification set. The evidence remains test-file-granular: it selects a
+     * test file and preserves the exact observed target without claiming that
+     * a particular test method covered an application symbol.
+     *
+     * @param array<string, array<string, mixed>> $contexts
+     * @param array<int, string> $changedFiles
+     * @param array<string, array<string, mixed>> $mapped
+     * @param array<string, int> $omitted
+     */
+    private function mergeRuntimeAffectedTests(
+        array $contexts,
+        array $changedFiles,
+        array &$mapped,
+        int &$relatedFactsRemaining,
+        float $minConfidence,
+        array &$omitted,
+    ): void {
+        $sourceFiles = [];
+
+        foreach ($changedFiles as $file) {
+            $sourceFiles[$file] = [
+                'file' => $file,
+                'confidence' => 1.0,
+                'score' => 1.0,
+            ];
+        }
+
+        foreach ($contexts as $context) {
+            if (in_array($context['type'] ?? null, ['test', 'test_file'], true)) {
+                continue;
+            }
+
+            $file = is_string($context['file'] ?? null)
+                ? $this->normalizeProjectFile($context['file'])
+                : null;
+
+            if ($file === null) {
+                continue;
+            }
+
+            $candidate = [
+                'file' => $file,
+                'confidence' => round((float) ($context['_pathConfidence'] ?? $context['confidence'] ?? 1.0), 4),
+                'score' => round((float) ($context['score'] ?? 0.0), 4),
+            ];
+            $existing = $sourceFiles[$file] ?? null;
+
+            if ($existing === null || ([
+                -$candidate['confidence'],
+                -$candidate['score'],
+                $candidate['file'],
+            ] <=> [
+                -$existing['confidence'],
+                -$existing['score'],
+                $existing['file'],
+            ]) < 0) {
+                $sourceFiles[$file] = $candidate;
+            }
+        }
+
+        uasort($sourceFiles, static fn (array $left, array $right): int => [
+            -$left['confidence'],
+            -$left['score'],
+            $left['file'],
+        ] <=> [
+            -$right['confidence'],
+            -$right['score'],
+            $right['file'],
+        ]);
+
+        foreach ($sourceFiles as $sourceFile) {
+            $sourceNodesTruncated = false;
+            $sourceNodes = $this->index->nodesOfTypeInFile(
+                $sourceFile['file'],
+                'source_file',
+                self::MAX_SOURCE_FILE_NODES_PER_FILE,
+                $sourceNodesTruncated,
+            );
+
+            if ($sourceNodesTruncated) {
+                $omitted['related_fact_limit']++;
+            }
+
+            foreach ($sourceNodes as $sourceNode) {
+                if (! $this->nodeHasBoundedIdentity($sourceNode)) {
+                    $omitted['node_text_limit']++;
+                    continue;
+                }
+
+                $testEdgesTruncated = false;
+                $testEdges = $this->index->rankedEdgesTo(
+                    (string) $sourceNode['id'],
+                    ['runtime_covers', 'runtime_renders_blade'],
+                    min(self::MAX_MAPPED_TESTS, $relatedFactsRemaining),
+                    $testEdgesTruncated,
+                );
+                $relatedFactsRemaining -= count($testEdges);
+
+                foreach ($testEdges as $edge) {
+                    $test = $this->index->node((string) ($edge['from'] ?? ''));
+
+                    if ($test === null
+                        || ($test['type'] ?? null) !== 'test_file'
+                        || ! $this->nodeHasBoundedIdentity($test)) {
+                        continue;
+                    }
+
+                    $confidence = round(
+                        (float) $sourceFile['confidence'] * (float) ($edge['confidence'] ?? 1.0),
+                        4,
+                    );
+
+                    if ($confidence < $minConfidence) {
+                        $omitted['min_confidence']++;
+                        continue;
+                    }
+
+                    $this->mergeRuntimeMappedTest(
+                        $mapped,
+                        $test,
+                        $confidence,
+                        $omitted,
+                        sourceFile: $sourceFile['file'],
+                    );
+                }
+
+                if ($testEdgesTruncated) {
+                    $omitted[count($mapped) >= self::MAX_MAPPED_TESTS
+                        ? 'mapped_test_limit'
+                        : 'related_fact_limit']++;
+                }
+            }
+        }
+
+        $targets = [];
+
+        foreach ($contexts as $context) {
+            if (in_array($context['type'] ?? null, ['test', 'test_file', 'source_file'], true)
+                || ! isset($context['id'])
+                || ! is_string($context['id'])) {
+                continue;
+            }
+
+            $candidate = [
+                'id' => $context['id'],
+                'confidence' => round((float) ($context['_pathConfidence'] ?? $context['confidence'] ?? 1.0), 4),
+                'score' => round((float) ($context['score'] ?? 0.0), 4),
+            ];
+            $existing = $targets[$context['id']] ?? null;
+
+            if ($existing === null || ([
+                -$candidate['confidence'],
+                -$candidate['score'],
+                $candidate['id'],
+            ] <=> [
+                -$existing['confidence'],
+                -$existing['score'],
+                $existing['id'],
+            ]) < 0) {
+                $targets[$context['id']] = $candidate;
+            }
+        }
+
+        uasort($targets, static fn (array $left, array $right): int => [
+            -$left['confidence'],
+            -$left['score'],
+            $left['id'],
+        ] <=> [
+            -$right['confidence'],
+            -$right['score'],
+            $right['id'],
+        ]);
+
+        foreach ($targets as $target) {
+            $testEdgesTruncated = false;
+            $testEdges = $this->index->rankedEdgesTo(
+                $target['id'],
+                self::RUNTIME_TARGET_EDGE_TYPES,
+                min(self::MAX_MAPPED_TESTS, $relatedFactsRemaining),
+                $testEdgesTruncated,
+            );
+            $relatedFactsRemaining -= count($testEdges);
+
+            foreach ($testEdges as $edge) {
+                $test = $this->index->node((string) ($edge['from'] ?? ''));
+
+                if ($test === null
+                    || ($test['type'] ?? null) !== 'test_file'
+                    || ! $this->nodeHasBoundedIdentity($test)) {
+                    continue;
+                }
+
+                $confidence = round(
+                    (float) $target['confidence'] * (float) ($edge['confidence'] ?? 1.0),
+                    4,
+                );
+
+                if ($confidence < $minConfidence) {
+                    $omitted['min_confidence']++;
+                    continue;
+                }
+
+                $this->mergeRuntimeMappedTest(
+                    $mapped,
+                    $test,
+                    $confidence,
+                    $omitted,
+                    target: [
+                        'id' => $target['id'],
+                        'relationship' => (string) ($edge['type'] ?? ''),
+                    ],
+                );
+            }
+
+            if ($testEdgesTruncated) {
+                $omitted[count($mapped) >= self::MAX_MAPPED_TESTS
+                    ? 'mapped_test_limit'
+                    : 'related_fact_limit']++;
+            }
+        }
+    }
+
+    /**
+     * @param array<string, array<string, mixed>> $mapped
+     * @param array<string, mixed> $test
+     * @param array<string, int> $omitted
+     */
+    private function mergeRuntimeMappedTest(
+        array &$mapped,
+        array $test,
+        float $confidence,
+        array &$omitted,
+        ?string $sourceFile = null,
+        ?array $target = null,
+    ): void {
+        $testFile = $this->nodeProjectFile($test);
+
+        if (($sourceFile === null && $target === null)
+            || $testFile === null
+            || ! isset($test['id'])
+            || ! is_string($test['id'])) {
+            return;
+        }
+
+        $key = null;
+
+        foreach ($mapped as $mappedKey => $entry) {
+            if (($entry['file'] ?? null) === $testFile) {
+                $key = $mappedKey;
+                break;
+            }
+        }
+
+        if ($key === null) {
+            if (count($mapped) >= self::MAX_MAPPED_TESTS) {
+                $omitted['mapped_test_limit']++;
+
+                return;
+            }
+
+            $key = $test['id'];
+            $mapped[$key] = [
+                'id' => $test['id'],
+                'file' => $testFile,
+                'confidence' => round($confidence, 4),
+            ];
+        } elseif (! isset($mapped[$key]['route'])) {
+            $mapped[$key]['confidence'] = max(
+                (float) ($mapped[$key]['confidence'] ?? 0.0),
+                round($confidence, 4),
+            );
+        }
+
+        $runtimeEvidence = is_array($mapped[$key]['runtimeEvidence'] ?? null)
+            ? $mapped[$key]['runtimeEvidence']
+            : [
+                'provenance' => 'appgraph_runtime',
+                'granularity' => 'file',
+            ];
+        $sources = is_array($runtimeEvidence['sources'] ?? null)
+            ? array_values(array_filter(
+                $runtimeEvidence['sources'],
+                static fn (mixed $source): bool => is_array($source)
+                    && is_string($source['file'] ?? null),
+            ))
+            : [];
+        $sourceFiles = array_column($sources, 'file');
+
+        if ($sourceFile !== null && ! in_array($sourceFile, $sourceFiles, true)) {
+            if (count($sourceFiles) >= self::MAX_RUNTIME_SOURCES_PER_TEST) {
+                $omitted['related_fact_limit']++;
+            } else {
+                $sources[] = ['file' => $sourceFile];
+                usort($sources, static fn (array $left, array $right): int => $left['file'] <=> $right['file']);
+            }
+        }
+
+        if ($sources !== []) {
+            $runtimeEvidence['sources'] = $sources;
+        }
+
+        if (is_array($target)
+            && is_string($target['id'] ?? null)
+            && $target['id'] !== ''
+            && is_string($target['relationship'] ?? null)
+            && in_array($target['relationship'], self::RUNTIME_TARGET_EDGE_TYPES, true)) {
+            $runtimeTargets = is_array($runtimeEvidence['targets'] ?? null)
+                ? array_values(array_filter(
+                    $runtimeEvidence['targets'],
+                    static fn (mixed $runtimeTarget): bool => is_array($runtimeTarget)
+                        && is_string($runtimeTarget['id'] ?? null)
+                        && is_string($runtimeTarget['relationship'] ?? null),
+                ))
+                : [];
+            $targetKey = $target['id']."\0".$target['relationship'];
+            $targetKeys = [];
+
+            foreach ($runtimeTargets as $runtimeTarget) {
+                $targetKeys[$runtimeTarget['id']."\0".$runtimeTarget['relationship']] = true;
+            }
+
+            if (! isset($targetKeys[$targetKey])) {
+                if (count($runtimeTargets) >= self::MAX_RUNTIME_TARGETS_PER_TEST) {
+                    $omitted['related_fact_limit']++;
+                } else {
+                    $runtimeTargets[] = [
+                        'id' => $target['id'],
+                        'relationship' => $target['relationship'],
+                    ];
+                    usort($runtimeTargets, static fn (array $left, array $right): int => [
+                        $left['id'],
+                        $left['relationship'],
+                    ] <=> [
+                        $right['id'],
+                        $right['relationship'],
+                    ]);
+                }
+            }
+
+            if ($runtimeTargets !== []) {
+                $runtimeEvidence['targets'] = $runtimeTargets;
+            }
+        }
+
+        $mapped[$key]['runtimeEvidence'] = $runtimeEvidence;
     }
 
     /**

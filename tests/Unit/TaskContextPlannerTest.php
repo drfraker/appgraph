@@ -203,6 +203,196 @@ class TaskContextPlannerTest extends TestCase
         $this->assertStringContainsString('may still exist', $unmapped['verification']['gaps'][0]['message']);
     }
 
+    public function test_runtime_file_evidence_merges_with_a_static_test_mapping_without_claiming_method_coverage(): void
+    {
+        $graph = $this->withExactSpans($this->queryFixtureGraph());
+        $testId = 'test:Tests\Feature\NoteTest::test_update';
+        $testFileId = 'test_file:tests/Feature/NoteTest.php';
+        $sourceFileId = 'source_file:app/Http/Controllers/NoteController.php';
+        $graph['nodes'][] = [
+            'id' => $testId,
+            'type' => 'test',
+            'label' => 'NoteTest::test_update',
+            'file' => 'tests/Feature/NoteTest.php',
+            'line' => 3,
+            'endLine' => 8,
+        ];
+        $graph['nodes'][] = [
+            'id' => $testFileId,
+            'type' => 'test_file',
+            'label' => 'tests/Feature/NoteTest.php',
+            'file' => 'tests/Feature/NoteTest.php',
+        ];
+        $graph['nodes'][] = [
+            'id' => $sourceFileId,
+            'type' => 'source_file',
+            'label' => 'app/Http/Controllers/NoteController.php',
+            'file' => 'app/Http/Controllers/NoteController.php',
+        ];
+        $graph['edges'][] = [
+            'from' => $testId,
+            'to' => 'route:PUT:/notes/{note}',
+            'type' => 'tests_route',
+            'confidence' => 1.0,
+        ];
+        $graph['edges'][] = [
+            'from' => $testFileId,
+            'to' => $sourceFileId,
+            'type' => 'runtime_covers',
+            'confidence' => 1.0,
+        ];
+        $this->writeGraphFiles($graph);
+
+        $result = $this->planner($graph)->plan('Inspect selected route behavior', ['notes.update']);
+        $mapped = $result['verification']['mappedTests'];
+
+        $this->assertCount(1, $mapped);
+        $this->assertSame($testId, $mapped[0]['id']);
+        $this->assertSame('route:PUT:/notes/{note}', $mapped[0]['route']);
+        $this->assertSame([
+            'provenance' => 'appgraph_runtime',
+            'granularity' => 'file',
+            'sources' => [['file' => 'app/Http/Controllers/NoteController.php']],
+        ], $mapped[0]['runtimeEvidence']);
+        $this->assertSame(["php artisan test 'tests/Feature/NoteTest.php'"], $result['verification']['commands']);
+    }
+
+    public function test_runtime_test_file_results_reuse_verification_bounds(): void
+    {
+        $graph = $this->withExactSpans($this->queryFixtureGraph());
+        $sourceFileId = 'source_file:app/Services/NoteService.php';
+        $graph['nodes'][] = [
+            'id' => $sourceFileId,
+            'type' => 'source_file',
+            'label' => 'app/Services/NoteService.php',
+            'file' => 'app/Services/NoteService.php',
+        ];
+
+        for ($index = 0; $index < 40; $index++) {
+            $file = sprintf('tests/Feature/Runtime%02dTest.php', $index);
+            $id = 'test_file:'.$file;
+            $graph['nodes'][] = [
+                'id' => $id,
+                'type' => 'test_file',
+                'label' => $file,
+                'file' => $file,
+            ];
+            $graph['edges'][] = [
+                'from' => $id,
+                'to' => $sourceFileId,
+                'type' => 'runtime_covers',
+                'confidence' => 1.0,
+            ];
+        }
+        $this->writeGraphFiles($graph);
+
+        $result = $this->planner($graph)->plan(
+            'Inspect selected service behavior',
+            ['App\Services\NoteService::save'],
+        );
+
+        $this->assertCount(32, $result['verification']['mappedTests']);
+        $this->assertCount(16, $result['verification']['commands']);
+        $this->assertGreaterThan(0, $result['omitted']['mapped_test_limit']);
+        $this->assertGreaterThan(0, $result['omitted']['verification_command_limit']);
+        $this->assertTrue($result['truncated']);
+
+        foreach ($result['verification']['mappedTests'] as $test) {
+            $this->assertSame('appgraph_runtime', $test['runtimeEvidence']['provenance']);
+            $this->assertSame('file', $test['runtimeEvidence']['granularity']);
+        }
+    }
+
+    public function test_runtime_relationships_select_one_test_file_from_relevant_exact_contexts(): void
+    {
+        $testFile = 'tests/Feature/ObservedRuntimeTest.php';
+        $testFileId = 'test_file:'.$testFile;
+        $bladeFile = 'resources/views/notes/show.blade.php';
+        $bladeId = 'source_file:'.$bladeFile;
+        $methodId = 'App\Services\NoteService::save';
+        $tableId = 'table:notes';
+        $inertiaId = 'inertia_component:Notes/Show';
+        $graph = [
+            'nodes' => [
+                ['id' => $methodId, 'type' => 'method', 'label' => 'NoteService::save', 'file' => 'app/Services/NoteService.php', 'line' => 2, 'endLine' => 8],
+                ['id' => $tableId, 'type' => 'table', 'label' => 'notes'],
+                ['id' => $inertiaId, 'type' => 'inertia_component', 'label' => 'Notes/Show'],
+                ['id' => $bladeId, 'type' => 'source_file', 'label' => $bladeFile, 'file' => $bladeFile],
+                ['id' => $testFileId, 'type' => 'test_file', 'label' => $testFile, 'file' => $testFile],
+            ],
+            'edges' => [
+                ['from' => $testFileId, 'to' => $methodId, 'type' => 'runtime_covers', 'confidence' => 1.0],
+                ['from' => $testFileId, 'to' => $tableId, 'type' => 'runtime_uses_table', 'confidence' => 1.0],
+                ['from' => $testFileId, 'to' => $tableId, 'type' => 'runtime_uses_table', 'confidence' => 0.9],
+                ['from' => $testFileId, 'to' => $bladeId, 'type' => 'runtime_renders_blade', 'confidence' => 1.0],
+                ['from' => $testFileId, 'to' => $inertiaId, 'type' => 'runtime_renders_inertia', 'confidence' => 1.0],
+            ],
+        ];
+        $this->writeGraphFiles($graph);
+
+        $result = $this->planner($graph)->plan(
+            'Inspect observed runtime behavior',
+            [$methodId, $tableId, $inertiaId],
+            [$bladeFile],
+        );
+
+        $this->assertCount(1, $result['verification']['mappedTests']);
+        $this->assertSame($testFileId, $result['verification']['mappedTests'][0]['id']);
+        $this->assertSame([
+            'provenance' => 'appgraph_runtime',
+            'granularity' => 'file',
+            'sources' => [['file' => $bladeFile]],
+            'targets' => [
+                ['id' => $methodId, 'relationship' => 'runtime_covers'],
+                ['id' => $inertiaId, 'relationship' => 'runtime_renders_inertia'],
+                ['id' => $tableId, 'relationship' => 'runtime_uses_table'],
+            ],
+        ], $result['verification']['mappedTests'][0]['runtimeEvidence']);
+        $this->assertSame(["php artisan test '{$testFile}'"], $result['verification']['commands']);
+    }
+
+    public function test_runtime_targets_are_bounded_per_test_file_and_report_omissions(): void
+    {
+        $testFile = 'tests/Feature/ObservedRuntimeTest.php';
+        $testFileId = 'test_file:'.$testFile;
+        $graph = [
+            'nodes' => [[
+                'id' => $testFileId,
+                'type' => 'test_file',
+                'label' => $testFile,
+                'file' => $testFile,
+            ]],
+            'edges' => [],
+        ];
+        $targets = [];
+
+        for ($index = 0; $index < 20; $index++) {
+            $tableId = sprintf('table:runtime_%02d', $index);
+            $targets[] = $tableId;
+            $graph['nodes'][] = [
+                'id' => $tableId,
+                'type' => 'table',
+                'label' => sprintf('runtime_%02d', $index),
+            ];
+            $graph['edges'][] = [
+                'from' => $testFileId,
+                'to' => $tableId,
+                'type' => 'runtime_uses_table',
+                'confidence' => 1.0,
+            ];
+        }
+        $this->writeGraphFiles($graph);
+
+        $result = $this->planner($graph)->plan('Inspect observed tables', $targets);
+        $runtimeTargets = $result['verification']['mappedTests'][0]['runtimeEvidence']['targets'];
+
+        $this->assertCount(16, $runtimeTargets);
+        $this->assertSame('table:runtime_00', $runtimeTargets[0]['id']);
+        $this->assertSame('table:runtime_15', $runtimeTargets[15]['id']);
+        $this->assertGreaterThan(0, $result['omitted']['related_fact_limit']);
+        $this->assertTrue($result['truncated']);
+    }
+
     public function test_truncated_dispatch_metadata_is_reported_without_a_false_non_causal_claim(): void
     {
         $dispatcher = 'App\\Actions\\Publish::run';

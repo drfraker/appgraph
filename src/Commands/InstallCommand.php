@@ -29,6 +29,8 @@ class InstallCommand extends Command
         {--no-guidelines : Do not install the AppGraph agent workflow instructions.}
         {--gitignore-path= : Git ignore file to update. Defaults to .gitignore.}
         {--no-gitignore : Do not add the generated AppGraph directory to .gitignore.}
+        {--phpunit-path= : PHPUnit XML file to update. Defaults to phpunit.xml, then phpunit.xml.dist.}
+        {--no-runtime : Do not register the opt-in AppGraph runtime evidence extension.}
         {--no-scan : Do not build the initial graph after configuring clients.}
         {--force : Replace an existing AppGraph configuration without prompting.}';
 
@@ -57,6 +59,10 @@ class InstallCommand extends Command
 
             if (! (bool) $this->option('no-gitignore')) {
                 $this->installGitignore($files);
+            }
+
+            if (! (bool) $this->option('no-runtime')) {
+                $this->installRuntimeExtension($files);
             }
         } catch (RuntimeException $exception) {
             $this->error($exception->getMessage());
@@ -230,9 +236,19 @@ class InstallCommand extends Command
         $storePath = is_string($storePath) && $storePath !== ''
             ? ($this->isAbsolutePath($storePath) ? $storePath : storage_path($storePath))
             : storage_path('appgraph/appgraph.sqlite');
+        $runtimeEvidencePath = config(
+            'appgraph.runtime_evidence.path',
+            'appgraph/runtime-evidence.json',
+        );
+        $runtimeEvidencePath = is_string($runtimeEvidencePath) && $runtimeEvidencePath !== ''
+            ? ($this->isAbsolutePath($runtimeEvidencePath)
+                ? $runtimeEvidencePath
+                : storage_path($runtimeEvidencePath))
+            : storage_path('appgraph/runtime-evidence.json');
         $generatedPaths = [
             storage_path(config('appgraph.output_path', 'appgraph/appgraph.json')),
             $storePath,
+            $runtimeEvidencePath,
         ];
         $patterns = [];
 
@@ -264,6 +280,10 @@ class InstallCommand extends Command
 
                 $patterns['/.scan.lock'] = true;
             }
+
+            if ($generatedPath === $runtimeEvidencePath) {
+                $patterns['/'.$filename.'.lock'] = true;
+            }
         }
 
         if ($patterns === []) {
@@ -290,6 +310,99 @@ class InstallCommand extends Command
         ));
 
         $this->components->info("Generated graph ignored in {$this->relativePath($path)}");
+    }
+
+    private function installRuntimeExtension(Filesystem $files): void
+    {
+        $path = $this->phpunitPath($files);
+
+        if ($path === null) {
+            $this->components->warn('No phpunit.xml or phpunit.xml.dist was found; runtime evidence was not registered.');
+
+            return;
+        }
+
+        $contents = (string) $files->get($path);
+        $class = 'AppGraph\\Runtime\\PHPUnit\\AppGraphExtension';
+
+        if (preg_match(
+            '/<bootstrap\b[^>]*\bclass\s*=\s*([\'\"])'.preg_quote($class, '/').'\1/i',
+            $contents,
+        ) === 1) {
+            $this->components->info("Runtime evidence already registered in {$this->relativePath($path)}");
+
+            return;
+        }
+
+        $newline = str_contains($contents, "\r\n") ? "\r\n" : "\n";
+
+        if (preg_match('/^([ \t]*)<extensions\s*\/>/m', $contents, $matches, PREG_OFFSET_CAPTURE) === 1) {
+            $indent = $matches[1][0];
+            $replacement = $this->runtimeExtensionXml($indent, $newline);
+            $contents = substr_replace(
+                $contents,
+                $replacement,
+                $matches[0][1],
+                strlen($matches[0][0]),
+            );
+        } elseif (preg_match('/^([ \t]*)<\/extensions\s*>/m', $contents, $matches, PREG_OFFSET_CAPTURE) === 1) {
+            $indent = $matches[1][0].'    ';
+            $entry = $this->runtimeExtensionEntry($indent, $newline).$newline;
+            $contents = substr_replace($contents, $entry, $matches[0][1], 0);
+        } elseif (preg_match('/^([ \t]*)<\/phpunit\s*>/m', $contents, $matches, PREG_OFFSET_CAPTURE) === 1) {
+            $indent = $matches[1][0];
+            $block = $this->runtimeExtensionXml($indent.'    ', $newline).$newline;
+            $contents = substr_replace($contents, $block, $matches[0][1], 0);
+        } else {
+            throw new RuntimeException("The PHPUnit config at [{$path}] does not contain a closing <phpunit> element.");
+        }
+
+        $files->put($path, $contents);
+        $this->components->info("Opt-in runtime evidence registered in {$this->relativePath($path)}");
+        $this->line('  <fg=gray>Run tests with APPGRAPH_RUNTIME=1 and a coverage driver before the next scan.</>');
+    }
+
+    private function phpunitPath(Filesystem $files): ?string
+    {
+        $configured = $this->option('phpunit-path');
+
+        if (is_string($configured) && trim($configured) !== '') {
+            $path = $this->absolutePath(trim($configured));
+
+            if (! $files->exists($path)) {
+                throw new RuntimeException("The configured PHPUnit file [{$path}] does not exist.");
+            }
+
+            return $path;
+        }
+
+        foreach (['phpunit.xml', 'phpunit.xml.dist'] as $candidate) {
+            $path = base_path($candidate);
+
+            if ($files->exists($path)) {
+                return $path;
+            }
+        }
+
+        return null;
+    }
+
+    private function runtimeExtensionXml(string $indent, string $newline): string
+    {
+        return implode($newline, [
+            $indent.'<extensions>',
+            $this->runtimeExtensionEntry($indent.'    ', $newline),
+            $indent.'</extensions>',
+        ]);
+    }
+
+    private function runtimeExtensionEntry(string $indent, string $newline): string
+    {
+        return implode($newline, [
+            $indent.'<bootstrap class="AppGraph\\Runtime\\PHPUnit\\AppGraphExtension">',
+            $indent.'    <parameter name="output" value="storage/appgraph/runtime-evidence.json"/>',
+            $indent.'</bootstrap>',
+        ]);
     }
 
     /**

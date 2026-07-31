@@ -197,6 +197,18 @@ class ScanFingerprint
     {
         $configuration = $this->configurationIsAvailable() ? config()->all() : [];
 
+        // Laravel lazily creates and selects a deprecation log channel after
+        // the first deprecation is emitted. That process-local mutation does
+        // not affect AppGraph scanning and must not make an unchanged graph
+        // appear stale on newer PHP versions that surface more deprecations.
+        if (is_array($configuration['logging'] ?? null)) {
+            unset($configuration['logging']['deprecations']);
+
+            if (is_array($configuration['logging']['channels'] ?? null)) {
+                unset($configuration['logging']['channels']['deprecations']);
+            }
+        }
+
         return hash('sha256', $this->stableJson($this->normalize($configuration)));
     }
 

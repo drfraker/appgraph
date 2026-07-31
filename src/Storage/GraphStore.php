@@ -830,7 +830,7 @@ class GraphStore
             if (! $create) {
                 // query_only can be disabled from SQL. The SQLite open flag is
                 // the actual read-only boundary for query and diff callbacks.
-                $options[PDO::SQLITE_ATTR_OPEN_FLAGS] = PDO::SQLITE_OPEN_READONLY;
+                $options[\Pdo\Sqlite::ATTR_OPEN_FLAGS] = \Pdo\Sqlite::OPEN_READONLY;
             }
 
             $pdo = new PDO('sqlite:'.$this->path, null, null, $options);

@@ -18,4 +18,9 @@
             <directory>src</directory>
         </include>
     </source>
+    <extensions>
+        <bootstrap class="AppGraph\Runtime\PHPUnit\AppGraphExtension">
+            <parameter name="output" value="storage/appgraph/runtime-evidence.json"/>
+        </bootstrap>
+    </extensions>
 </phpunit>

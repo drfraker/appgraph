@@ -5,6 +5,15 @@ return [
 
     'memory_limit' => '1024M',
 
+    'extensions' => [
+        /*
+         * Declarative meanings for application callables. v0.7.1 supports exact
+         * function matches with the named_route_url semantic. Unknown match or
+         * semantic kinds are ignored rather than inferred. route() stays built in.
+         */
+        'callables' => [],
+    ],
+
     'store' => [
         /*
          * SQLite is the authoritative local graph store. The JSON export is an

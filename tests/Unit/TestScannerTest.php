@@ -5,6 +5,7 @@ namespace AppGraph\Tests\Unit;
 use AppGraph\Graph\Graph;
 use AppGraph\Graph\Node;
 use AppGraph\Scanners\TestScanner;
+use AppGraph\Support\CallableSemanticRegistry;
 use AppGraph\Support\FileFinder;
 use AppGraph\Tests\TestCase;
 use Illuminate\Filesystem\Filesystem;
@@ -72,6 +73,285 @@ PHP);
         $this->assertSame('route', $namedRoute['metadata']['resolvedHelper']);
         $this->assertSame(13, $this->graphNode($array, 'test:'.$class.'::test_named_route')['endLine']);
         $this->assertSame(19, $this->graphNode($array, 'test:'.$class.'::literal_route')['endLine']);
+    }
+
+    public function test_it_maps_configured_callable_semantics_in_fluent_test_calls(): void
+    {
+        file_put_contents($this->fixturePath.'/tests/Feature/AppointmentTest.php', <<<'PHP'
+<?php
+
+namespace AppGraph\Tests\ConfiguredRouteHelpers;
+
+use Illuminate\Foundation\Testing\TestCase;
+
+class AppointmentTest extends TestCase
+{
+    public function test_update(): void
+    {
+        $this->actingAs($staff)
+            ->from(routeForTenant('appointments.index'))
+            ->post(routeForTenant('appointments.update', $appointment))
+            ->assertRedirect();
+    }
+
+    public function test_dynamic_route_name(): void
+    {
+        $this->post(routeForTenant($routeName));
+    }
+
+    public function test_named_route_name_argument(): void
+    {
+        $this->post(routeForTenant(routeName: 'appointments.update'));
+    }
+}
+PHP);
+
+        $graph = $this->graphWithNamedPostRoute('appointments.update');
+
+        (new TestScanner(
+            new FileFinder($this->fixturePath),
+            callableSemantics: new CallableSemanticRegistry([
+                $this->namedRouteFunctionSemantic('routeForTenant', 0),
+            ]),
+        ))->scan($graph);
+
+        $array = $graph->toArray();
+        $class = 'AppGraph\Tests\ConfiguredRouteHelpers\AppointmentTest';
+        $routeId = 'route:POST:/appointments/{appointment}';
+        $edge = $this->graphEdge($array, 'test:'.$class.'::test_update', $routeId, 'tests_route');
+
+        $this->assertNotNull($edge);
+        $this->assertSame(0.98, $edge['confidence']);
+        $this->assertSame('appointments.update', $edge['metadata']['routeName']);
+        $this->assertSame('routeForTenant', $edge['metadata']['helper']);
+        $this->assertSame('routeForTenant', $edge['metadata']['resolvedHelper']);
+        $this->assertSame('configured_callable_semantic', $edge['metadata']['inference']);
+        $this->assertSame('named_route_url', $edge['metadata']['semantic']);
+        $this->assertSame('function', $edge['metadata']['callableKind']);
+        $this->assertSame(0, $edge['metadata']['routeNameArgument']);
+        $this->assertNull($this->graphEdge(
+            $array,
+            'test:'.$class.'::test_dynamic_route_name',
+            $routeId,
+            'tests_route',
+        ));
+        $this->assertNull($this->graphEdge(
+            $array,
+            'test:'.$class.'::test_named_route_name_argument',
+            $routeId,
+            'tests_route',
+        ));
+    }
+
+    public function test_it_uses_exact_function_resolution_for_configured_route_helpers(): void
+    {
+        file_put_contents($this->fixturePath.'/tests/Feature/ConfiguredRouteHelperResolutionTest.php', <<<'PHP'
+<?php
+
+namespace AppGraph\Tests\ConfiguredRouteHelperResolution;
+
+use PHPUnit\Framework\TestCase;
+use function routeForTenant as tenantRoute;
+use function Trusted\tenantRoute as trustedRoute;
+use function Vendor\Helpers\routeForTenant as vendorRoute;
+
+function routeForTenant(string $name): string
+{
+    return $name;
+}
+
+class ConfiguredRouteHelperResolutionTest extends TestCase
+{
+    public function test_namespaced_shadow(): void
+    {
+        routeForTenant('appointments.update');
+    }
+
+    public function test_explicit_global(): void
+    {
+        \routeForTenant('appointments.update');
+    }
+
+    public function test_global_import_alias(): void
+    {
+        tenantRoute('appointments.update');
+    }
+
+    public function test_configured_fqn_alias(): void
+    {
+        trustedRoute('tenant', 'appointments.update');
+    }
+
+    public function test_unconfigured_import(): void
+    {
+        vendorRoute('appointments.update');
+    }
+}
+PHP);
+
+        $graph = $this->graphWithNamedPostRoute('appointments.update');
+
+        (new TestScanner(
+            new FileFinder($this->fixturePath),
+            callableSemantics: new CallableSemanticRegistry([
+                $this->namedRouteFunctionSemantic('routeForTenant', 0),
+                $this->namedRouteFunctionSemantic('Trusted\\tenantRoute', 1),
+            ]),
+        ))->scan($graph);
+
+        $array = $graph->toArray();
+        $testPrefix = 'test:AppGraph\\Tests\\ConfiguredRouteHelperResolution\\'
+            .'ConfiguredRouteHelperResolutionTest::';
+        $routeId = 'route:POST:/appointments/{appointment}';
+
+        $this->assertNull($this->graphEdge(
+            $array,
+            $testPrefix.'test_namespaced_shadow',
+            $routeId,
+            'tests_route',
+        ));
+        $this->assertGraphHasEdge(
+            $array,
+            $testPrefix.'test_explicit_global',
+            $routeId,
+            'tests_route',
+        );
+
+        $globalAlias = $this->graphEdge(
+            $array,
+            $testPrefix.'test_global_import_alias',
+            $routeId,
+            'tests_route',
+        );
+        $this->assertNotNull($globalAlias);
+        $this->assertSame('tenantRoute', $globalAlias['metadata']['helper']);
+        $this->assertSame('routeForTenant', $globalAlias['metadata']['resolvedHelper']);
+
+        $fqnAlias = $this->graphEdge(
+            $array,
+            $testPrefix.'test_configured_fqn_alias',
+            $routeId,
+            'tests_route',
+        );
+        $this->assertNotNull($fqnAlias);
+        $this->assertSame('trustedRoute', $fqnAlias['metadata']['helper']);
+        $this->assertSame('Trusted\\tenantRoute', $fqnAlias['metadata']['resolvedHelper']);
+        $this->assertSame(1, $fqnAlias['metadata']['routeNameArgument']);
+        $this->assertNull($this->graphEdge(
+            $array,
+            $testPrefix.'test_unconfigured_import',
+            $routeId,
+            'tests_route',
+        ));
+    }
+
+    public function test_it_ignores_invalid_helper_configuration_and_preserves_the_builtin_route_helper(): void
+    {
+        file_put_contents($this->fixturePath.'/tests/Feature/InvalidRouteHelperConfigurationTest.php', <<<'PHP'
+<?php
+
+namespace AppGraph\Tests\InvalidRouteHelperConfiguration;
+
+use PHPUnit\Framework\TestCase;
+
+class InvalidRouteHelperConfigurationTest extends TestCase
+{
+    public function test_builtin_route(): void
+    {
+        route('appointments.update', 'not-the-route-name');
+    }
+
+    public function test_negative_position(): void
+    {
+        negativeRoute('appointments.update');
+    }
+
+    public function test_string_position(): void
+    {
+        stringRoute('appointments.update');
+    }
+}
+PHP);
+
+        $graph = $this->graphWithNamedPostRoute('appointments.update');
+
+        (new TestScanner(
+            new FileFinder($this->fixturePath),
+            callableSemantics: new CallableSemanticRegistry([
+                $this->namedRouteFunctionSemantic('route', 1),
+                $this->namedRouteFunctionSemantic('negativeRoute', -1),
+                $this->namedRouteFunctionSemantic('stringRoute', '0'),
+                $this->namedRouteFunctionSemantic('not a function', 0),
+            ]),
+        ))->scan($graph);
+
+        $array = $graph->toArray();
+        $testPrefix = 'test:AppGraph\\Tests\\InvalidRouteHelperConfiguration\\'
+            .'InvalidRouteHelperConfigurationTest::';
+        $routeId = 'route:POST:/appointments/{appointment}';
+        $builtin = $this->graphEdge(
+            $array,
+            $testPrefix.'test_builtin_route',
+            $routeId,
+            'tests_route',
+        );
+
+        $this->assertNotNull($builtin);
+        $this->assertSame(1.0, $builtin['confidence']);
+        $this->assertSame('route', $builtin['metadata']['resolvedHelper']);
+        $this->assertArrayNotHasKey('inference', $builtin['metadata']);
+        $this->assertArrayNotHasKey('routeNameArgument', $builtin['metadata']);
+        $this->assertNull($this->graphEdge(
+            $array,
+            $testPrefix.'test_negative_position',
+            $routeId,
+            'tests_route',
+        ));
+        $this->assertNull($this->graphEdge(
+            $array,
+            $testPrefix.'test_string_position',
+            $routeId,
+            'tests_route',
+        ));
+    }
+
+    public function test_the_service_provider_injects_callable_semantics_into_the_test_scanner(): void
+    {
+        file_put_contents($this->fixturePath.'/tests/Feature/ConfiguredRouteHelperTest.php', <<<'PHP'
+<?php
+
+namespace AppGraph\Tests\ConfiguredRouteHelperBinding;
+
+use Illuminate\Foundation\Testing\TestCase;
+
+class ConfiguredRouteHelperTest extends TestCase
+{
+    public function test_update(): void
+    {
+        $this->post(routeForTenant('appointments.update'));
+    }
+}
+PHP);
+
+        $graph = $this->graphWithNamedPostRoute('appointments.update');
+        config()->set('appgraph.extensions.callables', [
+            $this->namedRouteFunctionSemantic('routeForTenant', 0),
+        ]);
+        app()->instance(FileFinder::class, new FileFinder($this->fixturePath));
+        app()->forgetInstance(CallableSemanticRegistry::class);
+        app()->forgetInstance(TestScanner::class);
+
+        app(TestScanner::class)->scan($graph);
+
+        $edge = $this->graphEdge(
+            $graph->toArray(),
+            'test:AppGraph\Tests\ConfiguredRouteHelperBinding\ConfiguredRouteHelperTest::test_update',
+            'route:POST:/appointments/{appointment}',
+            'tests_route',
+        );
+
+        $this->assertNotNull($edge);
+        $this->assertSame('configured_callable_semantic', $edge['metadata']['inference']);
     }
 
     public function test_it_uses_hosts_for_literal_requests_and_marks_hostless_domain_matches_as_ambiguous(): void
@@ -362,5 +642,46 @@ PHP);
         );
         $this->assertNotNull($globalRoute);
         $this->assertSame('route', $globalRoute['metadata']['resolvedHelper']);
+    }
+
+    private function graphWithNamedPostRoute(string $name): Graph
+    {
+        $graph = new Graph();
+        $graph->addNode(Node::make(
+            'route:POST:/appointments/{appointment}',
+            'route',
+            'POST /appointments/{appointment}',
+            [
+                'metadata' => [
+                    'name' => $name,
+                    'uri' => 'appointments/{appointment}',
+                    'methods' => ['POST'],
+                ],
+            ],
+        ));
+
+        return $graph;
+    }
+
+    /**
+     * @return array{
+     *     match: array{kind: string, name: string},
+     *     semantic: array{kind: string, arguments: array{route_name: mixed}}
+     * }
+     */
+    private function namedRouteFunctionSemantic(string $name, mixed $routeNameArgument): array
+    {
+        return [
+            'match' => [
+                'kind' => 'function',
+                'name' => $name,
+            ],
+            'semantic' => [
+                'kind' => 'named_route_url',
+                'arguments' => [
+                    'route_name' => $routeNameArgument,
+                ],
+            ],
+        ];
     }
 }

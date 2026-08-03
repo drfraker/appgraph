@@ -7,6 +7,7 @@ use AppGraph\Graph\Graph;
 use AppGraph\Graph\Node as GraphNode;
 use AppGraph\Scanners\Concerns\InteractsWithPhpAst;
 use AppGraph\Scanners\Concerns\MatchesRouteTargets;
+use AppGraph\Support\CallableSemanticRegistry;
 use AppGraph\Support\FileFinder;
 use AppGraph\Support\PhpFileFacts;
 use PhpParser\Node;
@@ -51,11 +52,15 @@ class TestScanner
     /** @var array<int, array{id: string, methods: array<int, string>, uri: string, domain: string|null}> */
     private array $routes = [];
 
+    private CallableSemanticRegistry $callableSemantics;
+
     public function __construct(
         private FileFinder $files,
         ?PhpFileFacts $phpFileFacts = null,
+        ?CallableSemanticRegistry $callableSemantics = null,
     ) {
         $this->initializePhpFileFacts($phpFileFacts);
+        $this->callableSemantics = $callableSemantics ?? new CallableSemanticRegistry();
     }
 
     protected function scannerName(): string
@@ -247,18 +252,33 @@ class TestScanner
     private function walk(Graph $graph, Node $node, string $testId, string $class): void
     {
         if ($node instanceof Expr\FuncCall
-            && $this->isSupportedRouteHelper($node, $class)) {
-            $name = $node->args[0]->value ?? null;
+            && ($routeSemantic = $this->matchNamedRouteSemantic($node, $class)) !== null) {
+            $name = $this->routeNameArgument($node, $routeSemantic['routeNameArgument']);
 
             if ($name instanceof Scalar\String_) {
                 foreach ($this->routesByName[$name->value] ?? [] as $routeId) {
-                    $graph->addEdge(new Edge($testId, $routeId, 'tests_route', 1.0, [
+                    $metadata = [
                         'routeName' => $name->value,
                         'helper' => $node->name->toString(),
-                        'resolvedHelper' => 'route',
+                        'resolvedHelper' => $routeSemantic['name'],
                         'line' => $node->getStartLine(),
                         'matchCertainty' => 'exact',
-                    ]));
+                    ];
+
+                    if ($routeSemantic['configured']) {
+                        $metadata['inference'] = 'configured_callable_semantic';
+                        $metadata['semantic'] = 'named_route_url';
+                        $metadata['callableKind'] = 'function';
+                        $metadata['routeNameArgument'] = $routeSemantic['routeNameArgument'];
+                    }
+
+                    $graph->addEdge(new Edge(
+                        $testId,
+                        $routeId,
+                        'tests_route',
+                        $routeSemantic['configured'] ? 0.98 : 1.0,
+                        $metadata,
+                    ));
                 }
             }
         }
@@ -317,33 +337,93 @@ class TestScanner
         }
     }
 
-    private function isSupportedRouteHelper(Expr\FuncCall $call, string $class): bool
+    /**
+     * @return array{name: string, routeNameArgument: int, configured: bool}|null
+     */
+    private function matchNamedRouteSemantic(Expr\FuncCall $call, string $class): ?array
+    {
+        $target = $this->resolvedFunctionTarget($call, $class);
+
+        if ($target === null) {
+            return null;
+        }
+
+        if ($target === 'route') {
+            return [
+                'name' => 'route',
+                'routeNameArgument' => 0,
+                'configured' => false,
+            ];
+        }
+
+        $rule = $this->callableSemantics->function($target, 'named_route_url');
+        $routeNameArgument = $rule['semantic']['arguments']['route_name'] ?? null;
+
+        if (! is_int($routeNameArgument)) {
+            return null;
+        }
+
+        return [
+            'name' => $rule['match']['name'],
+            'routeNameArgument' => $routeNameArgument,
+            'configured' => true,
+        ];
+    }
+
+    private function resolvedFunctionTarget(Expr\FuncCall $call, string $class): ?string
     {
         if (! $call->name instanceof Name) {
-            return false;
+            return null;
         }
 
         if ($call->name->isFullyQualified()) {
-            return strcasecmp(ltrim($call->name->toString(), '\\'), 'route') === 0
-                && ! isset($this->localFunctions['route']);
+            $target = $this->normalizeFunctionName($call->name->toString());
+
+            return isset($this->localFunctions[$target]) ? null : $target;
         }
 
         $resolvedName = $call->name->getAttribute('resolvedName');
 
         if ($resolvedName instanceof Name) {
-            return strcasecmp(ltrim($resolvedName->toString(), '\\'), 'route') === 0
-                && ! isset($this->localFunctions['route']);
+            $target = $this->normalizeFunctionName($resolvedName->toString());
+
+            return isset($this->localFunctions[$target]) ? null : $target;
         }
 
-        if (! $call->name->isUnqualified() || strcasecmp($call->name->toString(), 'route') !== 0) {
-            return false;
+        if (! $call->name->isUnqualified()) {
+            return null;
         }
 
+        $target = $this->normalizeFunctionName($call->name->toString());
         $namespace = $this->namespaceFromClass($class);
-        $localFunction = strtolower(($namespace === null ? '' : $namespace.'\\').'route');
+        $localFunction = $this->normalizeFunctionName(
+            ($namespace === null ? '' : $namespace.'\\').$target,
+        );
 
-        return ! isset($this->localFunctions[$localFunction])
-            && ! isset($this->localFunctions['route']);
+        if (isset($this->localFunctions[$localFunction])
+            || isset($this->localFunctions[$target])) {
+            return null;
+        }
+
+        return $target;
+    }
+
+    private function routeNameArgument(Expr\FuncCall $call, int $position): ?Expr
+    {
+        for ($index = 0; $index <= $position; $index++) {
+            $argument = $call->args[$index] ?? null;
+
+            if ($argument === null || $argument->unpack || $argument->name !== null) {
+                return null;
+            }
+        }
+
+        return $call->args[$position]->value;
+    }
+
+    private function normalizeFunctionName(string $name): string
+    {
+        return strtolower(ltrim($name, '\\'));
     }
 
     private function isProvenLaravelHttpReceiver(Expr $receiver, string $class): bool

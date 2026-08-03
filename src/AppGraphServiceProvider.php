@@ -8,7 +8,9 @@ use AppGraph\Commands\ScanCommand;
 use AppGraph\Query\StalenessChecker;
 use AppGraph\Runtime\JsonRuntimeEvidenceStore;
 use AppGraph\Runtime\RuntimeEvidenceRegistry;
+use AppGraph\Scanners\TestScanner;
 use AppGraph\Storage\GraphStore;
+use AppGraph\Support\CallableSemanticRegistry;
 use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\FileFinder;
 use AppGraph\Support\FreshScanRunner;
@@ -86,6 +88,20 @@ class AppGraphServiceProvider extends ServiceProvider
             return new PhpFileFacts(
                 cacheDirectory: $cacheDirectory,
                 sourceObservations: $app->make(SourceFileObservations::class),
+            );
+        });
+        $this->app->singleton(CallableSemanticRegistry::class, function ($app): CallableSemanticRegistry {
+            $configuredCallables = $app['config']->get('appgraph.extensions.callables', []);
+
+            return new CallableSemanticRegistry(
+                is_array($configuredCallables) ? $configuredCallables : [],
+            );
+        });
+        $this->app->bind(TestScanner::class, function ($app): TestScanner {
+            return new TestScanner(
+                $app->make(FileFinder::class),
+                $app->make(PhpFileFacts::class),
+                $app->make(CallableSemanticRegistry::class),
             );
         });
         $this->app->singleton(GraphStore::class, function ($app): GraphStore {

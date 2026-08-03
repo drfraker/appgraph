@@ -162,6 +162,34 @@ The published configuration also includes `appgraph.mcp.legacy_tools`, which def
 to `false`. Enable it only for clients or workflows that still depend on the four
 pre-focused MCP tools; it does not change the broader CLI surface.
 
+Applications can describe the meaning of their own callables without adding app-specific
+knowledge to AppGraph. In v0.7.1, exact function calls can declare that they produce a
+named-route URL for static test mapping:
+
+```php
+'extensions' => [
+    'callables' => [
+        [
+            'match' => [
+                'kind' => 'function',
+                'name' => 'App\\Support\\localized_route',
+            ],
+            'semantic' => [
+                'kind' => 'named_route_url',
+                'arguments' => [
+                    'route_name' => 0,
+                ],
+            ],
+        ],
+    ],
+],
+```
+
+Configure the target function or FQN; imported aliases resolve to that exact target.
+AppGraph ignores unknown callable/semantic kinds and dynamic, named, or unpacked
+route-name arguments rather than guessing. The same declaration shape leaves room for
+future exact, receiver-proven method and static-method macro support.
+
 ## Runtime test evidence
 
 AppGraph includes an optional PHPUnit extension, compatible with PHPUnit tests and Pest

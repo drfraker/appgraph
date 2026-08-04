@@ -9,6 +9,7 @@ use AppGraph\Query\StalenessChecker;
 use AppGraph\Runtime\JsonRuntimeEvidenceStore;
 use AppGraph\Runtime\RuntimeEvidenceRegistry;
 use AppGraph\Scanners\TestScanner;
+use AppGraph\Scanners\ViewScanner;
 use AppGraph\Storage\GraphStore;
 use AppGraph\Support\CallableSemanticRegistry;
 use AppGraph\Support\ContainerBindingRegistry;
@@ -102,6 +103,29 @@ class AppGraphServiceProvider extends ServiceProvider
                 $app->make(FileFinder::class),
                 $app->make(PhpFileFacts::class),
                 $app->make(CallableSemanticRegistry::class),
+            );
+        });
+        $this->app->bind(ViewScanner::class, function ($app): ViewScanner {
+            $configuredPaths = $app['config']->get('view.paths', []);
+            $viewPaths = array_values(array_filter(
+                is_array($configuredPaths) ? $configuredPaths : [],
+                static fn (mixed $path): bool => is_string($path) && trim($path) !== '',
+            ));
+            $namespace = null;
+
+            try {
+                $namespace = method_exists($app, 'getNamespace') ? $app->getNamespace() : null;
+            } catch (Throwable) {
+                // Composer autoload discovery is optional; the App\ default in
+                // ViewScanner covers the standard skeleton.
+            }
+
+            return new ViewScanner(
+                $app->make(FileFinder::class),
+                $app->make(SourceFileObservations::class),
+                $app->make(PhpFileFacts::class),
+                $viewPaths !== [] ? $viewPaths : null,
+                $namespace,
             );
         });
         $this->app->singleton(GraphStore::class, function ($app): GraphStore {

@@ -23,6 +23,7 @@ class QueryEngine
         ],
         'authorization' => ['authorizes_via'],
         'frontendConsumers' => ['consumes_route'],
+        'views' => ['renders'],
         'tests' => ['tests_route'],
     ];
 
@@ -489,6 +490,7 @@ class QueryEngine
         $dispatches = [];
         $sideEffects = [];
         $authorization = [];
+        $views = [];
         $remainingRelatedFacts = $maxRelatedFacts;
         $relatedFactsConsumed = 0;
         $relatedFactsTruncated = false;
@@ -567,6 +569,17 @@ class QueryEngine
                 if (! isset($models[$edge['to']])
                     || $this->compareFlowRows($row, $models[$edge['to']]) < 0) {
                     $models[$edge['to']] = $row;
+                }
+
+                continue;
+            }
+
+            if ($edge['type'] === 'renders') {
+                $row = $this->relatedNodeRow($edge['to'], $related, $hit, $edgeConfidence);
+
+                if (! isset($views[$edge['to']])
+                    || $this->compareFlowRows($row, $views[$edge['to']]) < 0) {
+                    $views[$edge['to']] = $row;
                 }
 
                 continue;
@@ -784,6 +797,46 @@ class QueryEngine
                     'message' => 'No test method was statically mapped to this route; dynamic or indirect tests may still exist.',
                 ];
             }
+
+            // Route::view routes render without a controller method, so their
+            // renders edges hang off the route node itself.
+            if (isset($selectedRelatedGroups['views'])) {
+                $routeRendersTruncated = false;
+                $routeRenderEdges = $this->index->rankedEdgesFrom(
+                    $route['id'],
+                    ['renders'],
+                    $remainingRelatedFacts,
+                    $routeRendersTruncated,
+                );
+                $remainingRelatedFacts -= count($routeRenderEdges);
+                $relatedFactsConsumed += count($routeRenderEdges);
+
+                if ($routeRendersTruncated) {
+                    $relatedFactsTruncated = true;
+                    $relatedFactTruncationStages['routeRenders'] = true;
+                }
+
+                foreach ($routeRenderEdges as $edge) {
+                    if ((float) ($edge['confidence'] ?? 1.0) < $minConfidence) {
+                        continue;
+                    }
+
+                    $node = $this->index->node($edge['to']);
+                    $row = array_filter([
+                        'id' => $edge['to'],
+                        'from' => $route['id'],
+                        'depth' => 1,
+                        'confidence' => $edge['confidence'] ?? 1.0,
+                        'file' => $node['file'] ?? null,
+                        'line' => $node['line'] ?? null,
+                    ], static fn ($value): bool => $value !== null);
+
+                    if (! isset($views[$edge['to']])
+                        || $this->compareFlowRows($row, $views[$edge['to']]) < 0) {
+                        $views[$edge['to']] = $row;
+                    }
+                }
+            }
         }
 
         $availableRelatedGroups = [
@@ -794,6 +847,7 @@ class QueryEngine
             'sideEffects' => array_values($sideEffects),
             'authorization' => array_values($authorization),
             'frontendConsumers' => array_values($frontendConsumers),
+            'views' => array_values($views),
             'tests' => array_values($tests),
         ];
         $groups = ['methods' => array_values($methods)];
@@ -1071,7 +1125,7 @@ class QueryEngine
     private function impactGroups(string $target, int $maxDepth, int $limit, float $minConfidence): array
     {
         $seed = $this->resolve($target);
-        $groups = ['methods' => [], 'models' => [], 'formRequests' => [], 'routes' => []];
+        $groups = ['methods' => [], 'models' => [], 'formRequests' => [], 'routes' => [], 'views' => []];
         /** @var array<string, array<int, float>> $states */
         $states = [$seed => [0 => 1.0]];
         $queue = [[$seed, 0, 1.0]];
@@ -1101,6 +1155,8 @@ class QueryEngine
                 'model' => ['uses_model'],
                 'form_request' => ['validates_with'],
                 'method' => ['calls', 'routes_to'],
+                'view' => ['renders', 'includes', 'extends', 'uses_component'],
+                'class' => ['uses_component'],
                 default => [],
             };
 
@@ -1147,11 +1203,13 @@ class QueryEngine
                     'model' => 'models',
                     'form_request' => 'formRequests',
                     'route' => 'routes',
+                    'view' => 'views',
                     default => null,
                 };
                 $row = null;
 
                 switch ($fromNode['type'] ?? null) {
+                    case 'view':
                     case 'method':
                         $row = array_filter([
                             'id' => $fromId,

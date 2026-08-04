@@ -1770,6 +1770,21 @@ class GraphIndex
         }
 
         if ($candidates !== []) {
+            // A Blade template conventionally shares its dotted name with the
+            // route that renders it ('notes.show'). The template must not make
+            // previously unambiguous route/name lookups ambiguous, so a single
+            // non-view candidate wins; views stay addressable as view:<name>.
+            if (! $resolvedCandidates['truncated']) {
+                $nonView = array_values(array_filter(
+                    $candidates,
+                    fn (string $id): bool => ($this->nodesById[$id]['type'] ?? null) !== 'view',
+                ));
+
+                if (count($nonView) === 1 && count($nonView) < count($candidates)) {
+                    return ['id' => $nonView[0], 'candidates' => []];
+                }
+            }
+
             $result = [
                 'id' => null,
                 'candidates' => $candidates,

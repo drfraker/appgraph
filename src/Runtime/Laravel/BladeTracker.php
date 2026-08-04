@@ -23,12 +23,15 @@ final class BladeTracker
             return;
         }
 
-        $application->instance(self::MARKER, true);
         $factory = $application->make('view');
 
         if (! is_object($factory) || ! method_exists($factory, 'composer')) {
             return;
         }
+
+        // Latch only after the composer can actually be registered, otherwise a
+        // rejected factory would permanently disarm blade tracking for this app.
+        $application->instance(self::MARKER, true);
 
         $factory->composer('*', static function (object $view) use ($collector): void {
             try {

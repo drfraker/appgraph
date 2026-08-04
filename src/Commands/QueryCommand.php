@@ -434,11 +434,11 @@ class QueryCommand extends Command
     {
         $categories = $this->option('category');
 
-        if (! is_array($categories) || count($categories) > 7) {
-            throw new RuntimeException('The [--category] option may be repeated at most 7 times.');
+        if (! is_array($categories) || count($categories) > 8) {
+            throw new RuntimeException('The [--category] option may be repeated at most 8 times.');
         }
 
-        $allowed = ['nodes', 'edges', 'routes', 'writes', 'authorization', 'queues', 'tests'];
+        $allowed = ['nodes', 'edges', 'routes', 'writes', 'authorization', 'queues', 'views', 'tests'];
         $normalized = [];
 
         foreach ($categories as $category) {

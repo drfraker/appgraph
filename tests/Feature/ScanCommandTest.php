@@ -355,7 +355,7 @@ class ScanCommandTest extends TestCase
         file_put_contents($sourcePath, "<?php\n\n// before\n");
         @unlink($outputPath);
 
-        foreach (['routes', 'database', 'models', 'form_requests', 'events', 'data_flow', 'side_effects', 'frontend', 'tests', 'policies', 'container_bindings'] as $scanner) {
+        foreach (['routes', 'database', 'models', 'form_requests', 'events', 'data_flow', 'side_effects', 'frontend', 'views', 'tests', 'policies', 'container_bindings'] as $scanner) {
             config()->set("appgraph.scan.{$scanner}", false);
         }
         config()->set('appgraph.scan.calls', true);
@@ -1438,7 +1438,7 @@ class ScanCommandTest extends TestCase
 
         $graph = json_decode((string) file_get_contents($outputPath), true, flags: JSON_THROW_ON_ERROR);
 
-        $this->assertSame('0.7.1', $graph['meta']['appgraphVersion']);
+        $this->assertSame('0.8.0', $graph['meta']['appgraphVersion']);
         $this->assertSame($graph['meta']['generation']['id'], app(GraphStore::class)->current()['id']);
         $this->assertSame(count($graph['nodes']), app(GraphStore::class)->current()['counts']['nodes']);
         $this->assertSame(count($graph['edges']), app(GraphStore::class)->current()['counts']['edges']);
@@ -1497,7 +1497,7 @@ class ScanCommandTest extends TestCase
 
         $overview = json_decode((string) file_get_contents($overviewPath), true, flags: JSON_THROW_ON_ERROR);
 
-        $this->assertSame('0.7.1', $overview['meta']['appgraphVersion']);
+        $this->assertSame('0.8.0', $overview['meta']['appgraphVersion']);
         $this->assertSame([
             'maxDepth' => 5,
             'maxMethods' => 9,
@@ -1713,7 +1713,7 @@ PHP;
 
     private function disableScanners(): void
     {
-        foreach (['routes', 'database', 'models', 'calls', 'data_flow', 'form_requests', 'events', 'side_effects', 'frontend', 'tests', 'policies', 'container_bindings'] as $scanner) {
+        foreach (['routes', 'database', 'models', 'calls', 'data_flow', 'form_requests', 'events', 'side_effects', 'frontend', 'views', 'tests', 'policies', 'container_bindings'] as $scanner) {
             config()->set("appgraph.scan.{$scanner}", false);
         }
     }

@@ -150,6 +150,45 @@ class FindQueryEngineTest extends TestCase
         $this->assertSame(0.9, $legacyNode['out'][0]['confidence']);
     }
 
+    public function test_find_prefers_the_route_when_a_view_shares_its_dotted_name(): void
+    {
+        $engine = new QueryEngine(GraphIndex::fromArray([
+            'meta' => [],
+            'nodes' => [
+                ['id' => 'route:GET:/notes/{note}', 'type' => 'route', 'label' => 'GET /notes/{note}', 'metadata' => ['name' => 'notes.show']],
+                ['id' => 'view:notes.show', 'type' => 'view', 'label' => 'notes.show', 'file' => 'resources/views/notes/show.blade.php', 'metadata' => ['name' => 'notes.show']],
+            ],
+            'edges' => [],
+        ]));
+
+        $result = $engine->find('notes.show');
+
+        $this->assertSame('route:GET:/notes/{note}', $result['resolved']);
+        $this->assertSame('view:notes.show', $engine->find('view:notes.show')['resolved']);
+    }
+
+    public function test_find_resolves_a_dotted_blade_view_name_to_its_view_node(): void
+    {
+        $engine = new QueryEngine(GraphIndex::fromArray([
+            'meta' => [],
+            'nodes' => [
+                ['id' => 'App\Http\Controllers\NoteController::show', 'type' => 'method', 'label' => 'NoteController::show', 'file' => 'app/Http/Controllers/NoteController.php', 'line' => 30],
+                ['id' => 'view:notes.show', 'type' => 'view', 'label' => 'notes.show', 'file' => 'resources/views/notes/show.blade.php', 'line' => 1, 'endLine' => 12, 'metadata' => ['name' => 'notes.show', 'engine' => 'blade']],
+            ],
+            'edges' => [
+                ['from' => 'App\Http\Controllers\NoteController::show', 'to' => 'view:notes.show', 'type' => 'renders', 'confidence' => 0.95],
+            ],
+        ]));
+
+        $result = $engine->find('notes.show');
+
+        $this->assertSame('view:notes.show', $result['resolved']);
+        $this->assertSame('view', $result['node']['type']);
+        $this->assertSame('resources/views/notes/show.blade.php', $result['node']['file']);
+        $this->assertSame('App\Http\Controllers\NoteController::show', $result['in'][0]['from']);
+        $this->assertSame('renders', $result['in'][0]['type']);
+    }
+
     /** @param array<int, array<string, mixed>>|null $nodes */
     private function engine(?array $nodes = null): QueryEngine
     {

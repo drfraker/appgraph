@@ -44,7 +44,7 @@ class SliceTool extends Tool
                 ->items($schema->string()->min(1)->max(self::MAX_ANCHOR_CHARACTERS))
                 ->max(20)
                 ->unique()
-                ->description('Explicit route, class, method, table, column, or file anchors. Optional prefixes: route:, class:, method:, table:, column:, file:.'),
+                ->description('Explicit route, class, method, table, column, view, or file anchors. Optional prefixes: route:, class:, method:, table:, column:, view:, file:.'),
             'files' => $schema->array()
                 ->items($schema->string()->min(1)->max(self::MAX_FILE_CHARACTERS))
                 ->max(50)

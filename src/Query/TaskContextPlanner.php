@@ -86,6 +86,10 @@ final class TaskContextPlanner
         'framework_invokes',
         'dispatches',
         'handled_by',
+        'renders',
+        'includes',
+        'extends',
+        'uses_component',
     ];
 
     /** @var array<int, string> */
@@ -113,6 +117,10 @@ final class TaskContextPlanner
         'morphed_by_many',
         'tests_route',
         'consumes_route',
+        'renders',
+        'includes',
+        'extends',
+        'uses_component',
         'reads_cache',
         'writes_cache',
         'reads_filesystem',
@@ -1022,10 +1030,11 @@ final class TaskContextPlanner
         $nodeType = $this->index->node((string) $state['id'])['type'] ?? null;
         $edgeType = $edge['type'] ?? null;
         $allowed = match ($nodeType) {
-            'route' => in_array($edgeType, ['routes_to', 'passes_through'], true),
-            'method' => in_array($edgeType, ['calls', 'validates_with', 'dispatches'], true),
+            'route' => in_array($edgeType, ['routes_to', 'passes_through', 'renders'], true),
+            'method' => in_array($edgeType, ['calls', 'validates_with', 'dispatches', 'renders'], true),
             'form_request' => $edgeType === 'framework_invokes',
             'event', 'job' => $edgeType === 'handled_by',
+            'view' => in_array($edgeType, ['includes', 'extends', 'uses_component'], true),
             default => false,
         };
 
@@ -1104,6 +1113,13 @@ final class TaskContextPlanner
                 || in_array($edgeType, $relationships, true),
             'route' => in_array($edgeType, ['tests_route', 'consumes_route'], true),
             'event', 'job' => $edgeType === 'dispatches',
+            // Only direct renderers: continuing upstream through
+            // includes/extends chains would fan every shared partial out to
+            // all sibling pages and their controllers, crowding out the
+            // genuinely related paths. Template-tree impact stays available
+            // via impact-of and the node card's in-edges.
+            'view' => $edgeType === 'renders',
+            'class' => $edgeType === 'uses_component',
             'table', 'column' => false,
             default => in_array($edgeType, $sideEffects, true),
         };
@@ -1607,7 +1623,7 @@ final class TaskContextPlanner
         $roleWeight = match ($node['type'] ?? null) {
             'route', 'method' => 0.95,
             'form_request', 'test' => 0.90,
-            'model', 'event', 'job' => 0.85,
+            'model', 'event', 'job', 'view' => 0.85,
             'table', 'column', 'cache', 'filesystem', 'external' => 0.70,
             default => 0.80,
         };
@@ -2706,7 +2722,7 @@ final class TaskContextPlanner
             'route' => 0,
             'method' => 1,
             'form_request' => 2,
-            'model', 'event', 'job' => 3,
+            'model', 'event', 'job', 'view' => 3,
             'test' => 4,
             'table', 'column' => 5,
             default => 6,

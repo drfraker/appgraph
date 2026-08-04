@@ -216,13 +216,17 @@ final class RuntimeEvidenceScanner
                 $sourceObservationCount++;
                 $sourcesByFile[$source->file()] = $source;
                 $sourcePath = $source->file();
+
+                if ($source->ranges() === []) {
+                    // Empty-range sources are hash carriers for blade
+                    // observations; the blades loop below counts their node
+                    // freshness exactly once.
+                    continue;
+                }
+
                 $sourceFreshness = $this->freshness($source->sha256(), $this->currentFile($sourcePath));
                 $this->increment($sourceNodeFreshness[$sourcePath], $sourceFreshness);
                 $relationshipFreshness = $this->combineFreshness($testFreshness, $sourceFreshness);
-
-                if ($source->ranges() === []) {
-                    continue;
-                }
 
                 if ($this->eligible($relationshipFreshness, $stats)) {
                     $accepted = $this->appendEdge(

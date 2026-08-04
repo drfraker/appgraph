@@ -33,7 +33,7 @@ class SearchTool extends Tool
     {
         return [
             'term' => $schema->string()->min(1)->max(512)->description('Literal substring to match against node ids and labels.')->required(),
-            'type' => $schema->string()->min(1)->max(128)->description('Optional node type filter: route, method, class, model, table, column, index, foreign_key, form_request, event, or job.'),
+            'type' => $schema->string()->min(1)->max(128)->description('Optional node type filter: route, method, class, model, table, column, index, foreign_key, form_request, view, event, or job.'),
             'limit' => $schema->integer()->min(1)->max(200)->description('Maximum results (default 50).'),
         ];
     }

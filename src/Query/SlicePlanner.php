@@ -235,6 +235,12 @@ final class SlicePlanner
         } elseif (str_starts_with($anchor, 'method:')) {
             $expectedTypes = ['method'];
             $target = substr($anchor, 7);
+        } elseif (str_starts_with($anchor, 'view:')) {
+            $expectedTypes = ['view'];
+
+            if ($this->index->node($anchor) === null) {
+                $target = substr($anchor, 5);
+            }
         } elseif (str_starts_with($anchor, 'class:')) {
             $expectedTypes = [
                 'class',
@@ -374,6 +380,7 @@ final class SlicePlanner
                 'authorizes_via' => 30,
                 'routes_to' => 40,
                 'handled_by' => 70,
+                'renders' => 75,
             ] as $edgeType => $rank) {
                 $truncated = false;
 
@@ -395,6 +402,7 @@ final class SlicePlanner
                 'class', 'method', 'trait' => 50,
                 'model' => 60,
                 'event', 'job' => 70,
+                'view' => 75,
                 'frontend' => 80,
                 'test' => 90,
                 default => 55,

@@ -92,6 +92,7 @@ return [
         'events' => true,
         'side_effects' => true,
         'frontend' => true,
+        'views' => true,
         'tests' => true,
         'policies' => true,
         'container_bindings' => true,

@@ -26,7 +26,7 @@ Typical questions:
 
 ```bash
 composer config repositories.appgraph vcs https://github.com/drfraker/appgraph
-composer require --dev drfraker/appgraph:^0.7
+composer require --dev drfraker/appgraph:^0.8
 php artisan appgraph:install
 ```
 
@@ -57,7 +57,7 @@ php artisan appgraph:install
 
 ## Focused workflow
 
-For a controller, route, method, model, table, column, event, or job:
+For a controller, route, method, model, table, column, view, event, or job:
 
 1. Use `appgraph_find` to resolve the target and inspect its direct relationships.
 2. Use `appgraph_slice` with explicit anchors or changed files to get a bounded,
@@ -267,6 +267,9 @@ Scanning covers:
 - Method calls and method-to-table reads/writes
 - Events, jobs, listeners, handlers, observers, and ordered bus chains
 - Cache, filesystem, and Laravel HTTP-client side effects
+- Blade and plain PHP views: templates as first-class `view:` nodes addressable by
+  dotted name, controller/route/mailable renderers, `@extends`/`@include` chains,
+  Blade component usage, and named-route consumption inside templates
 - Frontend route consumers and statically mapped route tests
 - Optional runtime test-to-file, line-to-symbol, table, Blade, and Inertia evidence
 - Relevant observed container bindings and framework execution bridges
@@ -278,6 +281,7 @@ routes_to, passes_through, defined_in
 calls, validates_with, framework_invokes, authorizes_via
 uses_model, uses_table, reads, writes
 dispatches, handled_by, listens_to, observes
+renders, includes, extends, uses_component
 consumes_route, tests_route
 runtime_covers, runtime_uses_table, runtime_renders_blade, runtime_renders_inertia
 reads_cache, writes_cache, reads_filesystem, writes_filesystem, calls_external
@@ -297,6 +301,12 @@ historical evidence rather than current runtime truth.
   are omitted, while unexecuted tests and paths remain unknown.
 - Dynamic bindings, macros, generated calls, and unsupported framework surfaces may be
   absent.
+- View analysis resolves literal names against the configured view paths. Dynamic view
+  names, namespaced `package::` views, and vendor component tags are reported as
+  diagnostics rather than guessed. When a route name and a template share a dotted name,
+  bare lookups prefer the route; use the `view:` prefix (e.g. `view:notes.show`) for the
+  template. A `table.column` shorthand that matches an existing column also wins over a
+  same-named view.
 - A bare Eloquent `Model::query()` creates a builder and is not itself a database read;
   AppGraph records reads at terminal operations such as `get()`, `first()`, or
   `paginate()` when it can preserve the query lineage.
@@ -317,5 +327,5 @@ vendor/bin/phpunit
 ## Roadmap
 
 - Improve high-value Laravel relationship accuracy using real-application fixtures
-- Add static Blade/Livewire consumers, static Pest closure route mappings, and scheduler entry points
+- Add static Livewire consumers, namespaced/vendor view hints, static Pest closure route mappings, and scheduler entry points
 - Benchmark time-to-first-useful-source-read, response size, and finding accuracy

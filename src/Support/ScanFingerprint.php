@@ -11,7 +11,7 @@ use AppGraph\AppGraph;
  */
 class ScanFingerprint
 {
-    public const VERSION = 4;
+    public const VERSION = 5;
 
     private static ?string $runtimeEvidenceSession = null;
 
@@ -133,6 +133,10 @@ class ScanFingerprint
             ...$this->files->findFiles('database/schema', ['sql']),
         ];
 
+        foreach ($this->configuredViewPaths() as $path) {
+            $paths = [...$paths, ...$this->files->findFiles($path, ['php'])];
+        }
+
         foreach ($additionalFiles as $path) {
             if (is_string($path) && $path !== '' && is_file($path)) {
                 $paths[] = str_replace('\\', '/', $this->files->absolutePath($path));
@@ -168,6 +172,42 @@ class ScanFingerprint
         sort($paths);
 
         return $paths;
+    }
+
+    /**
+     * View templates are scan inputs for the views scanner, so editing one must
+     * mark the graph stale and the manifest must cover every observed template.
+     * Mirrors the ViewScanner's own discovery exactly: same config source, same
+     * lexical canonicalization, and nothing when the scanner is disabled.
+     *
+     * @return array<int, string>
+     */
+    private function configuredViewPaths(): array
+    {
+        if (! $this->configurationIsAvailable()) {
+            return [$this->files->canonicalPath('resources/views')];
+        }
+
+        if (! (bool) config('appgraph.scan.views', true)) {
+            return [];
+        }
+
+        $paths = [];
+
+        foreach ((array) config('view.paths', []) as $path) {
+            if (is_string($path) && trim($path) !== '') {
+                $paths[] = $path;
+            }
+        }
+
+        if ($paths === []) {
+            $paths = ['resources/views'];
+        }
+
+        return array_values(array_unique(array_map(
+            fn (string $path): string => $this->files->canonicalPath($path),
+            $paths,
+        )));
     }
 
     /** @return array<int, string> */

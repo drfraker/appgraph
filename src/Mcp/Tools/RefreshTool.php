@@ -13,7 +13,7 @@ use Laravel\Mcp\Server\Tool;
 use RuntimeException;
 
 #[Name('appgraph_refresh')]
-#[Description('Rebuild this Laravel application\'s AppGraph after a meaningful batch of source changes and return a change receipt: what changed since the previous generation, counted overall and by category (routes, writes, authorization, queues, tests). Do not call before every lookup.')]
+#[Description('Rebuild this Laravel application\'s AppGraph after a meaningful batch of source changes and return a change receipt: what changed since the previous generation, counted overall and by category (routes, writes, authorization, queues, views, tests). Do not call before every lookup.')]
 class RefreshTool extends Tool
 {
     use InteractsWithQueryEngine;
@@ -21,7 +21,7 @@ class RefreshTool extends Tool
 
     protected string $name = 'appgraph_refresh';
 
-    protected string $description = 'Rebuild this Laravel application\'s AppGraph after a meaningful batch of source changes and return a change receipt: what changed since the previous generation, counted overall and by category (routes, writes, authorization, queues, tests). Do not call before every lookup.';
+    protected string $description = 'Rebuild this Laravel application\'s AppGraph after a meaningful batch of source changes and return a change receipt: what changed since the previous generation, counted overall and by category (routes, writes, authorization, queues, views, tests). Do not call before every lookup.';
 
     /**
      * Bounded number of per-change detail rows in a receipt. Counts always

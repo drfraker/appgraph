@@ -17,6 +17,7 @@ class GenerationDiffer
         'writes',
         'authorization',
         'queues',
+        'views',
         'tests',
     ];
 
@@ -887,6 +888,9 @@ class GenerationDiffer
                         WHEN (entity = 'node' AND (before_type = 'route' OR after_type = 'route'))
                           OR (entity = 'edge' AND fact_type IN ('routes_to', 'passes_through', 'consumes_route'))
                             THEN 'routes'
+                        WHEN (entity = 'node' AND (before_type = 'view' OR after_type = 'view'))
+                          OR (entity = 'edge' AND fact_type IN ('renders', 'includes', 'extends', 'uses_component'))
+                            THEN 'views'
                         WHEN entity = 'node' THEN 'nodes'
                         ELSE 'edges'
                     END AS category

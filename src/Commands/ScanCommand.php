@@ -19,6 +19,7 @@ use AppGraph\Scanners\RouteScanner;
 use AppGraph\Scanners\RuntimeEvidenceScanner;
 use AppGraph\Scanners\SideEffectScanner;
 use AppGraph\Scanners\TestScanner;
+use AppGraph\Scanners\ViewScanner;
 use AppGraph\Storage\GraphStore;
 use AppGraph\Support\ContainerBindingRegistry;
 use AppGraph\Support\FileFinder;
@@ -79,6 +80,7 @@ class ScanCommand extends Command
         EventFlowScanner $eventFlowScanner,
         SideEffectScanner $sideEffectScanner,
         FrontendRouteScanner $frontendRouteScanner,
+        ViewScanner $viewScanner,
         TestScanner $testScanner,
         PolicyScanner $policyScanner,
         ContainerBindingScanner $containerBindingScanner,
@@ -185,6 +187,7 @@ class ScanCommand extends Command
             $includeEvents = (bool) config('appgraph.scan.events', true);
             $includeSideEffects = (bool) config('appgraph.scan.side_effects', true);
             $includeFrontend = (bool) config('appgraph.scan.frontend', true);
+            $includeViews = (bool) config('appgraph.scan.views', true);
             $includeTests = (bool) config('appgraph.scan.tests', true);
             $includePolicies = (bool) config('appgraph.scan.policies', true);
             $includeContainerBindings = (bool) config('appgraph.scan.container_bindings', true);
@@ -291,6 +294,10 @@ class ScanCommand extends Command
 
             if ($includeFrontend) {
                 $this->runScanner($graph, 'frontend', fn () => $frontendRouteScanner->scan($graph));
+            }
+
+            if ($includeViews) {
+                $this->runScanner($graph, 'views', fn () => $viewScanner->scan($graph));
             }
 
             if ($includeTests) {

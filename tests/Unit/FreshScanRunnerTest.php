@@ -25,8 +25,7 @@ foreach ($argv as $argument) {
     }
 }
 
-if (($argv[1] ?? null) !== 'appgraph:scan'
-    || ($options['preserve-generation'] ?? null) !== '17') {
+if (($argv[1] ?? null) !== 'appgraph:scan') {
     fwrite(STDERR, 'unexpected fresh scan arguments');
     exit(9);
 }
@@ -49,7 +48,7 @@ PHP);
                 $artisan,
                 PHP_BINARY,
             );
-            $result = $runner->run('17');
+            $result = $runner->run();
 
             $this->assertSame('18', $result['generation']['id']);
             $this->assertSame('17', $result['previousGeneration']['id']);

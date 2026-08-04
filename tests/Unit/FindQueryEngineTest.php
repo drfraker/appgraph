@@ -150,6 +150,19 @@ class FindQueryEngineTest extends TestCase
         $this->assertSame(0.9, $legacyNode['out'][0]['confidence']);
     }
 
+    public function test_find_falls_back_to_all_token_matching_for_multi_word_targets(): void
+    {
+        $result = $this->engine([
+            ['id' => 'App\Observers\AppointmentObserver', 'type' => 'class', 'label' => 'AppointmentObserver', 'file' => 'app/Observers/AppointmentObserver.php', 'line' => 11],
+            ['id' => 'App\Models\Appointment', 'type' => 'model', 'label' => 'Appointment', 'file' => 'app/Models/Appointment.php', 'line' => 9],
+        ])->find('appointment observer');
+
+        $this->assertSame(
+            ['App\Observers\AppointmentObserver'],
+            array_column($result['candidates'] ?? [], 'id'),
+        );
+    }
+
     public function test_find_prefers_the_route_when_a_view_shares_its_dotted_name(): void
     {
         $engine = new QueryEngine(GraphIndex::fromArray([

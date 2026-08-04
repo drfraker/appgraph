@@ -1,7 +1,7 @@
 # AppGraph workflow
 
 AppGraph maps this Laravel application and points to source; source remains authoritative.
-1. Use `appgraph_find` to resolve a route, class, method, table, column, view (dotted Blade name like `notes.show`), event, or job to a node and its direct edges.
+1. Use `appgraph_find` to resolve a route, class, method, table, column, view (dotted Blade name like `notes.show`), event, or job to a node and its direct edges. Anchor on exact identifiers (`NoteController::update`, `notes.show`, `appointments.start_date_time`); multi-word targets match identifiers containing every word, but prose sentences will not resolve.
 2. Use `appgraph_slice` with explicit anchors or changed files for a budgeted source reading plan in stable Laravel-lifecycle order.
 3. Read the referenced source before concluding or changing behavior.
 4. After meaningful edits, use `appgraph_refresh` when current graph results matter and inspect its change receipt.

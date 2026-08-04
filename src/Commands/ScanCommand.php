@@ -64,8 +64,6 @@ class ScanCommand extends Command
         {--no-overview : Skip writing the overview projection.}
         {--result-token= : Internal correlation token for MCP refresh result delivery.}
         {--result-file= : Internal private result channel for a fresh-process MCP refresh.}
-        {--preserve-generation= : Internal numeric verification baseline retained through publication.}
-        {--lock-owner= : Internal owner token for refresh-scoped scan locking.}
         {--pretty : Pretty-print the JSON output.}';
 
     protected $description = 'Publish an immutable SQLite AppGraph generation and attempt optional JSON and overview mirrors.';
@@ -118,39 +116,7 @@ class ScanCommand extends Command
                 $store,
             );
 
-            $preserveGeneration = $this->option('preserve-generation');
-
-            if ($preserveGeneration !== null && $preserveGeneration !== '') {
-                $preserveGeneration = is_string($preserveGeneration) ? trim($preserveGeneration) : '';
-
-                if (strlen($preserveGeneration) > 19
-                    || preg_match('/^[1-9]\d*$/D', $preserveGeneration) !== 1) {
-                    throw new RuntimeException('The internal AppGraph verification baseline is invalid.');
-                }
-            } else {
-                $preserveGeneration = null;
-            }
-
-            $lockOwner = $this->option('lock-owner');
-
-            if ($lockOwner !== null && $lockOwner !== '') {
-                $lockOwner = is_string($lockOwner) ? trim($lockOwner) : '';
-
-                if (preg_match('/^[a-f0-9]{32}$/D', $lockOwner) !== 1) {
-                    throw new RuntimeException('The internal AppGraph scan lock owner is invalid.');
-                }
-            } else {
-                $lockOwner = null;
-            }
-
-            $acquiredLockToken = $scanLock->acquire($lockOwner);
-
-            if ($preserveGeneration !== null) {
-                // This runs under the scan lock and before any scanner work, so
-                // the caller cannot accidentally use a generation created by
-                // this refresh as its alleged pre-edit baseline.
-                $store->verifyGeneration($preserveGeneration);
-            }
+            $acquiredLockToken = $scanLock->acquire();
 
             $path = $this->outputPath();
             $overviewPath = $this->shouldWriteOverview() ? $this->overviewPath($path) : null;
@@ -413,7 +379,7 @@ class ScanCommand extends Command
                 ],
             ]);
 
-            $storeResult = $store->publish($graph, $preserveGeneration);
+            $storeResult = $store->publish($graph);
             $pretty = (bool) $this->option('pretty');
             $generation = $storeResult['generation']['id'];
             $verb = $storeResult['created'] ? 'published' : 'reused';

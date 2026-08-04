@@ -1682,6 +1682,41 @@ class GraphIndex
             $results[] = $node;
         }
 
+        // A prose-flavored target ("appointment observer") misses as one
+        // substring while each word matches a single identifier. Only when the
+        // plain pass finds nothing, retry requiring every token instead, so a
+        // multi-word anchor costs one round trip rather than several misses.
+        // This fallback is in-memory only; store-backed SQL search stays
+        // whole-term, which only legacy/CLI search paths observe.
+        if ($results === []) {
+            $tokens = array_values(array_unique(
+                preg_split('/[^\pL\pN]+/u', mb_strtolower($term), -1, PREG_SPLIT_NO_EMPTY) ?: [],
+            ));
+
+            // A target with dozens of tokens is prose, not an anchor; scanning
+            // every node for each would be quadratic waste on a guaranteed miss.
+            if (count($tokens) >= 2 && count($tokens) <= 12) {
+                foreach ($this->nodesById as $node) {
+                    if ($type !== null && $node['type'] !== $type) {
+                        continue;
+                    }
+
+                    $metadata = is_array($node['metadata'] ?? null) ? $node['metadata'] : [];
+                    $haystack = mb_strtolower(
+                        $node['id'].' '.($node['label'] ?? '').' '.(string) ($metadata['name'] ?? ''),
+                    );
+
+                    foreach ($tokens as $token) {
+                        if (! str_contains($haystack, $token)) {
+                            continue 2;
+                        }
+                    }
+
+                    $results[] = $node;
+                }
+            }
+        }
+
         // Mirror the store backend's relevance ranking (exact > prefix >
         // suffix > substring, shorter labels first, node id as the final
         // tiebreak) so ordering and truncation membership do not depend on

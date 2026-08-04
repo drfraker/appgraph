@@ -31,7 +31,7 @@ class GraphStore
         private string $path,
         private int $retainedGenerations = 10,
         private int $busyTimeoutMs = 5000,
-        private bool $enableFts = true,
+        private bool $enableFts = false,
     ) {
         $this->retainedGenerations = max(2, min(50, $this->retainedGenerations));
         $this->busyTimeoutMs = max(0, min(60000, $this->busyTimeoutMs));
@@ -60,17 +60,11 @@ class GraphStore
      * An exact repeat (same source and full graph fingerprints) reuses the
      * current generation rather than filling retention with refresh noise.
      *
-     * The optional protected id is retained for an immediate verification
-     * response even when normal generation retention would otherwise prune it.
-     *
      * @return array{created: bool, generation: array<string, mixed>, previousGeneration: array<string, mixed>|null}
      */
-    public function publish(Graph $graph, ?string $protectedGeneration = null): array
+    public function publish(Graph $graph): array
     {
         $this->assertRuntimeAvailable();
-        $protectedGenerationId = $protectedGeneration !== null
-            ? $this->numericGenerationId($protectedGeneration, 'protected generation')
-            : null;
         $directory = dirname($this->path);
 
         if (! is_dir($directory) && ! mkdir($directory, 0775, true) && ! is_dir($directory)) {
@@ -99,19 +93,8 @@ class GraphStore
         try {
             $this->assertStoreStateIntegrity($pdo);
 
-            if ($protectedGenerationId !== null) {
-                // A refresh that promises to verify against a pre-edit
-                // baseline must fail before publication if that baseline has
-                // already disappeared, and must not prune it while committing.
-                $this->assertGenerationIntegrity(
-                    $pdo,
-                    $this->generationRow($pdo, (string) $protectedGenerationId),
-                );
-            }
-
             $currentRow = $this->currentRow($pdo);
-            if ($currentRow !== null
-                && ($protectedGenerationId === null || (int) $currentRow['id'] !== $protectedGenerationId)) {
+            if ($currentRow !== null) {
                 // Parent facts and source manifests affect the new generation's
                 // lineage and source-change summary, so corruption must fail
                 // before a successor can be published on top of it.
@@ -220,10 +203,7 @@ class GraphStore
             );
             $pdo->prepare('UPDATE store_state SET current_generation_id = :id WHERE singleton = 1')
                 ->execute(['id' => $generationId]);
-            $this->prune(
-                $pdo,
-                $protectedGenerationId !== null ? [$protectedGenerationId] : [],
-            );
+            $this->prune($pdo);
             $this->assertStoreStateIntegrity($pdo);
             $pdo->commit();
             $graph->replaceMeta($canonicalMeta);
@@ -258,21 +238,6 @@ class GraphStore
             }
 
             return $row !== null ? $this->generationSummary($row, true) : null;
-        });
-    }
-
-    /** @return array<string, mixed> */
-    public function generation(string $generation = 'current'): array
-    {
-        return $this->withSnapshot(function (PDO $pdo) use ($generation): array {
-            $row = $this->resolveGenerationRow($pdo, $generation);
-            $current = $this->currentRow($pdo);
-            $this->assertGenerationMetadataIntegrity($pdo, $row);
-
-            return $this->generationSummary(
-                $row,
-                $current !== null && (int) $current['id'] === (int) $row['id'],
-            );
         });
     }
 
@@ -476,7 +441,6 @@ class GraphStore
         string $term,
         ?string $type = null,
         int $limit = 50,
-        string $generation = 'current',
     ): array {
         $term = trim($term);
 
@@ -499,8 +463,8 @@ class GraphStore
 
         $limit = max(1, min(200, $limit));
 
-        return $this->withSnapshot(function (PDO $pdo) use ($term, $type, $limit, $generation): array {
-            $generationRow = $this->resolveGenerationRow($pdo, $generation);
+        return $this->withSnapshot(function (PDO $pdo) use ($term, $type, $limit): array {
+            $generationRow = $this->resolveGenerationRow($pdo, 'current');
             $this->assertGenerationIntegrity($pdo, $generationRow);
             $ftsMode = (string) $pdo->query('SELECT fts_mode FROM store_state WHERE singleton = 1')->fetchColumn();
             $useFts = $this->enableFts
@@ -700,28 +664,10 @@ class GraphStore
             return $row;
         }
 
-        if ($reference === 'previous') {
-            $current = $this->currentRow($pdo);
-
-            if ($current === null) {
-                throw new RuntimeException('AppGraph has no current generation.');
-            }
-
-            $statement = $pdo->prepare('SELECT * FROM generations WHERE id < :current ORDER BY id DESC LIMIT 1');
-            $statement->execute(['current' => $current['id']]);
-            $row = $statement->fetch();
-
-            if (! is_array($row)) {
-                throw new RuntimeException('AppGraph has no retained previous generation.');
-            }
-
-            return $row;
-        }
-
         try {
             $id = $this->numericGenerationId($reference, 'generation');
         } catch (RuntimeException) {
-            throw new RuntimeException("Invalid AppGraph generation [{$reference}]. Use a numeric id, current, or previous.");
+            throw new RuntimeException("Invalid AppGraph generation [{$reference}]. Use a numeric id or current.");
         }
 
         return $this->generationRow($pdo, (string) $id);
@@ -952,16 +898,21 @@ class GraphStore
 
             CREATE INDEX IF NOT EXISTS generation_nodes_type
                 ON generation_nodes(generation_id, type, node_id);
-            CREATE INDEX IF NOT EXISTS generation_nodes_file
-                ON generation_nodes(generation_id, file, line, node_id);
-            CREATE INDEX IF NOT EXISTS generation_nodes_name
-                ON generation_nodes(generation_id, name, node_id);
-            CREATE INDEX IF NOT EXISTS generation_edges_out
-                ON generation_edges(generation_id, edge_from, type, confidence DESC, edge_to);
-            CREATE INDEX IF NOT EXISTS generation_edges_in
-                ON generation_edges(generation_id, edge_to, type, confidence DESC, edge_from);
-            CREATE INDEX IF NOT EXISTS generation_edges_type
-                ON generation_edges(generation_id, type);
+            CREATE INDEX IF NOT EXISTS generation_nodes_file_v2
+                ON generation_nodes(generation_id, file, node_id);
+
+            -- Retired indexes, dropped here so pre-0.9 stores migrate on their
+            -- next publish. The name index could never match because all name
+            -- predicates wrap lower(name); the edge indexes served no default
+            -- query plan (AppGraph never runs ANALYZE, so even the CLI
+            -- verify-change neighborhood scan never selected them — dropping
+            -- them trades that latent plan for publish speed and store size).
+            -- generation_nodes_file is superseded by the trimmed _v2 shape.
+            DROP INDEX IF EXISTS generation_nodes_name;
+            DROP INDEX IF EXISTS generation_nodes_file;
+            DROP INDEX IF EXISTS generation_edges_out;
+            DROP INDEX IF EXISTS generation_edges_in;
+            DROP INDEX IF EXISTS generation_edges_type;
             SQL);
 
             if ($freshStore) {
@@ -972,6 +923,15 @@ class GraphStore
             // publisher leaves current on the greatest retained generation id,
             // so any other state is evidence of a damaged authoritative store.
             $this->assertStoreStateIntegrity($pdo);
+
+            if (! $this->enableFts) {
+                // A store that published under an fts-enabled configuration
+                // would otherwise keep paying per-insert node_search
+                // maintenance forever. Retire the accelerator entirely; a later
+                // fts-enabled publish rebuilds it from verified facts.
+                $pdo->exec("UPDATE store_state SET fts_mode = 'none' WHERE singleton = 1");
+                $pdo->exec('DROP TABLE IF EXISTS node_search');
+            }
 
             if ($this->enableFts) {
                 try {
@@ -1397,17 +1357,12 @@ class GraphStore
         }
     }
 
-    /** @param array<int, int> $protectedGenerationIds */
-    private function prune(PDO $pdo, array $protectedGenerationIds = []): void
+    private function prune(PDO $pdo): void
     {
         $statement = $pdo->prepare('SELECT id FROM generations ORDER BY id DESC LIMIT -1 OFFSET :retain');
         $statement->bindValue('retain', $this->retainedGenerations, PDO::PARAM_INT);
         $statement->execute();
-        $protectedGenerationIds = array_fill_keys($protectedGenerationIds, true);
-        $ids = array_values(array_filter(
-            array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN)),
-            static fn (int $id): bool => ! isset($protectedGenerationIds[$id]),
-        ));
+        $ids = array_map('intval', $statement->fetchAll(PDO::FETCH_COLUMN));
 
         if ($ids === []) {
             return;

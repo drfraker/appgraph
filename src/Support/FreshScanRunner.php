@@ -27,14 +27,8 @@ class FreshScanRunner implements ScanRunner
     }
 
     /** @return array<string, mixed> */
-    public function run(?string $preserveGeneration = null): array
+    public function run(): array
     {
-        if ($preserveGeneration !== null
-            && (strlen($preserveGeneration) > 19
-                || preg_match('/^[1-9]\d*$/D', $preserveGeneration) !== 1)) {
-            throw new RuntimeException('The AppGraph fresh scan baseline is invalid.');
-        }
-
         $artisan = $this->artisanPath ?? base_path('artisan');
 
         if (! is_file($artisan) || ! is_readable($artisan)) {
@@ -52,10 +46,6 @@ class FreshScanRunner implements ScanRunner
             '--result-token='.$token,
             '--result-file='.$resultPath,
         ];
-
-        if ($preserveGeneration !== null) {
-            $command[] = '--preserve-generation='.$preserveGeneration;
-        }
 
         $process = new Process($command, base_path());
         $timeout = (int) config('appgraph.mcp.scan_timeout_seconds', 300);

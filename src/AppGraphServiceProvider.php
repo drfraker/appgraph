@@ -139,7 +139,7 @@ class AppGraphServiceProvider extends ServiceProvider
                 path: $path,
                 retainedGenerations: (int) $app['config']->get('appgraph.store.retained_generations', 10),
                 busyTimeoutMs: (int) $app['config']->get('appgraph.store.busy_timeout_ms', 5000),
-                enableFts: (bool) $app['config']->get('appgraph.store.fts', true),
+                enableFts: (bool) $app['config']->get('appgraph.store.fts', false),
             );
         });
         $this->app->singleton(ScanLock::class, function ($app): ScanLock {

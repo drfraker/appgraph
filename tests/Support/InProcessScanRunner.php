@@ -15,16 +15,10 @@ final class InProcessScanRunner implements ScanRunner
     }
 
     /** @return array<string, mixed> */
-    public function run(?string $preserveGeneration = null): array
+    public function run(): array
     {
         $token = bin2hex(random_bytes(16));
-        $arguments = ['--result-token' => $token];
-
-        if ($preserveGeneration !== null) {
-            $arguments['--preserve-generation'] = $preserveGeneration;
-        }
-
-        $status = Artisan::call('appgraph:scan', $arguments);
+        $status = Artisan::call('appgraph:scan', ['--result-token' => $token]);
         $result = $this->results->take($token);
 
         if ($status !== 0 || ! is_array($result)) {

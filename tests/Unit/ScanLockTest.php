@@ -81,29 +81,25 @@ class ScanLockTest extends TestCase
         }
     }
 
-    public function test_owner_token_allows_scoped_reentry_without_unlocking_early(): void
+    public function test_owner_token_scopes_release_and_reacquisition_is_rejected(): void
     {
         $path = $this->path();
         $lock = new ScanLock($path, timeoutMs: 0);
         $other = new ScanLock($path, timeoutMs: 0);
         $owner = $lock->acquire();
 
-        $this->assertSame($owner, $lock->acquire($owner));
+        try {
+            $lock->acquire();
+            $this->fail('A held lock must reject re-acquisition in the same process.');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('already held', $exception->getMessage());
+        }
 
         try {
             $lock->release(str_repeat('0', 32));
             $this->fail('A different owner token must not release the lock.');
         } catch (RuntimeException $exception) {
             $this->assertStringContainsString('owned by another operation', $exception->getMessage());
-        }
-
-        $lock->release($owner);
-
-        try {
-            $other->acquire();
-            $this->fail('One nested release must leave the outer lock held.');
-        } catch (RuntimeException $exception) {
-            $this->assertStringContainsString('Timed out', $exception->getMessage());
         }
 
         $lock->release($owner);

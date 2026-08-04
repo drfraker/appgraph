@@ -86,7 +86,6 @@ class ChangeVerifier
         int $depth = 4,
         float $minConfidence = 0.0,
         int $limit = 50,
-        bool $confirmedRefreshReuse = false,
     ): array {
         $baseline = trim($baseline);
 
@@ -210,14 +209,12 @@ class ChangeVerifier
             $evidence,
             $targets,
             $changedFiles,
-            $confirmedRefreshReuse,
         );
         $overallChanges = (int) $diff['counts']['overall']['total'];
         $inScope = (int) ($evidence['targetScope']['changesInScope']['total'] ?? 0);
         $collateral = $evidence['targetScope']['collateralChanges'] ?? null;
         $scopeSpecified = $targets !== [] || $changedFiles !== [];
         $status = match (true) {
-            ($diff['sameGeneration'] ?? false) === true && $confirmedRefreshReuse => 'no_new_generation_published',
             ($diff['sameGeneration'] ?? false) === true => 'same_generation_selected',
             $overallChanges === 0 => 'no_graph_delta_observed',
             ! $scopeSpecified => 'graph_changes_observed',
@@ -1315,7 +1312,6 @@ class ChangeVerifier
         array $evidence,
         array $targets,
         array $changedFiles,
-        bool $confirmedRefreshReuse,
     ): array
     {
         $uncertainties = [];
@@ -1396,12 +1392,8 @@ class ChangeVerifier
 
         if (($diff['sameGeneration'] ?? false) === true) {
             $uncertainties[] = [
-                'code' => $confirmedRefreshReuse
-                    ? 'no_new_generation_published'
-                    : 'same_generation_selected',
-                'message' => $confirmedRefreshReuse
-                    ? 'The refresh reused the captured baseline because source, graph, and evidence fingerprints were identical; there is no later immutable snapshot to compare.'
-                    : 'The same immutable generation was selected on both sides; this comparison alone does not prove that a refresh occurred or that no newer generation exists.',
+                'code' => 'same_generation_selected',
+                'message' => 'The same immutable generation was selected on both sides; this comparison alone does not prove that a refresh occurred or that no newer generation exists.',
             ];
         }
 

@@ -24,7 +24,16 @@ return [
         'retained_generations' => 10,
         'busy_timeout_ms' => 5000,
         'lock_timeout_ms' => 30000,
-        'fts' => true,
+
+        /*
+         * The FTS trigram accelerator only serves SQL-backed search (the CLI
+         * `appgraph:query search` and the legacy MCP search tool); the default
+         * find/slice/refresh tools search the in-memory index instead. Disabled
+         * by default because it is rebuilt on every publish — enable it only if
+         * you rely on store-backed search on a large graph. Without it those
+         * paths fall back to an equivalent LIKE scan.
+         */
+        'fts' => false,
     ],
 
     'php_facts' => [

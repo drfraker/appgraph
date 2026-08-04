@@ -37,12 +37,10 @@ trait InteractsWithQueryEngine
     }
 
     /** @return array{result: array<string, mixed>, lockOwner: string} */
-    private function refreshGraph(
-        ?string $baselineGeneration = null,
-    ): array
+    private function refreshGraph(): array
     {
         MemoryLimit::ensure(config('appgraph.memory_limit', '256M'));
-        $result = app(ScanRunner::class)->run($baselineGeneration);
+        $result = app(ScanRunner::class)->run();
 
         $path = storage_path(config('appgraph.output_path', 'appgraph/appgraph.json'));
         $store = $this->store();
@@ -58,10 +56,6 @@ trait InteractsWithQueryEngine
 
             if (! is_string($generation) || preg_match('/^[1-9]\d*$/D', $generation) !== 1) {
                 throw new \RuntimeException('AppGraph refresh did not return an immutable generation id.');
-            }
-
-            if ($baselineGeneration !== null) {
-                $store->verifyGeneration($baselineGeneration);
             }
 
             $store->verifyGeneration($generation);

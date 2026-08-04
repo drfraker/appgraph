@@ -696,7 +696,7 @@ class McpToolsTest extends TestCase
             {
             }
 
-            public function run(?string $preserveGeneration = null): array
+            public function run(): array
             {
                 return $this->store->publish($this->graph);
             }

@@ -427,7 +427,7 @@ class GraphStoreTest extends TestCase
         $store->publish($this->graph(source: 'symlink'));
     }
 
-    public function test_trigram_index_remains_complete_across_enabled_disabled_enabled_processes(): void
+    public function test_disabled_publish_retires_the_trigram_index_and_a_reenabled_publish_rebuilds_it(): void
     {
         $enabled = $this->store(enableFts: true);
         $enabled->publish($this->graph(source: 'first', nodes: [
@@ -444,11 +444,23 @@ class GraphStoreTest extends TestCase
         $disabled->publish($this->graph(source: 'second', nodes: [
             Node::make('node:needle', 'action', 'UniqueNeedleValue'),
         ]));
-        $reenabled = new GraphStore($enabled->path(), enableFts: true);
-        $result = $reenabled->searchNodes('NeedleValue');
 
-        $this->assertSame('trigram', $result['fts']);
-        $this->assertSame(['node:needle'], array_column($result['results'], 'id'));
+        // The disabled publish retired the accelerator entirely, so a
+        // re-enabled process serves the exact LIKE fallback until its own next
+        // publish rebuilds FTS from verified facts.
+        $reenabled = new GraphStore($enabled->path(), enableFts: true);
+        $fallback = $reenabled->searchNodes('NeedleValue');
+
+        $this->assertSame('fallback', $fallback['fts']);
+        $this->assertSame(['node:needle'], array_column($fallback['results'], 'id'));
+
+        $reenabled->publish($this->graph(source: 'third', nodes: [
+            Node::make('node:needle', 'action', 'UniqueNeedleValue'),
+        ]));
+        $rebuilt = $reenabled->searchNodes('NeedleValue');
+
+        $this->assertSame('trigram', $rebuilt['fts']);
+        $this->assertSame(['node:needle'], array_column($rebuilt['results'], 'id'));
     }
 
     public function test_read_snapshot_rejects_writes_and_preserves_current(): void
@@ -527,7 +539,7 @@ class GraphStoreTest extends TestCase
             ->execute(['generation' => $first]);
 
         try {
-            $store->generation($second);
+            $store->generations();
             $this->fail('A read must reject a current pointer that no longer names the latest retained generation.');
         } catch (RuntimeException $exception) {
             $this->assertStringContainsString(
@@ -577,7 +589,7 @@ class GraphStoreTest extends TestCase
         $this->pdo($store)->exec('DELETE FROM generation_nodes');
 
         // Lightweight generation discovery remains available for summaries.
-        $this->assertSame($generation, $store->generation($generation)['id']);
+        $this->assertSame($generation, $store->generations()['generations'][0]['id']);
 
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('integrity check failed');
@@ -706,32 +718,6 @@ class GraphStoreTest extends TestCase
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('generation type count mismatch');
         $countStore->publish($this->graph(source: 'counts'));
-    }
-
-    public function test_corrupt_protected_baseline_aborts_before_publication(): void
-    {
-        $store = $this->store(retainedGenerations: 2);
-        $first = $store->publish($this->graph(
-            source: 'one',
-            files: ['app/One.php' => hash('sha256', 'one')],
-        ))['generation']['id'];
-        $second = $store->publish($this->graph(source: 'two', label: 'Two'))['generation']['id'];
-        $pdo = $this->pdo($store);
-        $pdo->prepare('DELETE FROM generation_files WHERE generation_id = :generation')
-            ->execute(['generation' => $first]);
-
-        try {
-            $store->publish(
-                $this->graph(source: 'three', label: 'Three'),
-                protectedGeneration: $first,
-            );
-            $this->fail('A corrupt protected baseline must abort publication.');
-        } catch (RuntimeException $exception) {
-            $this->assertStringContainsString('integrity check failed', $exception->getMessage());
-        }
-
-        $this->assertSame($second, $store->current()['id']);
-        $this->assertSame(2, (int) $pdo->query('SELECT COUNT(*) FROM generations')->fetchColumn());
     }
 
     public function test_tampered_fts_rows_fall_back_and_are_healed_on_publication(): void
@@ -879,14 +865,12 @@ class GraphStoreTest extends TestCase
         }
     }
 
-    public function test_historical_search_marks_only_the_actual_current_generation(): void
+    public function test_historical_graph_reads_mark_only_the_actual_current_generation(): void
     {
         $store = $this->store(enableFts: false);
         $first = $store->publish($this->graph(source: 'first', label: 'Common First'))['generation']['id'];
         $second = $store->publish($this->graph(source: 'second', label: 'Common Second'))['generation']['id'];
 
-        $this->assertFalse($store->searchNodes('Common', generation: $first)['generation']['current']);
-        $this->assertTrue($store->searchNodes('Common', generation: $second)['generation']['current']);
         $this->assertFalse($store->graph($first)['meta']['generation']['current']);
         $this->assertTrue($store->graph($second)['meta']['generation']['current']);
     }
@@ -979,27 +963,54 @@ class GraphStoreTest extends TestCase
         $this->assertFalse($page['truncated']);
     }
 
-    public function test_publication_protects_a_verification_baseline_from_retention_gc(): void
+    public function test_publishing_into_a_pre_090_store_retires_legacy_indexes_and_trigram_state(): void
     {
-        $store = $this->store(retainedGenerations: 2);
-        $first = $store->publish($this->graph(source: 'one'))['generation']['id'];
-        $second = $store->publish($this->graph(source: 'two', label: 'Two'))['generation']['id'];
-        $third = $store->publish(
-            $this->graph(source: 'three', label: 'Three'),
-            protectedGeneration: $first,
-        )['generation']['id'];
+        $store = $this->store(enableFts: false);
+        $store->publish($this->graph(source: 'one'));
+        $pdo = $this->pdo($store);
+
+        // Recreate the pre-0.9 physical layout on top of the live schema.
+        $pdo->exec('CREATE INDEX IF NOT EXISTS generation_nodes_name ON generation_nodes(generation_id, name, node_id)');
+        $pdo->exec('DROP INDEX IF EXISTS generation_nodes_file_v2');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS generation_nodes_file ON generation_nodes(generation_id, file, line, node_id)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS generation_edges_out ON generation_edges(generation_id, edge_from, type, confidence DESC, edge_to)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS generation_edges_in ON generation_edges(generation_id, edge_to, type, confidence DESC, edge_from)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS generation_edges_type ON generation_edges(generation_id, type)');
+
+        try {
+            $pdo->exec("CREATE VIRTUAL TABLE IF NOT EXISTS node_search USING fts5(node_id, label, tokenize='trigram')");
+        } catch (Throwable) {
+            $this->markTestSkipped('This SQLite build does not provide FTS5 trigram support.');
+        }
+
+        $pdo->exec("UPDATE store_state SET fts_mode = 'trigram' WHERE singleton = 1");
+
+        $store->publish($this->graph(source: 'two', label: 'Two'));
+
+        $indexes = $pdo->query(
+            "SELECT name FROM sqlite_schema WHERE type = 'index' AND name LIKE 'generation_%'"
+        )->fetchAll(PDO::FETCH_COLUMN);
+
+        $this->assertContains('generation_nodes_type', $indexes);
+        $this->assertContains('generation_nodes_file_v2', $indexes);
+
+        foreach ([
+            'generation_nodes_name',
+            'generation_nodes_file',
+            'generation_edges_out',
+            'generation_edges_in',
+            'generation_edges_type',
+        ] as $legacy) {
+            $this->assertNotContains($legacy, $indexes);
+        }
 
         $this->assertSame(
-            [$third, $second, $first],
-            array_column($store->generations(limit: 10)['generations'], 'id'),
+            'none',
+            $pdo->query('SELECT fts_mode FROM store_state WHERE singleton = 1')->fetchColumn(),
         );
-        $this->assertSame($first, $store->generation($first)['id']);
-
-        $fourth = $store->publish($this->graph(source: 'four', label: 'Four'))['generation']['id'];
-
         $this->assertSame(
-            [$fourth, $third],
-            array_column($store->generations(limit: 10)['generations'], 'id'),
+            0,
+            (int) $pdo->query("SELECT COUNT(*) FROM sqlite_schema WHERE name = 'node_search'")->fetchColumn(),
         );
     }
 
